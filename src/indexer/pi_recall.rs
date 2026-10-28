@@ -97,10 +97,11 @@ pub(crate) struct PiFacts {
     pub(crate) alignment_ok: bool,
     /// Result body shape keyed by result message index.
     pub(crate) result_body_shapes: BTreeMap<usize, PiResultBodyShape>,
-    /// The captured blob line of each matched `toolResult` record, keyed by
-    /// canonical message index. Only the lossless copy proof reads it; it is
-    /// never written into a message's `extra` or the database.
-    pub(crate) result_line_texts: BTreeMap<usize, String>,
+    /// The captured blob line of every matched message, keyed by canonical
+    /// message index. The lossless copy proof reads the result line and the
+    /// paired call line from here; the text is never written into a message's
+    /// `extra` or the database.
+    pub(crate) line_texts: BTreeMap<usize, String>,
 }
 
 /// One projected native `message` record from the captured blob.
@@ -156,6 +157,13 @@ impl PiFacts {
             alignment_ok = false;
         }
 
+        let line_texts = matched
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, raw_idx)| {
+                raw_idx.map(|raw_idx| (idx, raw_messages[raw_idx].text.clone()))
+            })
+            .collect();
         let events = matched
             .iter()
             .map(|raw_idx| match raw_idx {
@@ -174,7 +182,7 @@ impl PiFacts {
             candidate_result_indices: BTreeSet::new(),
             alignment_ok,
             result_body_shapes: BTreeMap::new(),
-            result_line_texts: BTreeMap::new(),
+            line_texts,
         };
 
         // Every `toolCall` block of every matched assistant message is a
@@ -193,9 +201,6 @@ impl PiFacts {
             facts
                 .result_body_shapes
                 .insert(result_idx, result_body_shape(value));
-            facts
-                .result_line_texts
-                .insert(result_idx, raw_messages[*raw_idx].text.clone());
 
             // A structural candidate hint only. The four strong names are the
             // sole strong identity; a bare name or another MCP namespace is a
@@ -1056,11 +1061,25 @@ fn judged_pi_outcome(
     match shared_pi_outcome(facts, message, idx, binding, category) {
         Outcome::Preserve(reason) => PiJudgment::preserved(reason),
         Outcome::Exclude(judged) => {
-            let raw_document = facts
-                .result_line_texts
-                .get(&idx)
+            // The binding's own source must be unambiguous too. A repeated
+            // member name in the paired call's captured line means the id,
+            // name or arguments may not be the values the file declares, so a
+            // valid result line never authorizes the new cleaning.
+            let call_document = facts
+                .line_texts
+                .get(&binding.call_idx)
                 .and_then(|line| LosslessSourceValue::parse(line.as_bytes()).ok());
-            match pi_copy_cleanup_plan(&message.extra, body, tool, raw_document.as_ref()) {
+            if !call_evidence_is_lossless(call_document.as_ref(), binding) {
+                return PiJudgment::preserved(Some(UncoveredReason::UnpairedResult));
+            }
+            let Some(result_document) = facts
+                .line_texts
+                .get(&idx)
+                .and_then(|line| LosslessSourceValue::parse(line.as_bytes()).ok())
+            else {
+                return PiJudgment::preserved(Some(UncoveredReason::UnpairedResult));
+            };
+            match pi_copy_cleanup_plan(&message.extra, body, tool, &result_document) {
                 Some(copies) => PiJudgment {
                     outcome: Outcome::Exclude(judged),
                     copies,
@@ -1070,6 +1089,37 @@ fn judged_pi_outcome(
             }
         }
     }
+}
+
+/// Whether the paired call's captured line is itself unambiguous.
+///
+/// The line must parse losslessly, so a repeated member name anywhere in it
+/// (including the call block or its arguments) rejects the evidence, and the
+/// recorded call block must still be at the recorded position with the same
+/// type, id and name. A missing line is not evidence either.
+fn call_evidence_is_lossless(document: Option<&LosslessSourceValue>, binding: &PiBinding) -> bool {
+    let Some(document) = document else {
+        return false;
+    };
+    let Some(LosslessSourceValue::Array(blocks)) = document
+        .get("message")
+        .and_then(|message| message.get("content"))
+    else {
+        return false;
+    };
+    let Some(LosslessSourceValue::Object(block)) = blocks.get(binding.call_block_idx as usize)
+    else {
+        return false;
+    };
+    let member = |name: &str| {
+        block
+            .iter()
+            .find(|(key, _)| key == name)
+            .and_then(|(_, value)| value.as_str())
+    };
+    member("type") == Some("toolCall")
+        && member("id") == Some(binding.tool_call_id.as_str())
+        && member("name") == Some(binding.tool_name.as_str())
 }
 
 /// Run the shared direct-tool core for a proven Pi result.
@@ -1286,7 +1336,7 @@ fn pi_copy_cleanup_plan(
     extra: &Value,
     body: &str,
     tool: RecallTool,
-    raw_document: Option<&LosslessSourceValue>,
+    raw_document: &LosslessSourceValue,
 ) -> Option<Vec<PiCopySlot>> {
     // The verified result JSON text. A complete C04 envelope carries it inside
     // the root element; an older unwrapped body is that text itself. Nothing
@@ -1307,7 +1357,13 @@ fn pi_copy_cleanup_plan(
 
     let mut proven = Vec::new();
     for slot in PiCopySlot::ALL {
-        let proof = prove_pi_copy_slot(extra, raw_document, slot, reference.as_ref(), legacy_body);
+        let proof = prove_pi_copy_slot(
+            extra,
+            Some(raw_document),
+            slot,
+            reference.as_ref(),
+            legacy_body,
+        );
         match proof {
             PiCopyProof::Absent => {}
             PiCopyProof::Proven => proven.push(slot),
@@ -1318,7 +1374,135 @@ fn pi_copy_cleanup_plan(
     if has_unproven_body_copy(extra, body, tool, &proven) {
         return None;
     }
+    // A complete structured copy at any other position is still a copy of the
+    // verified result. It grants no cleaning at a fourth position; it keeps the
+    // whole record.
+    if has_foreign_structured_copy(raw_document, reference.as_ref(), &proven) {
+        return None;
+    }
     Some(proven)
+}
+
+/// True when the captured record holds the complete verified JSON value as an
+/// object outside the proven body leaf and the proven copy slots.
+///
+/// The comparison is the same fixed lossless equality, so a different value, a
+/// shared fragment or an ordinary same-named field is not a copy. Only the
+/// third copy carrier (the structured object) is looked for elsewhere; strings
+/// outside the permitted slots are already covered by the body-copy walk.
+fn has_foreign_structured_copy(
+    document: &LosslessSourceValue,
+    reference: Option<&LosslessSourceValue>,
+    proven: &[PiCopySlot],
+) -> bool {
+    let Some(reference) = reference else {
+        return false;
+    };
+    let mut stack: Vec<&LosslessSourceValue> = Vec::new();
+    match document {
+        LosslessSourceValue::Object(record) => {
+            for (key, value) in record {
+                if key == "message" {
+                    if message_has_foreign_copy(value, reference, proven) {
+                        return true;
+                    }
+                } else if is_structured_copy(value, reference) {
+                    return true;
+                } else {
+                    stack.push(value);
+                }
+            }
+        }
+        other => stack.push(other),
+    }
+    stack_has_structured_copy(stack, reference)
+}
+
+/// The `message` level of [`has_foreign_structured_copy`]: the proven body
+/// leaves under `content` and the proven slots under `details` are skipped,
+/// every other value is a candidate.
+fn message_has_foreign_copy(
+    message: &LosslessSourceValue,
+    reference: &LosslessSourceValue,
+    proven: &[PiCopySlot],
+) -> bool {
+    let LosslessSourceValue::Object(fields) = message else {
+        return is_structured_copy(message, reference);
+    };
+    let mut stack: Vec<&LosslessSourceValue> = Vec::new();
+    for (key, value) in fields {
+        match key.as_str() {
+            "content" => push_content_children(value, &mut stack),
+            "details" => match value {
+                LosslessSourceValue::Object(details) => {
+                    if is_structured_copy(value, reference) {
+                        return true;
+                    }
+                    for (name, value) in details {
+                        let is_proven = proven.iter().any(|slot| slot.name() == name.as_str());
+                        if !is_proven {
+                            stack.push(value);
+                        }
+                    }
+                }
+                other => stack.push(other),
+            },
+            _ => stack.push(value),
+        }
+    }
+    stack_has_structured_copy(stack, reference)
+}
+
+/// The unskipped leaves of a `content` value: a plain string is the proven
+/// body itself and yields nothing; a text block contributes everything except
+/// its `text` member.
+fn push_content_children<'a>(
+    content: &'a LosslessSourceValue,
+    stack: &mut Vec<&'a LosslessSourceValue>,
+) {
+    match content {
+        LosslessSourceValue::Array(blocks) => {
+            for block in blocks {
+                match block {
+                    LosslessSourceValue::Object(block_fields) => {
+                        let is_text_block = block_fields
+                            .iter()
+                            .any(|(key, value)| key == "type" && value.as_str() == Some("text"));
+                        for (key, value) in block_fields {
+                            if !(is_text_block && key == "text") {
+                                stack.push(value);
+                            }
+                        }
+                    }
+                    other => stack.push(other),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn stack_has_structured_copy(
+    mut stack: Vec<&LosslessSourceValue>,
+    reference: &LosslessSourceValue,
+) -> bool {
+    while let Some(value) = stack.pop() {
+        if is_structured_copy(value, reference) {
+            return true;
+        }
+        match value {
+            LosslessSourceValue::Object(fields) => {
+                stack.extend(fields.iter().map(|(_, value)| value));
+            }
+            LosslessSourceValue::Array(items) => stack.extend(items.iter()),
+            _ => {}
+        }
+    }
+    false
+}
+
+fn is_structured_copy(value: &LosslessSourceValue, reference: &LosslessSourceValue) -> bool {
+    matches!(value, LosslessSourceValue::Object(_)) && lossless_copy_equal(reference, value)
 }
 
 /// Prove one permitted slot against its fixed carrier rule.
@@ -2999,6 +3183,29 @@ mod tests {
             &mut variant,
         );
 
+        // N16 shape: the complete structured result value at a fourth
+        // position. It grants no cleaning there and keeps the whole record;
+        // the positive control shows the same pair without the copy excludes.
+        let inner = r#"{"hits":[{"content":"synthetic"}]}"#;
+        let body = format!(r#"<cass_recall version="1" tool="cass_search">{inner}</cass_recall>"#);
+        let lines = r18_single_result_lines(&body, None);
+        let mut control = project_literal("wrong-position-control", &lines);
+        assert!(
+            run_r18_cleanup(&mut control)
+                .excluded
+                .iter()
+                .any(Option::is_some),
+            "positive control: the same pair without a copy excludes"
+        );
+        let mut outside = lines.clone();
+        assert_eq!(outside[3].pop(), Some('}'));
+        outside[3].push_str(&format!(r#","other":{{"structuredContent":{inner}}}}}"#));
+        let mut variant = project_literal("wrong-position", &outside);
+        assert_r18_preserved(
+            "complete structured copy outside the permitted slots",
+            &mut variant,
+        );
+
         // Ordinary metadata that only shares field names or a fragment is not
         // a copy: the row is excluded and every metadata value survives.
         let mut variant = project_literal(
@@ -3061,10 +3268,29 @@ mod tests {
             "dup-key-escaped",
             &r18_single_result_lines(
                 SEARCH_C04,
-                Some(r#"{"structuredContent":{"hits":[],"hits":[]}}"#),
+                Some(r#"{"structuredContent":{"hits":[],"\u0068its":[]}}"#),
             ),
         );
         assert_r18_preserved("escaped repeated member name", &mut variant);
+
+        // A repeated member name in the paired call's captured line. The call
+        // block still parses to id `c1` (the last member wins), so the binding
+        // looks valid, but the captured source declares two ids.
+        let details = Some(r#"{"structuredContent":{"hits":[]}}"#);
+        let lines = r18_single_result_lines(SEARCH_C04, details);
+        let mut control = project_literal("call-source-control", &lines);
+        assert!(
+            run_r18_cleanup(&mut control)
+                .excluded
+                .iter()
+                .any(Option::is_some),
+            "positive control: the unique call id still excludes"
+        );
+        let mut ambiguous = lines.clone();
+        assert!(ambiguous[2].contains(r#""id":"c1""#));
+        ambiguous[2] = ambiguous[2].replacen(r#""id":"c1""#, r#""id":"other","id":"c1""#, 1);
+        let mut variant = project_literal("call-source-duplicate", &ambiguous);
+        assert_r18_preserved("repeated id in the paired call line", &mut variant);
 
         // A damaged candidate string.
         let mut variant = project_literal(
