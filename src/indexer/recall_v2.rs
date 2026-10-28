@@ -1511,17 +1511,29 @@ fn exec_text_names_a_cass_call(expression: &str) -> bool {
     json_string_cmd(expression).is_some_and(|command| cli_names_cass(&command))
 }
 
+/// The four Cass MCP read methods this lexical scan may recognize.
+const CASS_MCP_METHODS: [&str; 4] = [
+    "mcp__cass_mcp__cass_search",
+    "mcp__cass_mcp__cass_expand",
+    "mcp__cass_mcp__cass_sessions",
+    "mcp__cass_mcp__cass_timeline",
+];
+
 /// Ticket 07b: does this unsupported script contain a static call to one of
 /// the four Cass MCP reads?
 ///
 /// The scan is lexical only. Strings, comments, template text and regex
 /// literals are skipped, and `tools . METHOD (` is recognized with the same
 /// four ASCII separators the literal parser allows. Comments between the
-/// method and its call parenthesis remain candidate evidence only. A method reference,
-/// `typeof tools.METHOD` or a descriptive string has no call parenthesis after
-/// the method, so it never matches. Nothing is executed, evaluated or
-/// rewritten: this answer only decides whether the strict checks after
-/// [`exec_recall_candidate_hint`] run, and it never authorizes an exclusion.
+/// method and its call parenthesis remain candidate evidence only. Ticket R17
+/// adds three limited call shapes: the `tools . METHOD . call (` member call,
+/// the `tools . METHOD ?. (` optional call, and one top-level `const NAME =
+/// tools . METHOD ;` followed by a call of that same name in the same top-level
+/// scope. A method reference, `typeof tools.METHOD` or a descriptive string has
+/// no call parenthesis after the method, so it never matches. Nothing is
+/// executed, evaluated or rewritten: this answer only decides whether the
+/// strict checks after [`exec_recall_candidate_hint`] run, and it never
+/// authorizes an exclusion.
 fn script_calls_a_cass_tool(expression: &str) -> bool {
     /// One level of the explicit stack: template text, or the `{...}` nesting
     /// of a `${...}` interpolation that returns to code scanning.
@@ -1563,26 +1575,78 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
         }
     }
 
-    /// `tools <sep> . <sep> METHOD <sep> (` at a complete identifier boundary.
+    /// One exact method at `pos`, cut at a complete identifier boundary.
+    /// Returns the end index of the method name.
+    fn method_at(bytes: &[u8], pos: usize) -> Option<usize> {
+        CASS_MCP_METHODS.iter().find_map(|method| {
+            let end = pos + method.len();
+            (bytes.get(pos..end) == Some(method.as_bytes())
+                && !bytes.get(end).copied().is_some_and(identifier_continue))
+            .then_some(end)
+        })
+    }
+
+    /// `tools <sep> . <sep> METHOD` at a complete identifier boundary, followed
+    /// by a direct call, a `.call (` member call, or a `?. (` optional call.
     fn callee_after_tools(bytes: &[u8], pos: usize) -> bool {
         let mut pos = skip_separators(bytes, pos);
         if bytes.get(pos) != Some(&b'.') {
             return false;
         }
         pos = skip_separators(bytes, pos + 1);
-        [
-            "mcp__cass_mcp__cass_search",
-            "mcp__cass_mcp__cass_expand",
-            "mcp__cass_mcp__cass_sessions",
-            "mcp__cass_mcp__cass_timeline",
-        ]
-        .iter()
-        .any(|method| {
-            let end = pos + method.len();
-            bytes.get(pos..end) == Some(method.as_bytes())
-                && !bytes.get(end).copied().is_some_and(identifier_continue)
-                && call_parenthesis_after_trivia(bytes, end)
-        })
+        let Some(method_end) = method_at(bytes, pos) else {
+            return false;
+        };
+        if call_parenthesis_after_trivia(bytes, method_end) {
+            return true;
+        }
+        let pos = skip_separators(bytes, method_end);
+        if bytes.get(pos..pos + 2) == Some(b"?.") {
+            return call_parenthesis_after_trivia(bytes, pos + 2);
+        }
+        if bytes.get(pos) != Some(&b'.') {
+            return false;
+        }
+        let pos = skip_separators(bytes, pos + 1);
+        bytes.get(pos..pos + 4) == Some(b"call")
+            && !bytes.get(pos + 4).copied().is_some_and(identifier_continue)
+            && call_parenthesis_after_trivia(bytes, pos + 4)
+    }
+
+    /// After a `const`/`let`/`var` keyword: the declared identifier's byte
+    /// range, and whether its initializer is exactly `tools . METHOD ;`. That
+    /// exact const form is the only alias source this scan accepts.
+    fn declaration_binding(bytes: &[u8], mut pos: usize) -> Option<(usize, usize, bool)> {
+        pos = skip_separators(bytes, pos);
+        if !bytes.get(pos).copied().is_some_and(identifier_start) {
+            return None;
+        }
+        let start = pos;
+        pos += 1;
+        while bytes.get(pos).copied().is_some_and(identifier_continue) {
+            pos += 1;
+        }
+        let end = pos;
+        pos = skip_separators(bytes, pos);
+        if bytes.get(pos) != Some(&b'=') {
+            return None;
+        }
+        pos = skip_separators(bytes, pos + 1);
+        if bytes.get(pos..pos + 5) != Some(b"tools")
+            || bytes.get(pos + 5).copied().is_some_and(identifier_continue)
+        {
+            return Some((start, end, false));
+        }
+        pos = skip_separators(bytes, pos + 5);
+        if bytes.get(pos) != Some(&b'.') {
+            return Some((start, end, false));
+        }
+        pos = skip_separators(bytes, pos + 1);
+        let Some(method_end) = method_at(bytes, pos) else {
+            return Some((start, end, false));
+        };
+        let pos = skip_separators(bytes, method_end);
+        Some((start, end, bytes.get(pos) == Some(&b';')))
     }
 
     let bytes = expression.as_bytes();
@@ -1597,6 +1661,10 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
     let mut control_parentheses = Vec::new();
     let mut statement_expected = true;
     let mut statement_braces = Vec::new();
+    // Top-level single-scope facts for the alias form: at most one exact const
+    // alias, and the brace depth that decides what "top level" means.
+    let mut alias: Option<String> = None;
+    let mut brace_depth: usize = 0;
 
     while pos < bytes.len() {
         let byte = bytes[pos];
@@ -1613,6 +1681,7 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
                 b'$' if bytes.get(pos + 1) == Some(&b'{') => {
                     pos += 2;
                     frames.push(Frame::Interpolation(0));
+                    brace_depth += 1;
                     operand_expected = true;
                     previous_significant = Some(b'{');
                 }
@@ -1704,6 +1773,7 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
             }
             b'{' => {
                 statement_braces.push(statement_start);
+                brace_depth += 1;
                 if let Some(Frame::Interpolation(depth)) = frames.last_mut() {
                     *depth += 1;
                 }
@@ -1713,6 +1783,7 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
                 previous_significant = Some(b'{');
             }
             b'}' => {
+                brace_depth = brace_depth.saturating_sub(1);
                 if matches!(frames.last(), Some(Frame::Interpolation(0))) {
                     frames.pop();
                     operand_expected = false;
@@ -1783,6 +1854,27 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
                     && callee_after_tools(bytes, pos)
                 {
                     return true;
+                }
+                if brace_depth == 0 {
+                    if matches!(word, "const" | "let" | "var") {
+                        if let Some((name_start, name_end, exact)) = declaration_binding(bytes, pos)
+                        {
+                            let name = &expression[name_start..name_end];
+                            if word == "const" && exact && alias.is_none() {
+                                alias = Some(name.to_string());
+                            } else if alias.as_deref() == Some(name) {
+                                // A second binding of the same name drops the
+                                // exact-method alias; a call no longer proves
+                                // which function it reaches.
+                                alias = None;
+                            }
+                        }
+                    } else if previous_significant != Some(b'.')
+                        && alias.as_deref() == Some(word)
+                        && call_parenthesis_after_trivia(bytes, pos)
+                    {
+                        return true;
+                    }
                 }
                 control_parenthesis_pending = previous_significant != Some(b'.')
                     && (matches!(word, "if" | "while" | "for" | "with" | "switch" | "catch")
@@ -6341,5 +6433,135 @@ mod tests {
             "a truncated recorded output must keep its existing reason"
         );
         println!("r15-store truncated: preserved invalid_recall_format");
+    }
+
+    // ========================================================================
+    // Ticket R17: three limited indirect call shapes stay candidates.
+    //
+    // The fixture copies the frozen 43-case matrix verbatim from the batch
+    // readiness report. Each shape test judges its own four positives, the
+    // four direct controls and all 27 negatives through the existing
+    // `exec_fixture` / `decide_for_record` path, so the assertions read the
+    // production judgment rather than a candidate boolean. Together the three
+    // shape tests cover every frozen case exactly once in its own group.
+    // ========================================================================
+
+    const ALIEN_FOLLOWUP_INDIRECT: &str =
+        include_str!("../../tests/fixtures/alien_codex/followup_indirect_calls.json");
+
+    const R17_SOURCE_CASES_SHA256: &str =
+        "7bbf9cebe618e1a0680b6752a4c89fe1645aff3212ae783b011afa567ff05df7";
+
+    /// The fixture's recorded output is the frozen `partial` string: the script
+    /// printed a status or length and left no complete C04 envelope.
+    fn r17_partial_output(case: &Value) -> Value {
+        let output = case["output"].as_str().expect("case output");
+        assert_eq!(output, "partial");
+        Value::String(output.into())
+    }
+
+    /// One shape's frozen cases: its own four positives, the four direct
+    /// controls and the 27 negatives.
+    fn r17_shape_cases(shape_group: &str) -> Vec<Value> {
+        let root: Value =
+            serde_json::from_str(ALIEN_FOLLOWUP_INDIRECT).expect("frozen R17 fixture JSON");
+        assert_eq!(
+            root["source_cases_sha256"].as_str(),
+            Some(R17_SOURCE_CASES_SHA256),
+            "fixture provenance"
+        );
+        let cases = root["cases"].as_array().expect("cases array");
+        let count = |group: &str| {
+            cases
+                .iter()
+                .filter(|case| case["group"].as_str() == Some(group))
+                .count()
+        };
+        assert_eq!(count(shape_group), 4, "{shape_group}: four positives");
+        assert_eq!(count("direct_control"), 4, "four direct controls");
+        assert_eq!(count("negative"), 27, "27 negatives");
+        let selected: Vec<Value> = cases
+            .iter()
+            .filter(|case| {
+                matches!(
+                    case["group"].as_str(),
+                    Some(group)
+                        if group == shape_group
+                            || group == "direct_control"
+                            || group == "negative"
+                )
+            })
+            .cloned()
+            .collect();
+        assert_eq!(selected.len(), 35, "{shape_group}: 35 frozen cases");
+        selected
+    }
+
+    /// Judge one frozen case through production and print its real outcome.
+    fn assert_r17_case(case: &Value) {
+        let id = case["id"].as_str().expect("case id");
+        let expression = case["expression"].as_str().expect("case expression");
+        assert_eq!(
+            case["expected_exclusion"].as_bool(),
+            Some(false),
+            "{id}: no case may be excluded"
+        );
+        let expected = match case["expected_reason_after_own_shape"].as_str() {
+            Some("unsupported_shell") => Outcome::Preserve(Some(UncoveredReason::UnsupportedShell)),
+            None => Outcome::Preserve(None),
+            other => panic!("{id}: unknown expected reason {other:?}"),
+        };
+        let (outcome, _, _) = exec_outcome(expression, r17_partial_output(case));
+        println!("case {id}: {outcome:?}");
+        assert_eq!(outcome, expected, "{id}: {expression}");
+    }
+
+    #[test]
+    fn r17_indirect_call_candidates() {
+        for case in r17_shape_cases("call") {
+            assert_r17_case(&case);
+        }
+    }
+
+    #[test]
+    fn r17_indirect_optional_candidates() {
+        for case in r17_shape_cases("optional") {
+            assert_r17_case(&case);
+        }
+    }
+
+    #[test]
+    fn r17_indirect_alias_candidates() {
+        for case in r17_shape_cases("alias") {
+            assert_r17_case(&case);
+        }
+    }
+
+    /// A raw `call_id` that names another row keeps the pairing reason: the
+    /// new candidate discovery must not reorder it into `unsupported_shell`.
+    #[test]
+    fn r17_indirect_wrong_call_id_keeps_reason() {
+        for shape in ["call", "optional", "alias"] {
+            let cases = r17_shape_cases(shape);
+            for case in cases
+                .iter()
+                .filter(|case| case["group"].as_str() == Some(shape))
+            {
+                let id = case["id"].as_str().expect("case id");
+                let expression = case["expression"].as_str().expect("case expression");
+                let (conv, events, mut raw_record) =
+                    exec_fixture(expression, r17_partial_output(case));
+                raw_record["payload"]["call_id"] = Value::String("call-t07-other".into());
+                let ctx = PairingContext::build(&crate::indexer::build_pairing_candidates(&conv));
+                let outcome =
+                    decide_for_record(&conv, 1, &events[1], &ctx, &paths_cfg(), &raw_record);
+                println!("case {id} wrong-call-id: {outcome:?}");
+                assert_eq!(
+                    outcome,
+                    Outcome::Preserve(Some(UncoveredReason::UnpairedResult)),
+                    "{id}: {expression}"
+                );
+            }
+        }
     }
 }
