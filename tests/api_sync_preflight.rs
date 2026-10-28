@@ -741,11 +741,11 @@ fn unreachable_endpoint_leaves_an_existing_archive_unchanged() {
 }
 
 // ---------------------------------------------------------------------------
-// AC 2 — a wrong service identity is refused before any index
+// A gateway may report its backend model without blocking the sync.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn wrong_identity_response_is_refused_before_any_index() {
+fn a_backend_model_name_does_not_block_sync_preflight() {
     let fixture = Fixture::new();
     fixture.seed_session("rollout-identity.jsonl", "api03g-identity");
     // A service that answers 200 but names a different model than the profile.
@@ -758,17 +758,16 @@ fn wrong_identity_response_is_refused_before_any_index() {
     let config = fixture.write_config("models.toml", &local_config(&stub.endpoint()));
 
     let output = fixture.sync_json(Some(&config), &[]);
-    dump_round("wrong-identity", &output);
+    dump_round("backend-model-name", &output);
     let report = report_of(&output);
-    assert_semantic_precondition(&report);
-    assert_eq!(
-        report["semantic_preflight"]["outcome"],
-        serde_json::json!("failed"),
-        "{report}"
+    assert_eq!(report["exit_code"], serde_json::json!(0), "{report}");
+    assert!(
+        fixture.db_path().exists(),
+        "a successful gateway response must allow indexing"
     );
     assert!(
-        !fixture.db_path().exists(),
-        "a wrong-identity response must be refused before the database is created"
+        db_scalar(&fixture.db_path(), "SELECT COUNT(*) FROM messages") > 0,
+        "sync must ingest the synthetic session"
     );
     assert!(
         stub.request_count() >= 1,
@@ -777,8 +776,8 @@ fn wrong_identity_response_is_refused_before_any_index() {
     );
 }
 
-/// The mirror image: a service that cannot hold one width across the probe's
-/// own requests is refused the same way.
+/// A service that cannot hold one width across the probe's own requests is
+/// still refused before indexing.
 #[test]
 fn drifting_width_across_probe_requests_is_refused_before_any_index() {
     let fixture = Fixture::new();

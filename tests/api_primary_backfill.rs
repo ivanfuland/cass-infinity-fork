@@ -1267,7 +1267,7 @@ fn a_response_with_the_wrong_width_fails_the_page() {
 }
 
 #[test]
-fn a_response_naming_another_model_is_refused_before_any_generation_exists() {
+fn a_backend_model_name_does_not_block_backfill_or_query() {
     let (_dir, data_dir) = scratch();
     let storage = build_db(
         &data_dir,
@@ -1293,17 +1293,40 @@ fn a_response_naming_another_model_is_refused_before_any_generation_exists() {
     );
     fs::write(&config_path, &text).expect("write config");
 
-    let output = run_backfill(&data_dir, &config_path, Some("local8"), &[]);
-    assert!(
-        !output.status.success(),
-        "a contradicting response identity must be refused"
+    assert_success(&run_backfill(&data_dir, &config_path, Some("local8"), &[]));
+    // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+    assert_eq!(generation_count(&storage), 1);
+    let generation_id = active_generation(&storage).expect("generation activated");
+    // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+    assert_eq!(message_chunks(&storage, generation_id), 1);
+    let before = stub.requests().len();
+    let query = cass(
+        &[
+            "search",
+            "synthetic query",
+            "--mode",
+            "semantic",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("data dir"),
+            "--api-config",
+            config_path.to_str().expect("config path"),
+            "--embedding-profile",
+            "local8",
+        ],
+        &[],
     );
-    assert_eq!(output.status.code(), Some(5));
+    assert_success(&query);
+    // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
     assert_eq!(
-        generation_count(&storage),
-        0,
-        "a probe that never validated an identity must not create a generation"
+        stub.requests().len(),
+        before + 1,
+        "query makes one gateway call"
     );
+    // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+    assert_eq!(active_generation(&storage), Some(generation_id));
+    // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+    assert_eq!(generation_count(&storage), 1, "query reuses the generation");
 }
 
 #[test]

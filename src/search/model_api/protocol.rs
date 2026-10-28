@@ -23,10 +23,9 @@
 //! using *one* of the two accepted shapes and never a mixture. Nothing is
 //! sorted, truncated or back-filled.
 //!
-//! Identity fields follow one rule: a field the service did not send stays
-//! `None`. A field the service did send must agree with the configuration, and a
-//! present field of the wrong type is a malformed response rather than a value
-//! to reinterpret.
+//! Backend identity fields are optional observations. They never gate a
+//! successful response: the gateway owns backend selection and fallback.
+//! Missing or unrecognised metadata stays `None`.
 
 use serde_json::{Map, Value};
 
@@ -249,7 +248,10 @@ pub fn parse_embedding_response(
     let Some(detail) = profile.embedding() else {
         return Err(ApiCallError::new(ApiCallErrorCode::WrongKind));
     };
-    let identity = observed_identity(profile, body)?;
+    if body.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(invalid_response());
+    }
+    let identity = observed_identity(body);
 
     let rows = body
         .get("data")
@@ -332,7 +334,10 @@ pub fn parse_rerank_response(
 
     let (rows, identity, native) = match body {
         Value::Object(object) => {
-            let identity = observed_identity(profile, body)?;
+            if object.get("error").is_some_and(|error| !error.is_null()) {
+                return Err(invalid_response());
+            }
+            let identity = observed_identity(body);
             let rows = object
                 .get("results")
                 .and_then(Value::as_array)
@@ -465,80 +470,14 @@ fn finalize_vector(
     Ok(stored)
 }
 
-/// Read the optional identity fields of a response.
-fn observed_identity(
-    profile: &ValidatedProfile,
-    body: &Value,
-) -> Result<ObservedIdentity, ApiCallError> {
-    let Some(object) = body.as_object() else {
-        return Err(invalid_response());
-    };
-
-    let response_model = match object.get("model") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(model)) => {
-            if !model_matches(profile, model) {
-                return Err(ApiCallError::new(ApiCallErrorCode::IdentityMismatch));
-            }
-            Some(model.clone())
-        }
-        Some(_) => return Err(invalid_response()),
-    };
-
-    let left = optional_string(object.get("revision"))?;
-    let right = optional_string(object.get("model_revision"))?;
-    if let (Some(left), Some(right)) = (&left, &right) {
-        if left != right {
-            return Err(ApiCallError::new(ApiCallErrorCode::IdentityMismatch));
-        }
-    }
-    let response_revision = left.or(right);
-    if let Some(revision) = &response_revision {
-        if revision != &profile.model_revision {
-            return Err(ApiCallError::new(ApiCallErrorCode::IdentityMismatch));
-        }
-    }
-
-    let provider = optional_string(object.get("provider"))?;
-    if let (Some(observed), Some(pinned)) = (
-        &provider,
-        profile
-            .embedding()
-            .and_then(|detail| detail.provider_only.as_deref())
-            .or_else(|| {
-                profile
-                    .rerank()
-                    .and_then(|detail| detail.provider_only.as_deref())
-            }),
-    ) {
-        if observed != pinned {
-            return Err(ApiCallError::new(ApiCallErrorCode::IdentityMismatch));
-        }
-    }
-
-    Ok(ObservedIdentity {
-        response_model,
-        response_revision,
-        provider,
-        usage: parse_usage(object),
-    })
-}
-
-/// Whether a reported model name is the configured model or one of its aliases.
-fn model_matches(profile: &ValidatedProfile, reported: &str) -> bool {
-    reported == profile.model
-        || profile
-            .response_model_aliases
-            .iter()
-            .any(|alias| alias == reported)
-}
-
-/// A present string field, or `None` when absent or null.
-fn optional_string(value: Option<&Value>) -> Result<Option<String>, ApiCallError> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => Ok(Some(text.clone())),
-        Some(_) => Err(invalid_response()),
+/// Record optional backend metadata without interpreting it as a contract.
+fn observed_identity(body: &Value) -> ObservedIdentity {
+    let string = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_owned);
+    ObservedIdentity {
+        response_model: string("model"),
+        response_revision: string("revision").or_else(|| string("model_revision")),
+        provider: string("provider"),
+        usage: body.as_object().and_then(parse_usage),
     }
 }
 
@@ -689,7 +628,59 @@ model_revision = "rev"
     }
 
     #[test]
-    fn a_present_provider_must_agree_with_the_pinned_one() {
+    fn optional_backend_metadata_cannot_reject_valid_embedding_or_rerank_results() {
+        let embedding = embedding_profile("");
+        let rerank = rerank_profile("");
+        for metadata in [
+            json!({"model": "gateway-backend", "revision": "backend-rev", "model_revision": "other-rev", "provider": "backend-provider"}),
+            json!({"model": 7, "revision": [], "model_revision": {}, "provider": {"name": "backend"}}),
+            json!({"model": null, "revision": null, "provider": null}),
+        ] {
+            let mut body = metadata;
+            body["data"] = json!([{"index": 0, "embedding": [1.0, 0.0]}]);
+            body["results"] = json!([{"index": 0, "relevance_score": 0.75}]);
+            // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+            assert_eq!(
+                parse_embedding_response(&embedding, &body, 1)
+                    .expect("backend metadata is informational")
+                    .vectors,
+                vec![vec![1.0, 0.0]]
+            );
+            // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+            assert_eq!(
+                parse_rerank_response(&rerank, &body, 1)
+                    .expect("backend metadata is informational")
+                    .scores,
+                vec![0.75]
+            );
+        }
+    }
+
+    #[test]
+    fn a_response_error_is_refused_even_when_results_are_present() {
+        let body = json!({
+            "error": {"code": 503, "message": "backend unavailable"},
+            "data": [{"index": 0, "embedding": [1.0]}],
+            "results": [{"index": 0, "relevance_score": 0.75}],
+        });
+        // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+        assert_eq!(
+            parse_embedding_response(&embedding_profile(""), &body, 1)
+                .expect_err("error response")
+                .code(),
+            ApiCallErrorCode::InvalidResponse
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+        assert_eq!(
+            parse_rerank_response(&rerank_profile(""), &body, 1)
+                .expect_err("error response")
+                .code(),
+            ApiCallErrorCode::InvalidResponse
+        );
+    }
+
+    #[test]
+    fn a_reported_provider_is_metadata_even_when_the_request_pins_one() {
         let pinned = openrouter_embedding_profile("provider_only = \"vendor-x\"\n");
         let body = json!({
             "provider": "vendor-y",
@@ -697,9 +688,11 @@ model_revision = "rev"
         });
         assert_eq!(
             parse_embedding_response(&pinned, &body, 1)
-                .expect_err("provider mismatch")
-                .code(),
-            ApiCallErrorCode::IdentityMismatch
+                .expect("backend provider is informational")
+                .identity
+                .provider
+                .as_deref(),
+            Some("vendor-y")
         );
 
         let body = json!({
@@ -708,9 +701,10 @@ model_revision = "rev"
         });
         assert_eq!(
             parse_embedding_response(&pinned, &body, 1)
-                .expect_err("non string provider")
-                .code(),
-            ApiCallErrorCode::InvalidResponse
+                .expect("unrecognised metadata does not invalidate vectors")
+                .identity
+                .provider,
+            None
         );
     }
 
