@@ -1,0 +1,161 @@
+{
+  "cases": [
+    {
+      "id": "P01-object-order",
+      "carrier": "structured",
+      "reference_json": "{\"hits\":[{\"line_number\":1,\"content\":\"synthetic\"}]}",
+      "candidate_json": "{\"hits\":[{\"content\":\"synthetic\",\"line_number\":1}]}",
+      "expected_proven": true
+    },
+    {
+      "id": "P02-fraction-verbatim",
+      "carrier": "structured",
+      "reference_json": "{\"hits\":[{\"score\":1.00}]}",
+      "candidate_json": "{\"hits\":[{\"score\":1.00}]}",
+      "expected_proven": true
+    },
+    {
+      "id": "P03-escaped-string",
+      "carrier": "text",
+      "reference_json": "{\"hits\":[{\"content\":\"a\"}]}",
+      "candidate_json": "{\"hits\":[{\"content\":\"\\u0061\"}]}",
+      "expected_proven": true
+    },
+    {
+      "id": "P04-large-number-verbatim",
+      "carrier": "structured",
+      "reference_json": "{\"hits\":[{\"n\":9007199254740993}]}",
+      "candidate_json": "{\"hits\":[{\"n\":9007199254740993}]}",
+      "expected_proven": true
+    },
+    {
+      "id": "P05-array-text-once",
+      "carrier": "text",
+      "reference_json": "[{\"content\":\"synthetic\"}]",
+      "candidate_json": "[{\"content\":\"synthetic\"}]",
+      "expected_proven": true
+    },
+    {
+      "id": "P06-legacy-raw-exact",
+      "carrier": "raw",
+      "reference_json": "{\"hits\":[{\"line_number\":1,\"content\":\"synthetic\"}]}",
+      "candidate_json": "{\"hits\":[{\"line_number\":1,\"content\":\"synthetic\"}]}",
+      "expected_proven": true
+    },
+    {
+      "id": "N01-c04-raw-protected",
+      "carrier": "raw",
+      "reference_json": "{\"hits\":[{\"line_number\":1,\"content\":\"synthetic\"}]}",
+      "candidate_json": "{\"hits\":[{\"line_number\":1,\"content\":\"synthetic\"}]}",
+      "expected_proven": false,
+      "body_is_c04": true
+    },
+    {
+      "id": "N02-duplicate-key",
+      "carrier": "structured",
+      "reference_json": "{\"hits\":[]}",
+      "candidate_json": "{\"hits\":[],\"hits\":[]}",
+      "expected_proven": false
+    },
+    {
+      "id": "N03-escaped-duplicate-key",
+      "carrier": "structured",
+      "reference_json": "{\"hits\":[]}",
+      "candidate_json": "{\"hits\":[],\"\\u0068its\":[]}",
+      "expected_proven": false
+    },
+    {
+      "id": "N04-integer-vs-fraction",
+      "carrier": "structured",
+      "reference_json": "{\"hits\":[{\"n\":1}]}",
+      "candidate_json": "{\"hits\":[{\"n\":1.0}]}",
+      "expected_proven": false
+    },
+    {
+      "id": "N05-fraction-spelling",
+      "carrier": "structured",
+      "reference_json": "{\"hits\":[{\"n\":1.0}]}",
+      "candidate_json": "{\"hits\":[{\"n\":1.00}]}",
+      "expected_proven": false
+    },
+    {
+      "id": "N06-rounded-neighbours",
+      "carrier": "structured",
+      "reference_json": "{\"hits\":[{\"n\":9007199254740992}]}",
+      "candidate_json": "{\"hits\":[{\"n\":9007199254740993}]}",
+      "expected_proven": false
+    },
+    {
+      "id": "N07-signed-zero",
+      "carrier": "structured",
+      "reference_json": "{\"hits\":[{\"n\":-0}]}",
+      "candidate_json": "{\"hits\":[{\"n\":0}]}",
+      "expected_proven": false
+    },
+    {
+      "id": "N08-bool-vs-number",
+      "carrier": "structured",
+      "reference_json": "{\"hits\":[{\"n\":true}]}",
+      "candidate_json": "{\"hits\":[{\"n\":1}]}",
+      "expected_proven": false
+    },
+    {
+      "id": "N09-damaged-json",
+      "carrier": "text",
+      "reference_json": "{\"hits\":[]}",
+      "candidate_json": "{\"hits\":[",
+      "expected_proven": false
+    },
+    {
+      "id": "N10-second-decode-forbidden",
+      "carrier": "text",
+      "reference_json": "{\"hits\":[]}",
+      "candidate_json": "\"{\\\"hits\\\":[]}\"",
+      "expected_proven": false
+    },
+    {
+      "id": "N11-structured-array-unsupported",
+      "carrier": "structured",
+      "reference_json": "[]",
+      "candidate_json": "[]",
+      "expected_proven": false
+    },
+    {
+      "id": "N12-extra-member",
+      "carrier": "structured",
+      "reference_json": "{\"hits\":[]}",
+      "candidate_json": "{\"hits\":[],\"ordinary\":1}",
+      "expected_proven": false
+    },
+    {
+      "id": "N13-array-order",
+      "carrier": "text",
+      "reference_json": "[{\"n\":1},{\"n\":2}]",
+      "candidate_json": "[{\"n\":2},{\"n\":1}]",
+      "expected_proven": false
+    },
+    {
+      "id": "N14-raw-byte-difference",
+      "carrier": "raw",
+      "reference_json": "{\"hits\":[]}",
+      "candidate_json": "{ \"hits\": [] }",
+      "expected_proven": false
+    },
+    {
+      "id": "N15-no-raw-evidence",
+      "carrier": "structured",
+      "reference_json": "{\"hits\":[{\"line_number\":1,\"content\":\"synthetic\"}]}",
+      "candidate_json": "{\"hits\":[{\"line_number\":1,\"content\":\"synthetic\"}]}",
+      "expected_proven": false,
+      "raw_evidence_available": false
+    },
+    {
+      "id": "N16-wrong-position",
+      "carrier": "structured",
+      "reference_json": "{\"hits\":[{\"line_number\":1,\"content\":\"synthetic\"}]}",
+      "candidate_json": "{\"hits\":[{\"line_number\":1,\"content\":\"synthetic\"}]}",
+      "expected_proven": false,
+      "pointer": "/other/structuredContent"
+    }
+  ]
+}

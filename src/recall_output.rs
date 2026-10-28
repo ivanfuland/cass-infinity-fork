@@ -56,6 +56,29 @@ pub fn encode(tool: RecallTool, value: &Value) -> Result<String, RecallError> {
 
 /// Parse the entire document. Never extract a matching tag from mixed output.
 pub fn decode(input: &str, expected: RecallTool) -> Result<Value, RecallError> {
+    decode_with_original_json(input, expected).map(|(value, _)| value)
+}
+
+/// The same parse as [`decode`], plus the exact JSON text that was parsed.
+///
+/// The lossless copy proof needs the original number spelling and the original
+/// member list; re-serializing the parsed `Value` would lose both. The public
+/// [`decode`] keeps its own signature, acceptance order and duplicate-key
+/// behavior (the last duplicate wins, as before).
+pub(crate) fn decode_with_original_json(
+    input: &str,
+    expected: RecallTool,
+) -> Result<(Value, String), RecallError> {
+    let json = extract_json(input, expected)?;
+    let value = serde_json::from_str(&json).map_err(|_| RecallError("invalid JSON"))?;
+    if !expected.accepts(&value) {
+        return Err(RecallError("result shape does not match tool"));
+    }
+    Ok((value, json))
+}
+
+/// The single root element and its body text, with the expected tool checked.
+fn extract_json(input: &str, expected: RecallTool) -> Result<String, RecallError> {
     let mut reader = Reader::from_str(input);
     let mut state = 0; // before root, inside root, after root
     let mut json = String::new();
@@ -119,9 +142,5 @@ pub fn decode(input: &str, expected: RecallTool) -> Result<Value, RecallError> {
             _ => return Err(RecallError("expected one text-only recall root")),
         }
     }
-    let value = serde_json::from_str(&json).map_err(|_| RecallError("invalid JSON"))?;
-    if !expected.accepts(&value) {
-        return Err(RecallError("result shape does not match tool"));
-    }
-    Ok(value)
+    Ok(json)
 }

@@ -37,7 +37,8 @@ use crate::indexer::recall_v2::{
     looks_like_recall_wrapper, parse_cli,
 };
 use crate::indexer::redact_secrets::MemoizingRedactor;
-use crate::recall_output::{RecallTool, decode};
+use crate::recall_output::{RecallTool, decode, decode_with_original_json};
+use franken_agent_detection::LosslessSourceValue;
 
 /// The four strong Pi tool identities from spec C1. Only the exact full name
 /// is proof of attribution; an unknown MCP namespace is never treated as a
@@ -96,12 +97,20 @@ pub(crate) struct PiFacts {
     pub(crate) alignment_ok: bool,
     /// Result body shape keyed by result message index.
     pub(crate) result_body_shapes: BTreeMap<usize, PiResultBodyShape>,
+    /// The captured blob line of each matched `toolResult` record, keyed by
+    /// canonical message index. Only the lossless copy proof reads it; it is
+    /// never written into a message's `extra` or the database.
+    pub(crate) result_line_texts: BTreeMap<usize, String>,
 }
 
 /// One projected native `message` record from the captured blob.
 struct RawMessage {
     line_no: usize,
     value: Value,
+    /// The captured line exactly as it sits in the blob. The lossless copy
+    /// proof reads number spellings and repeated member names from here; the
+    /// parsed `value` cannot preserve them.
+    text: String,
 }
 
 /// One `toolCall` site found inside a matched assistant message.
@@ -165,6 +174,7 @@ impl PiFacts {
             candidate_result_indices: BTreeSet::new(),
             alignment_ok,
             result_body_shapes: BTreeMap::new(),
+            result_line_texts: BTreeMap::new(),
         };
 
         // Every `toolCall` block of every matched assistant message is a
@@ -183,6 +193,9 @@ impl PiFacts {
             facts
                 .result_body_shapes
                 .insert(result_idx, result_body_shape(value));
+            facts
+                .result_line_texts
+                .insert(result_idx, raw_messages[*raw_idx].text.clone());
 
             // A structural candidate hint only. The four strong names are the
             // sole strong identity; a bare name or another MCP namespace is a
@@ -321,9 +334,10 @@ fn projected_raw_messages(blob_path: &Path) -> Vec<RawMessage> {
         .filter(|(_, line)| !line.trim().is_empty())
         .filter_map(|(index, line)| {
             let value: Value = serde_json::from_str(line).ok()?;
-            projection_emits_message(&value).then_some(RawMessage {
+            projection_emits_message(&value).then(|| RawMessage {
                 line_no: index + 1,
                 value,
+                text: line.to_string(),
             })
         })
         .collect()
@@ -870,7 +884,11 @@ pub(crate) fn cleanup_pi_conversation(
         let body = conv.messages[idx].content.clone();
         let binding = facts.bindings.get(&idx);
 
-        let outcome = judge_pi_result(
+        let PiJudgment {
+            outcome,
+            copies,
+            tool,
+        } = judge_pi_result(
             &facts,
             &conv.messages[idx],
             idx,
@@ -882,6 +900,7 @@ pub(crate) fn cleanup_pi_conversation(
         );
         match outcome {
             Outcome::Exclude(judged) => {
+                let original = conv.messages[idx].clone();
                 let marker = apply_with_redaction(
                     &mut conv.messages[idx],
                     &judged,
@@ -891,8 +910,24 @@ pub(crate) fn cleanup_pi_conversation(
                     field_map,
                     redaction_enabled,
                 );
-                clear_pi_result_body(&mut conv.messages[idx].extra, shape, &marker);
-                excluded[idx] = Some(marker);
+                // Both the body and every proven copy land on one message
+                // copy and one write. The write is taken only when nothing is
+                // left to exclude and every changed leaf is owned by this
+                // cleanup; otherwise the whole record is kept.
+                let before = original.extra.clone();
+                let mut cleaned = before.clone();
+                clear_pi_result_body(&mut cleaned, shape, &marker);
+                clear_pi_copies(&mut cleaned, &copies, &marker);
+                let atomic = tool.is_some_and(|tool| {
+                    pi_cleanup_is_atomic(&before, &cleaned, shape, &copies, &marker, &body, tool)
+                });
+                if atomic {
+                    conv.messages[idx].extra = cleaned;
+                    excluded[idx] = Some(marker);
+                } else {
+                    conv.messages[idx] = original;
+                    bump(&mut uncovered_by_reason, UncoveredReason::UnpairedResult);
+                }
             }
             Outcome::Preserve(Some(reason)) => bump(&mut uncovered_by_reason, reason),
             Outcome::Preserve(None) => {}
@@ -904,6 +939,25 @@ pub(crate) fn cleanup_pi_conversation(
         uncovered_by_reason,
         alignment_failed: false,
         event_count: facts.raw_message_count,
+    }
+}
+
+/// The judgment for one Pi result record, plus the proven copy slots to clear
+/// when the shared core excludes it. `tool` is set exactly when `outcome` is
+/// `Exclude`, so the atomic write can re-check the cleaned extra.
+struct PiJudgment {
+    outcome: Outcome,
+    copies: Vec<PiCopySlot>,
+    tool: Option<RecallTool>,
+}
+
+impl PiJudgment {
+    fn preserved(reason: Option<UncoveredReason>) -> Self {
+        Self {
+            outcome: Outcome::Preserve(reason),
+            copies: Vec::new(),
+            tool: None,
+        }
     }
 }
 
@@ -923,67 +977,97 @@ fn judge_pi_result(
     body: &str,
     calls_by_id: &HashMap<String, Vec<CallSite>>,
     declarations: &[ReadDeclaration],
-) -> Outcome {
+) -> PiJudgment {
     let Some(kind) = identify_candidate(&message.extra, idx, body, calls_by_id, declarations)
     else {
-        return Outcome::Preserve(None);
+        return PiJudgment::preserved(None);
     };
 
     // Candidate-only: an unsafe body shape or a missing/ambiguous binding is
     // diagnosed before any identity or format branch.
     let Some(binding) = binding else {
-        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+        return PiJudgment::preserved(Some(UncoveredReason::UnpairedResult));
     };
     if shape == PiResultBodyShape::Mixed {
-        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+        return PiJudgment::preserved(Some(UncoveredReason::UnpairedResult));
     }
 
     match kind {
-        PiCandidateKind::Strong(tool) => {
-            // A strong identity is proven by its exact full name. An
-            // unproven copy of the body elsewhere in the record is preserved
-            // and counted -- never excluded.
-            if has_unproven_body_copy(&message.extra, body, tool) {
-                return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
-            }
-            shared_pi_outcome(
+        PiCandidateKind::Strong(tool) => judged_pi_outcome(
+            facts,
+            message,
+            idx,
+            binding,
+            DirectToolCategory::Strong(tool),
+            tool,
+            body,
+        ),
+        PiCandidateKind::Bare(tool) => {
+            // A complete envelope is the bare identity's proof. A bound
+            // damaged envelope keeps the bounded invalid-format diagnosis
+            // from the shared core.
+            judged_pi_outcome(
                 facts,
                 message,
                 idx,
                 binding,
-                DirectToolCategory::Strong(tool),
+                DirectToolCategory::Bare(tool),
+                tool,
+                body,
             )
-        }
-        PiCandidateKind::Bare(tool) => {
-            // A complete envelope is the bare identity's proof; a copy of it
-            // elsewhere is still unproven. A bound damaged envelope keeps the
-            // bounded invalid-format diagnosis from the shared core.
-            if declares_c04(body, tool) && has_unproven_body_copy(&message.extra, body, tool) {
-                return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
-            }
-            shared_pi_outcome(facts, message, idx, binding, DirectToolCategory::Bare(tool))
         }
         PiCandidateKind::Foreign(_) => {
             // Another server's same-suffixed name is never a CASS identity.
             // A bound result carrying the complete envelope is ambiguous
             // enough to report.
-            Outcome::Preserve(Some(UncoveredReason::AmbiguousToolIdentity))
+            PiJudgment::preserved(Some(UncoveredReason::AmbiguousToolIdentity))
         }
         PiCandidateKind::Shell => {
             // A shell call is never excluded and never executed.
-            Outcome::Preserve(Some(UncoveredReason::UnsupportedShell))
+            PiJudgment::preserved(Some(UncoveredReason::UnsupportedShell))
         }
         PiCandidateKind::Read => {
             // Eligibility is already proven: a bound read of a prior CASS
             // result's declared full output carrying a complete envelope. The
             // attribution is ambiguous, so the row is preserved and counted.
             // Nothing is read from disk and no response is fabricated.
-            Outcome::Preserve(Some(UncoveredReason::AmbiguousToolIdentity))
+            PiJudgment::preserved(Some(UncoveredReason::AmbiguousToolIdentity))
         }
         PiCandidateKind::IdOnly => {
             // The result's id names one earlier strong CASS call, but its own
             // name does not prove the identity, so it cannot bind.
-            Outcome::Preserve(Some(UncoveredReason::UnpairedResult))
+            PiJudgment::preserved(Some(UncoveredReason::UnpairedResult))
+        }
+    }
+}
+
+/// Run the shared direct-tool core, then consume the copy proof only when the
+/// core gives `Exclude`. An unproven or ambiguous copy turns that exclusion
+/// into the existing whole-record preservation.
+fn judged_pi_outcome(
+    facts: &PiFacts,
+    message: &NormalizedMessage,
+    idx: usize,
+    binding: &PiBinding,
+    category: DirectToolCategory,
+    tool: RecallTool,
+    body: &str,
+) -> PiJudgment {
+    match shared_pi_outcome(facts, message, idx, binding, category) {
+        Outcome::Preserve(reason) => PiJudgment::preserved(reason),
+        Outcome::Exclude(judged) => {
+            let raw_document = facts
+                .result_line_texts
+                .get(&idx)
+                .and_then(|line| LosslessSourceValue::parse(line.as_bytes()).ok());
+            match pi_copy_cleanup_plan(&message.extra, body, tool, raw_document.as_ref()) {
+                Some(copies) => PiJudgment {
+                    outcome: Outcome::Exclude(judged),
+                    copies,
+                    tool: Some(tool),
+                },
+                None => PiJudgment::preserved(Some(UncoveredReason::UnpairedResult)),
+            }
         }
     }
 }
@@ -1026,25 +1110,67 @@ fn pi_judgment_event(event: &RawEvent, binding_id: &str) -> RawEvent {
     judged
 }
 
+/// One of the three fixed carriers under `/message/details` that R18 may
+/// clean once its value is proven equal to the verified result. The position
+/// alone never grants permission; the value proof must hold at the same time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiCopySlot {
+    Raw,
+    StructuredContent,
+    Text,
+}
+
+impl PiCopySlot {
+    const ALL: [Self; 3] = [Self::Raw, Self::StructuredContent, Self::Text];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::StructuredContent => "structuredContent",
+            Self::Text => "text",
+        }
+    }
+}
+
+/// The proof state of one permitted copy slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiCopyProof {
+    /// The slot holds no value, so it neither leaks nor blocks the exclusion.
+    Absent,
+    /// The slot holds a copy proven equal to the verified result.
+    Proven,
+    /// The slot cannot be proven; the whole record is kept.
+    Unproven,
+}
+
 /// True when the same record carries a copy of the result body outside the
-/// proven body leaf. The body's attribution is proven only for the content
-/// slot: for a plain string that whole value, for a block array the `text`
-/// field of each text block. Every other string in the record is checked,
-/// including a text block's other fields, a non-text block's metadata, the
-/// message's other fields and the record's top-level fields.
+/// proven body leaf and outside `proven_slots`. The body's attribution is
+/// proven only for the content slot: for a plain string that whole value, for
+/// a block array the `text` field of each text block. Every other string in
+/// the record is checked, including a text block's other fields, a non-text
+/// block's metadata, the message's other fields and the record's top-level
+/// fields.
 ///
 /// A complete C04 envelope is recognized through the shared codec: a copy
 /// must decode for the same tool to the same value. Surrounding whitespace
-/// therefore does not hide a copy. If the body cannot be decoded, a complete
-/// envelope for the same tool elsewhere makes attribution unproven instead.
-/// Plain JSON and other non-envelope metadata do not acquire copy semantics.
-fn has_unproven_body_copy(extra: &Value, body: &str, tool: RecallTool) -> bool {
+/// therefore does not hide a copy. A byte-identical copy of the whole body is
+/// a copy whether the body is a complete envelope or the older unwrapped JSON.
+/// If the body cannot be decoded, a complete envelope for the same tool
+/// elsewhere makes attribution unproven instead. Plain JSON and other
+/// non-envelope metadata do not acquire copy semantics beyond that exact
+/// equality.
+fn has_unproven_body_copy(
+    extra: &Value,
+    body: &str,
+    tool: RecallTool,
+    proven_slots: &[PiCopySlot],
+) -> bool {
     let reference = decode(body, tool).ok();
     let reference = reference.as_ref();
     match extra {
         Value::Object(record) => record.iter().any(|(key, value)| {
             if key == "message" {
-                copy_in_message(value, body, reference, tool)
+                copy_in_message(value, body, reference, tool, proven_slots)
             } else {
                 value_has_body_copy(value, body, reference, tool)
             }
@@ -1054,20 +1180,37 @@ fn has_unproven_body_copy(extra: &Value, body: &str, tool: RecallTool) -> bool {
 }
 
 /// Walk one message object, skipping only the proven body leaves under
-/// `content`.
+/// `content` and the already proven copy slots under `details`.
 fn copy_in_message(
     message: &Value,
     body: &str,
     reference: Option<&Value>,
     tool: RecallTool,
+    proven_slots: &[PiCopySlot],
 ) -> bool {
     match message {
+        Value::Object(fields) => fields.iter().any(|(key, value)| match key.as_str() {
+            "content" => copy_in_content(value, body, reference, tool),
+            "details" => copy_in_details(value, body, reference, tool, proven_slots),
+            _ => value_has_body_copy(value, body, reference, tool),
+        }),
+        other => value_has_body_copy(other, body, reference, tool),
+    }
+}
+
+/// Walk the `details` object while ignoring the proven slots. An unproven
+/// slot is not skipped: its value still counts as a copy.
+fn copy_in_details(
+    details: &Value,
+    body: &str,
+    reference: Option<&Value>,
+    tool: RecallTool,
+    proven_slots: &[PiCopySlot],
+) -> bool {
+    match details {
         Value::Object(fields) => fields.iter().any(|(key, value)| {
-            if key == "content" {
-                copy_in_content(value, body, reference, tool)
-            } else {
-                value_has_body_copy(value, body, reference, tool)
-            }
+            let proven = proven_slots.iter().any(|slot| slot.name() == key.as_str());
+            !proven && value_has_body_copy(value, body, reference, tool)
         }),
         other => value_has_body_copy(other, body, reference, tool),
     }
@@ -1116,12 +1259,297 @@ fn value_has_body_copy(
 }
 
 fn is_body_copy(text: &str, body: &str, reference: Option<&Value>, tool: RecallTool) -> bool {
-    if looks_like_recall_wrapper(body) && text == body {
+    // A byte-identical copy of the whole body is a copy whether the body is a
+    // complete C04 envelope or the older unwrapped JSON. Inside the three
+    // permitted slots this equality is the A1 proof; anywhere else it can
+    // only stop an exclusion.
+    if text == body {
         return true;
     }
     match reference {
         Some(expected) => decode(text, tool).ok().as_ref() == Some(expected),
         None => decode(text, tool).is_ok(),
+    }
+}
+
+/// Decide the copy cleanup of a result the shared core already decided to
+/// exclude.
+///
+/// `None` means the whole record is kept: a permitted slot holds a value that
+/// cannot be proven, or a copy of the body survives outside the proven slots.
+/// `Some(slots)` lists the proven slots to replace; the body itself is always
+/// cleared by the caller.
+///
+/// The proof is only ever consumed after the identity, binding and body rules
+/// gave `Exclude`; it never grants an exclusion by itself.
+fn pi_copy_cleanup_plan(
+    extra: &Value,
+    body: &str,
+    tool: RecallTool,
+    raw_document: Option<&LosslessSourceValue>,
+) -> Option<Vec<PiCopySlot>> {
+    // The verified result JSON text. A complete C04 envelope carries it inside
+    // the root element; an older unwrapped body is that text itself. Nothing
+    // here re-serializes a parsed value.
+    let envelope = decode_with_original_json(body, tool).ok();
+    let legacy_body = match &envelope {
+        Some(_) => None,
+        None => LosslessSourceValue::parse(body.as_bytes())
+            .ok()
+            .map(|_| body),
+    };
+    let reference_json = envelope
+        .as_ref()
+        .map(|(_, json)| json.as_str())
+        .or(legacy_body);
+    let reference =
+        reference_json.and_then(|json| LosslessSourceValue::parse(json.as_bytes()).ok());
+
+    let mut proven = Vec::new();
+    for slot in PiCopySlot::ALL {
+        let proof = prove_pi_copy_slot(extra, raw_document, slot, reference.as_ref(), legacy_body);
+        match proof {
+            PiCopyProof::Absent => {}
+            PiCopyProof::Proven => proven.push(slot),
+            PiCopyProof::Unproven => return None,
+        }
+    }
+
+    if has_unproven_body_copy(extra, body, tool, &proven) {
+        return None;
+    }
+    Some(proven)
+}
+
+/// Prove one permitted slot against its fixed carrier rule.
+///
+/// * `raw`: a non-envelope string byte-identical to the verified legacy body.
+/// * `structuredContent`: an object equal to the verified JSON value.
+/// * `text`: a string that decodes exactly once to the verified JSON value.
+///
+/// The value is read from the captured blob line, not from the parsed
+/// `extra`, so a repeated member name or a distinct number spelling is still
+/// visible. A missing captured line, a position mismatch, a rejected parse or
+/// a value difference is `Unproven`.
+fn prove_pi_copy_slot(
+    extra: &Value,
+    raw_document: Option<&LosslessSourceValue>,
+    slot: PiCopySlot,
+    reference: Option<&LosslessSourceValue>,
+    legacy_body: Option<&str>,
+) -> PiCopyProof {
+    let present = extra
+        .pointer("/message/details")
+        .and_then(Value::as_object)
+        .is_some_and(|details| details.contains_key(slot.name()));
+    if !present {
+        return PiCopyProof::Absent;
+    }
+    let Some(document) = raw_document else {
+        return PiCopyProof::Unproven;
+    };
+    let Some(candidate) = document
+        .get("message")
+        .and_then(|message| message.get("details"))
+        .and_then(|details| details.get(slot.name()))
+    else {
+        return PiCopyProof::Unproven;
+    };
+    let proven = match slot {
+        PiCopySlot::Raw => matches!(legacy_body, Some(body) if candidate.as_str() == Some(body)),
+        PiCopySlot::StructuredContent => {
+            matches!(candidate, LosslessSourceValue::Object(_))
+                && reference.is_some_and(|reference| lossless_copy_equal(reference, candidate))
+        }
+        PiCopySlot::Text => candidate.as_str().is_some_and(|text| {
+            let Ok(decoded) = LosslessSourceValue::parse(text.as_bytes()) else {
+                return false;
+            };
+            // At most one decode: a value that is still a string is never
+            // decoded a second time.
+            !matches!(decoded, LosslessSourceValue::String(_))
+                && reference.is_some_and(|reference| lossless_copy_equal(reference, &decoded))
+        }),
+    };
+    if proven {
+        PiCopyProof::Proven
+    } else {
+        PiCopyProof::Unproven
+    }
+}
+
+/// The fixed copy equality. Object member order is irrelevant; array order,
+/// value type and string value matter; a number is equal only to the identical
+/// token, never to an equal float or a rounded neighbour. Values that exceed
+/// the comparison bound are never proven.
+fn lossless_copy_equal(reference: &LosslessSourceValue, candidate: &LosslessSourceValue) -> bool {
+    const MAX_DEPTH: usize = 128;
+    if !within_copy_depth(reference, MAX_DEPTH) || !within_copy_depth(candidate, MAX_DEPTH) {
+        return false;
+    }
+    let mut stack = vec![(reference, candidate)];
+    while let Some((left, right)) = stack.pop() {
+        match (left, right) {
+            (LosslessSourceValue::Object(left), LosslessSourceValue::Object(right)) => {
+                if left.len() != right.len() {
+                    return false;
+                }
+                for (key, left_value) in left {
+                    let Some((_, right_value)) = right.iter().find(|(other, _)| other == key)
+                    else {
+                        return false;
+                    };
+                    stack.push((left_value, right_value));
+                }
+            }
+            (LosslessSourceValue::Array(left), LosslessSourceValue::Array(right)) => {
+                if left.len() != right.len() {
+                    return false;
+                }
+                stack.extend(left.iter().zip(right));
+            }
+            (LosslessSourceValue::String(left), LosslessSourceValue::String(right)) => {
+                if left != right {
+                    return false;
+                }
+            }
+            (LosslessSourceValue::Number(left), LosslessSourceValue::Number(right)) => {
+                if left.as_str() != right.as_str() {
+                    return false;
+                }
+            }
+            (LosslessSourceValue::Bool(left), LosslessSourceValue::Bool(right)) => {
+                if left != right {
+                    return false;
+                }
+            }
+            (LosslessSourceValue::Null, LosslessSourceValue::Null) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether a value's nesting stays within the comparison bound.
+fn within_copy_depth(value: &LosslessSourceValue, max: usize) -> bool {
+    let mut stack = vec![(value, 1usize)];
+    while let Some((value, depth)) = stack.pop() {
+        if depth > max {
+            return false;
+        }
+        match value {
+            LosslessSourceValue::Object(members) => {
+                stack.extend(members.iter().map(|(_, value)| (value, depth + 1)));
+            }
+            LosslessSourceValue::Array(items) => {
+                stack.extend(items.iter().map(|item| (item, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Replace each proven copy with the same placeholder the body uses. Keys and
+/// the `details` object itself stay; only the proven leaf value changes.
+fn clear_pi_copies(extra: &mut Value, slots: &[PiCopySlot], marker: &ExcludedMarker) {
+    if slots.is_empty() {
+        return;
+    }
+    let placeholder = serde_json::json!({
+        "redacted": true,
+        "sha256": marker.sha256,
+        "bytes": marker.bytes,
+    });
+    let Some(details) = extra
+        .pointer_mut("/message/details")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for slot in slots {
+        if details.contains_key(slot.name()) {
+            details.insert(slot.name().to_string(), placeholder.clone());
+        }
+    }
+}
+
+/// Verify the atomic write before it reaches the canonical message: no copy
+/// of the body survives, and every changed leaf is one the cleanup owns and
+/// now holds the marker placeholder. Anything else keeps the record whole.
+fn pi_cleanup_is_atomic(
+    before: &Value,
+    after: &Value,
+    shape: PiResultBodyShape,
+    slots: &[PiCopySlot],
+    marker: &ExcludedMarker,
+    body: &str,
+    tool: RecallTool,
+) -> bool {
+    if has_unproven_body_copy(after, body, tool, &[]) {
+        return false;
+    }
+    let placeholder = serde_json::json!({
+        "redacted": true,
+        "sha256": marker.sha256,
+        "bytes": marker.bytes,
+    });
+    let mut paths = Vec::new();
+    changed_paths(before, after, "", &mut paths);
+    paths.iter().all(|path| {
+        // A scalar slot is replaced at its own path; an object or array slot
+        // is replaced as a whole, so its changed children are reported. Both
+        // count only when the slot value itself is now the placeholder.
+        let cleared_slot = slots.iter().any(|slot| {
+            let root = format!("/message/details/{}", slot.name());
+            let changed = path == &root
+                || (path.starts_with(&root) && path.as_bytes().get(root.len()) == Some(&b'/'));
+            changed && after.pointer(&root) == Some(&placeholder)
+        });
+        let cleared_body = match shape {
+            PiResultBodyShape::String => {
+                path == "/message/content"
+                    && after.pointer("/message/content") == Some(&placeholder)
+            }
+            PiResultBodyShape::TextBlocks => {
+                path.starts_with("/message/content/")
+                    && path.ends_with("/text")
+                    && after.pointer(path) == Some(&placeholder)
+            }
+            PiResultBodyShape::Mixed => false,
+        };
+        cleared_slot || cleared_body
+    })
+}
+
+/// Every path whose value differs between two JSON documents. A container that
+/// changed shape (or an array whose length changed) is reported as that
+/// container's own path.
+fn changed_paths(before: &Value, after: &Value, path: &str, out: &mut Vec<String>) {
+    if before == after {
+        return;
+    }
+    match (before, after) {
+        (Value::Object(left), Value::Object(right)) => {
+            for (key, left_value) in left {
+                let child = format!("{path}/{key}");
+                match right.get(key) {
+                    Some(right_value) => changed_paths(left_value, right_value, &child, out),
+                    None => out.push(child),
+                }
+            }
+            for key in right.keys() {
+                if !left.contains_key(key) {
+                    out.push(format!("{path}/{key}"));
+                }
+            }
+        }
+        (Value::Array(left), Value::Array(right)) if left.len() == right.len() => {
+            for (index, (left_value, right_value)) in left.iter().zip(right).enumerate() {
+                changed_paths(left_value, right_value, &format!("{path}/{index}"), out);
+            }
+        }
+        _ => out.push(path.to_string()),
     }
 }
 
@@ -1795,6 +2223,97 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // R18: three proven non-envelope copies.
+    //
+    // These helpers write the derived blob from literal JSONL lines instead of
+    // re-serializing a `Value`, so a case can carry a JSON number token or a
+    // duplicate key exactly as the matrix fixture spells it. The real pinned
+    // connector still projects the result.
+    // ========================================================================
+
+    const R18_SESSION_LINE: &str = r#"{"type":"session","version":3,"id":"synthetic-R18","timestamp":"2026-10-24T00:00:00.000Z","cwd":"/synthetic/alien"}"#;
+
+    fn r18_user_line(id: &str, text: &str) -> String {
+        serde_json::json!({
+            "type": "message",
+            "id": id,
+            "timestamp": "2026-10-24T00:00:00.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        })
+        .to_string()
+    }
+
+    fn r18_call_line(id: &str, call_id: &str, tool_name: &str, arguments: Value) -> String {
+        serde_json::json!({
+            "type": "message",
+            "id": id,
+            "timestamp": "2026-10-24T00:00:00.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "toolCall",
+                    "id": call_id,
+                    "name": tool_name,
+                    "arguments": arguments,
+                }],
+            },
+        })
+        .to_string()
+    }
+
+    /// One native result line. `details` is spliced in as a literal JSON text,
+    /// so a copy keeps its own number spelling and member order.
+    fn r18_result_line(
+        id: &str,
+        call_id: &str,
+        tool_name: &str,
+        body: &str,
+        details: Option<&str>,
+    ) -> String {
+        let body = serde_json::to_string(body).unwrap();
+        let details = details.map_or_else(String::new, |details| format!(",\"details\":{details}"));
+        format!(
+            "{{\"type\":\"message\",\"id\":\"{id}\",\"timestamp\":\"2026-10-24T00:00:00.000Z\",\"message\":{{\"role\":\"toolResult\",\"content\":[{{\"type\":\"text\",\"text\":{body}}}],\"toolCallId\":\"{call_id}\",\"toolName\":\"{tool_name}\",\"isError\":false{details}}}}}"
+        )
+    }
+
+    fn project_literal(tag: &str, lines: &[String]) -> FullVariant {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join(".pi/agent/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let blob = sessions.join(format!("2026-10-24T00-00-00_R18_{tag}.jsonl"));
+        let mut text = lines.join("\n");
+        text.push('\n');
+        fs::write(&blob, text).unwrap();
+
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass-data"),
+            vec![ScanRoot::local(dir.path().to_path_buf())],
+            None,
+        );
+        let mut conversations = PiAgentConnector::new().scan(&ctx).unwrap();
+        assert_eq!(conversations.len(), 1, "{tag}: one projected conversation");
+        let conversation = conversations.remove(0);
+        assert_eq!(
+            conversation.source_path, blob,
+            "{tag}: projection reads the derived copy"
+        );
+        FullVariant {
+            blob,
+            conversation,
+            _dir: dir,
+        }
+    }
+
+    fn r18_placeholder(marker: &ExcludedMarker) -> Value {
+        serde_json::json!({
+            "redacted": true,
+            "sha256": marker.sha256,
+            "bytes": marker.bytes,
+        })
+    }
+
     /// Derive the canonical result extra so it no longer equals any blob
     /// line: the result itself leaves the one-to-one mapping while the blob
     /// keeps its valid native record.
@@ -2139,5 +2658,609 @@ mod tests {
             4,
             2,
         );
+    }
+
+    /// C1: one legacy-JSON body with its byte-identical `details.raw` copy, and
+    /// one C04 body with both a decoded `details.structuredContent` object and
+    /// a once-decoded `details.text` string. Each proven copy is replaced by
+    /// the same marker placeholder as the body, ordinary sibling metadata
+    /// survives, and the captured blob is never written.
+    #[test]
+    fn r18_pi_three_slots_clean() {
+        let legacy_body = r#"{"hits":[{"line_number":1,"content":"synthetic"}]}"#;
+        let inner = r#"{"hits":[]}"#;
+        let lines = vec![
+            R18_SESSION_LINE.to_string(),
+            r18_user_line("u", "ordinary synthetic user"),
+            r18_call_line(
+                "a1",
+                "c1",
+                "mcp__cass_mcp__cass_search",
+                serde_json::json!({"query": "synthetic alien"}),
+            ),
+            r18_result_line(
+                "r1",
+                "c1",
+                "mcp__cass_mcp__cass_search",
+                legacy_body,
+                Some(&format!(
+                    r#"{{"server":"cass-mcp","fullOutputPath":"/synthetic/out.json","raw":{}}}"#,
+                    serde_json::to_string(legacy_body).unwrap()
+                )),
+            ),
+            r18_call_line(
+                "a2",
+                "c2",
+                "mcp__cass_mcp__cass_search",
+                serde_json::json!({"query": "synthetic alien"}),
+            ),
+            r18_result_line(
+                "r2",
+                "c2",
+                "mcp__cass_mcp__cass_search",
+                SEARCH_C04,
+                Some(&format!(
+                    r#"{{"server":"cass-mcp","structuredContent":{inner},"text":{}}}"#,
+                    serde_json::to_string(inner).unwrap()
+                )),
+            ),
+        ];
+        let mut variant = project_literal("three-slots", &lines);
+        let blob_before = fs::read(&variant.blob).unwrap();
+
+        let outcome = cleanup_pi_conversation(
+            &variant.blob,
+            &mut variant.conversation,
+            "derived/r18.jsonl",
+            false,
+        );
+
+        assert!(!outcome.alignment_failed, "real projection aligns");
+        assert_eq!(
+            outcome.uncovered_by_reason,
+            BTreeMap::new(),
+            "both proven results are excluded, nothing is preserved"
+        );
+
+        // A1: legacy body plus its byte-identical raw copy.
+        let legacy_marker = outcome.excluded[2]
+            .as_ref()
+            .expect("A1 legacy-JSON result is excluded");
+        let legacy_placeholder = r18_placeholder(legacy_marker);
+        let legacy_message = &variant.conversation.messages[2];
+        assert!(
+            legacy_message.content.is_empty(),
+            "A1: the body leaves the content slot"
+        );
+        assert_eq!(
+            legacy_message.extra.pointer("/message/content/0/text"),
+            Some(&legacy_placeholder),
+            "A1: the body uses the marker placeholder"
+        );
+        assert_eq!(
+            legacy_message.extra.pointer("/message/details/raw"),
+            Some(&legacy_placeholder),
+            "A1: the proven raw copy uses the same placeholder"
+        );
+        assert_eq!(
+            legacy_message.extra.pointer("/message/details/server"),
+            Some(&Value::String("cass-mcp".to_string())),
+            "A1: ordinary sibling metadata survives"
+        );
+        assert_eq!(
+            legacy_message
+                .extra
+                .pointer("/message/details/fullOutputPath"),
+            Some(&Value::String("/synthetic/out.json".to_string())),
+            "A1: an unrelated details field is untouched"
+        );
+
+        // A2 and A3: C04 body with the decoded object and the once-decoded
+        // string copy.
+        let c04_marker = outcome.excluded[4]
+            .as_ref()
+            .expect("A2/A3 C04 result is excluded");
+        let c04_placeholder = r18_placeholder(c04_marker);
+        let c04_message = &variant.conversation.messages[4];
+        assert!(
+            c04_message.content.is_empty(),
+            "A2/A3: the body leaves the content slot"
+        );
+        assert_eq!(
+            c04_message.extra.pointer("/message/content/0/text"),
+            Some(&c04_placeholder),
+            "A2/A3: the body uses the marker placeholder"
+        );
+        assert_eq!(
+            c04_message
+                .extra
+                .pointer("/message/details/structuredContent"),
+            Some(&c04_placeholder),
+            "A2: the decoded object copy uses the same placeholder"
+        );
+        assert_eq!(
+            c04_message.extra.pointer("/message/details/text"),
+            Some(&c04_placeholder),
+            "A3: the once-decoded string copy uses the same placeholder"
+        );
+        assert_eq!(
+            c04_message.extra.pointer("/message/details/server"),
+            Some(&Value::String("cass-mcp".to_string())),
+            "A2/A3: ordinary sibling metadata survives"
+        );
+        assert_eq!(
+            fs::read(&variant.blob).unwrap(),
+            blob_before,
+            "the captured blob is never written"
+        );
+    }
+
+    /// One user turn, one strong CASS call and its result, written from
+    /// literal lines. The result is canonical message index 2.
+    fn r18_single_result_lines(body: &str, details: Option<&str>) -> Vec<String> {
+        vec![
+            R18_SESSION_LINE.to_string(),
+            r18_user_line("u", "ordinary synthetic user"),
+            r18_call_line(
+                "a",
+                "c1",
+                "mcp__cass_mcp__cass_search",
+                serde_json::json!({"query": "synthetic alien"}),
+            ),
+            r18_result_line("r", "c1", "mcp__cass_mcp__cass_search", body, details),
+        ]
+    }
+
+    /// Run one cleanup and require the whole record to survive: nothing is
+    /// excluded, the single candidate is counted as unpaired, every canonical
+    /// message keeps its exact pre-run value and the blob is unchanged.
+    fn assert_r18_preserved(tag: &str, variant: &mut FullVariant) {
+        let blob_before = fs::read(&variant.blob).unwrap();
+        let before = serde_json::to_value(&variant.conversation.messages).unwrap();
+        let outcome = cleanup_pi_conversation(
+            &variant.blob,
+            &mut variant.conversation,
+            "derived/r18.jsonl",
+            false,
+        );
+        assert!(!outcome.alignment_failed, "{tag}: alignment holds");
+        assert_eq!(
+            outcome.excluded,
+            vec![None; variant.conversation.messages.len()],
+            "{tag}: nothing is excluded"
+        );
+        assert_eq!(
+            outcome.uncovered_by_reason,
+            BTreeMap::from([("unpaired_result".to_string(), 1)]),
+            "{tag}: the one candidate is preserved and counted"
+        );
+        assert_eq!(
+            serde_json::to_value(&variant.conversation.messages).unwrap(),
+            before,
+            "{tag}: body and the whole decoded extra are unchanged"
+        );
+        assert_eq!(
+            fs::read(&variant.blob).unwrap(),
+            blob_before,
+            "{tag}: the captured blob is never written"
+        );
+    }
+
+    fn run_r18_cleanup(variant: &mut FullVariant) -> PiCleanupOutcome {
+        cleanup_pi_conversation(
+            &variant.blob,
+            &mut variant.conversation,
+            "derived/r18.jsonl",
+            false,
+        )
+    }
+
+    fn copy_policy_cases() -> Vec<Value> {
+        let path = fixture_dir().join("followup_copy_policy.json");
+        let fixture: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        fixture["cases"].as_array().unwrap().clone()
+    }
+
+    /// C2: the frozen 6-positive/16-negative comparison matrix, run against
+    /// the same production proof helper the cleanup consumes.
+    #[test]
+    fn r18_pi_copy_policy_matrix() {
+        let cases = copy_policy_cases();
+        assert_eq!(cases.len(), 22, "the frozen matrix keeps its 22 cases");
+        assert_eq!(
+            cases
+                .iter()
+                .filter(|case| case["expected_proven"] == Value::Bool(true))
+                .count(),
+            6,
+            "6 proven and 16 unproven"
+        );
+
+        for case in &cases {
+            let id = case["id"].as_str().unwrap();
+            let slot = match case["carrier"].as_str().unwrap() {
+                "raw" => PiCopySlot::Raw,
+                "structured" => PiCopySlot::StructuredContent,
+                "text" => PiCopySlot::Text,
+                other => panic!("{id}: unknown carrier {other}"),
+            };
+            let reference_json = case["reference_json"].as_str().unwrap();
+            let candidate_json = case["candidate_json"].as_str().unwrap();
+            let expected = case["expected_proven"].as_bool().unwrap();
+
+            // The candidate's real value is read from the captured line, so
+            // the parsed `extra` only needs to carry the key. A non-permitted
+            // pointer keeps the slot out of `details` entirely.
+            let permitted = format!("/message/details/{}", slot.name());
+            let pointer = case["pointer"].as_str().unwrap_or(&permitted);
+            let embedded = match slot {
+                PiCopySlot::StructuredContent => candidate_json.to_string(),
+                _ => serde_json::to_string(candidate_json).unwrap(),
+            };
+            let (extra, line) = if pointer == permitted {
+                let mut line = String::from(r#"{"message":{"details":{"#);
+                line.push('"');
+                line.push_str(slot.name());
+                line.push_str("\":");
+                line.push_str(&embedded);
+                line.push_str("}}}");
+                let mut details = serde_json::Map::new();
+                details.insert(slot.name().to_string(), Value::Null);
+                (serde_json::json!({"message": {"details": details}}), line)
+            } else {
+                let name = pointer.rsplit('/').next().unwrap();
+                let mut line = String::from(r#"{"message":{"details":{},"other":{"#);
+                line.push('"');
+                line.push_str(name);
+                line.push_str("\":");
+                line.push_str(&embedded);
+                line.push_str("}}}");
+                let mut other = serde_json::Map::new();
+                other.insert(name.to_string(), Value::Null);
+                (
+                    serde_json::json!({"message": {"details": {}, "other": other}}),
+                    line,
+                )
+            };
+
+            let raw_evidence = case["raw_evidence_available"].as_bool().unwrap_or(true);
+            // The production path parses the captured line losslessly; a
+            // repeated member name anywhere in it rejects that parse, exactly
+            // as it would in a captured blob.
+            let document = raw_evidence
+                .then(|| LosslessSourceValue::parse(line.as_bytes()).ok())
+                .flatten();
+            let legacy_body = (slot == PiCopySlot::Raw && case["body_is_c04"] != Value::Bool(true))
+                .then_some(reference_json);
+            let reference = LosslessSourceValue::parse(reference_json.as_bytes()).unwrap();
+
+            let proof = prove_pi_copy_slot(
+                &extra,
+                document.as_ref(),
+                slot,
+                Some(&reference),
+                legacy_body,
+            );
+            assert_eq!(
+                proof == PiCopyProof::Proven,
+                expected,
+                "{id}: carrier {} pointer {pointer}",
+                slot.name()
+            );
+        }
+    }
+
+    /// C3: A4 and every copy outside the proven slots keep the whole record.
+    /// Ordinary metadata with the same field names or a shared fragment is
+    /// not a copy, so that row is still excluded untouched.
+    #[test]
+    fn r18_pi_unknown_copies_preserve() {
+        let legacy = r#"{"hits":[]}"#;
+
+        // A4: the raw slot carries the complete C04 envelope itself.
+        let mut variant = project_literal(
+            "a4-raw-envelope",
+            &r18_single_result_lines(
+                SEARCH_C04,
+                Some(&format!(
+                    r#"{{"raw":{}}}"#,
+                    serde_json::to_string(SEARCH_C04).unwrap()
+                )),
+            ),
+        );
+        assert_r18_preserved("A4 raw holds the complete envelope", &mut variant);
+
+        // A legacy byte-identical copy outside the three permitted slots.
+        let mut variant = project_literal(
+            "legacy-elsewhere",
+            &r18_single_result_lines(
+                legacy,
+                Some(&format!(
+                    r#"{{"note":{}}}"#,
+                    serde_json::to_string(legacy).unwrap()
+                )),
+            ),
+        );
+        assert_r18_preserved("legacy copy outside the permitted slots", &mut variant);
+
+        // An unknown field carrying the complete envelope.
+        let mut variant = project_literal(
+            "c04-elsewhere",
+            &r18_single_result_lines(
+                SEARCH_C04,
+                Some(&format!(
+                    r#"{{"other":{}}}"#,
+                    serde_json::to_string(SEARCH_C04).unwrap()
+                )),
+            ),
+        );
+        assert_r18_preserved(
+            "complete envelope outside the permitted slots",
+            &mut variant,
+        );
+
+        // Ordinary metadata that only shares field names or a fragment is not
+        // a copy: the row is excluded and every metadata value survives.
+        let mut variant = project_literal(
+            "ordinary-metadata",
+            &r18_single_result_lines(
+                legacy,
+                Some(r#"{"server":"cass-mcp","summary":"hits: synthetic","hits":[]}"#),
+            ),
+        );
+        let outcome = run_r18_cleanup(&mut variant);
+        let marker = outcome.excluded[2]
+            .as_ref()
+            .expect("ordinary metadata does not block the exclusion");
+        let placeholder = r18_placeholder(marker);
+        let extra = &variant.conversation.messages[2].extra;
+        assert_eq!(
+            extra.pointer("/message/content/0/text"),
+            Some(&placeholder),
+            "the body is cleared"
+        );
+        assert_eq!(
+            extra.pointer("/message/details/summary"),
+            Some(&Value::String("hits: synthetic".to_string())),
+            "a similar fragment stays"
+        );
+        assert_eq!(
+            extra.pointer("/message/details/hits"),
+            Some(&serde_json::json!([])),
+            "a same-named ordinary field stays"
+        );
+        assert_eq!(
+            extra.pointer("/message/details/server"),
+            Some(&Value::String("cass-mcp".to_string())),
+            "an ordinary details field stays"
+        );
+    }
+
+    /// C3: a copy that cannot be proven keeps the whole record, including a
+    /// repeated member name, a damaged candidate, a different number token, a
+    /// non-identical raw string and a non-envelope raw value under a C04 body.
+    #[test]
+    fn r18_pi_source_ambiguity_preserves() {
+        let c04 = |inner: &str| {
+            format!(r#"<cass_recall version="1" tool="cass_search">{inner}</cass_recall>"#)
+        };
+        let as_text = |text: &str| serde_json::to_string(text).unwrap();
+
+        // A repeated decoded member name in the candidate object.
+        let mut variant = project_literal(
+            "dup-key",
+            &r18_single_result_lines(
+                SEARCH_C04,
+                Some(r#"{"structuredContent":{"hits":[],"hits":[]}}"#),
+            ),
+        );
+        assert_r18_preserved("repeated member name", &mut variant);
+
+        // A repeated member name spelled with an escape in the second copy.
+        let mut variant = project_literal(
+            "dup-key-escaped",
+            &r18_single_result_lines(
+                SEARCH_C04,
+                Some(r#"{"structuredContent":{"hits":[],"hits":[]}}"#),
+            ),
+        );
+        assert_r18_preserved("escaped repeated member name", &mut variant);
+
+        // A damaged candidate string.
+        let mut variant = project_literal(
+            "damaged-text",
+            &r18_single_result_lines(
+                SEARCH_C04,
+                Some(&format!(r#"{{"text":{}}}"#, as_text(r#"{"hits":["#))),
+            ),
+        );
+        assert_r18_preserved("damaged candidate", &mut variant);
+
+        // A different number token at the same leaf.
+        let scored = c04(r#"{"hits":[{"n":1}]}"#);
+        let mut variant = project_literal(
+            "number-token",
+            &r18_single_result_lines(
+                &scored,
+                Some(r#"{"structuredContent":{"hits":[{"n":1.0}]}}"#),
+            ),
+        );
+        assert_r18_preserved("different number token", &mut variant);
+
+        // A raw value that is not byte-identical to the legacy body.
+        let mut variant = project_literal(
+            "raw-bytes",
+            &r18_single_result_lines(
+                r#"{"hits":[]}"#,
+                Some(&format!(r#"{{"raw":{}}}"#, as_text(r#"{ "hits": [] }"#))),
+            ),
+        );
+        assert_r18_preserved("raw bytes differ", &mut variant);
+
+        // A non-envelope raw value under a C04 body: A1 is closed here.
+        let mut variant = project_literal(
+            "c04-raw-inner",
+            &r18_single_result_lines(
+                SEARCH_C04,
+                Some(&format!(r#"{{"raw":{}}}"#, as_text(r#"{"hits":[]}"#))),
+            ),
+        );
+        assert_r18_preserved("raw inner JSON under a C04 body", &mut variant);
+    }
+
+    /// C4: several proven copies are cleared in the same write; one unsafe
+    /// copy keeps the body and every copy exactly as captured.
+    #[test]
+    fn r18_pi_atomic_multiple_copies() {
+        let inner = r#"{"hits":[]}"#;
+        let as_text = |text: &str| serde_json::to_string(text).unwrap();
+
+        // Two proven carriers plus ordinary metadata, all on one C04 result.
+        let mut variant = project_literal(
+            "both-proven",
+            &r18_single_result_lines(
+                SEARCH_C04,
+                Some(&format!(
+                    r#"{{"structuredContent":{inner},"text":{},"tool":"cass_search"}}"#,
+                    as_text(inner)
+                )),
+            ),
+        );
+        let blob_before = fs::read(&variant.blob).unwrap();
+        let outcome = run_r18_cleanup(&mut variant);
+        let marker = outcome.excluded[2]
+            .as_ref()
+            .expect("both copies are proven");
+        let placeholder = r18_placeholder(marker);
+        let extra = &variant.conversation.messages[2].extra;
+        assert_eq!(
+            extra.pointer("/message/details/structuredContent"),
+            Some(&placeholder),
+            "the object copy is cleared"
+        );
+        assert_eq!(
+            extra.pointer("/message/details/text"),
+            Some(&placeholder),
+            "the string copy is cleared with the same marker"
+        );
+        assert_eq!(
+            extra.pointer("/message/details/tool"),
+            Some(&Value::String("cass_search".to_string())),
+            "the sibling field is kept"
+        );
+        assert_eq!(
+            fs::read(&variant.blob).unwrap(),
+            blob_before,
+            "the captured blob is never written"
+        );
+
+        // The same shape with one damaged carrier: nothing is written.
+        let mut variant = project_literal(
+            "one-unsafe",
+            &r18_single_result_lines(
+                SEARCH_C04,
+                Some(&format!(
+                    r#"{{"structuredContent":{inner},"text":{}}}"#,
+                    as_text(r#"{"hits":["#)
+                )),
+            ),
+        );
+        assert_r18_preserved("one unsafe copy keeps all", &mut variant);
+
+        // A proven raw copy plus a second legacy copy elsewhere: the outer
+        // copy has no proven position, so the whole record stays.
+        let legacy = r#"{"hits":[]}"#;
+        let mut variant = project_literal(
+            "outer-copy",
+            &r18_single_result_lines(
+                legacy,
+                Some(&format!(
+                    r#"{{"raw":{},"note":{}}}"#,
+                    as_text(legacy),
+                    as_text(legacy)
+                )),
+            ),
+        );
+        assert_r18_preserved("an outer legacy copy keeps all", &mut variant);
+    }
+
+    /// C5: the public codec keeps its accept, reject and error behavior, and
+    /// the internal helper returns the same value plus the original JSON text.
+    #[test]
+    fn r18_codec_public_behavior_kept() {
+        use crate::recall_output::{RecallError, encode};
+        let values = [
+            (RecallTool::Search, serde_json::json!({"hits": []})),
+            (RecallTool::Expand, serde_json::json!([])),
+            (RecallTool::Sessions, serde_json::json!({"sessions": []})),
+            (
+                RecallTool::Timeline,
+                serde_json::json!({
+                    "range": {},
+                    "total_sessions": 0,
+                    "groups": {},
+                }),
+            ),
+        ];
+        for (tool, value) in values {
+            let encoded = encode(tool, &value).unwrap();
+            assert_eq!(
+                decode(&encoded, tool).unwrap(),
+                value,
+                "{tool:?}: round trip"
+            );
+            let (decoded, original) = decode_with_original_json(&encoded, tool).unwrap();
+            assert_eq!(decoded, value, "{tool:?}: same value from the helper");
+            let reparsed: Value = serde_json::from_str(&original).unwrap();
+            assert_eq!(
+                reparsed, value,
+                "{tool:?}: the helper keeps the source JSON"
+            );
+        }
+
+        assert!(
+            decode(
+                &encode(RecallTool::Search, &serde_json::json!({"hits": []})).unwrap(),
+                RecallTool::Expand
+            )
+            .is_err()
+        );
+        assert!(
+            decode(
+                "<cass_recall version=\"2\" tool=\"cass_search\">{\"hits\":[]}</cass_recall>",
+                RecallTool::Search
+            )
+            .is_err()
+        );
+        assert!(
+            decode(
+                "<cass_recall version=\"1\" tool=\"cass_search\">{\"hits\":[</cass_recall>",
+                RecallTool::Search
+            )
+            .is_err()
+        );
+        assert!(decode("<cass_recall version=\"1\" tool=\"cass_search\">{\"hits\":[]}</cass_recall><extra/>", RecallTool::Search).is_err());
+        assert!(
+            decode(
+                "prefix<cass_recall version=\"1\" tool=\"cass_search\">{\"hits\":[]}</cass_recall>",
+                RecallTool::Search
+            )
+            .is_err()
+        );
+
+        // A repeated member name is still accepted by the public codec (the
+        // last member wins), exactly as before; only the copy proof refuses it.
+        let duplicate = "<cass_recall version=\"1\" tool=\"cass_search\">{\"hits\":[],\"hits\":[]}</cass_recall>";
+        assert_eq!(
+            decode(duplicate, RecallTool::Search).unwrap(),
+            serde_json::json!({"hits": []}),
+            "public decode keeps its duplicate-key behavior"
+        );
+        let (_, original) = decode_with_original_json(duplicate, RecallTool::Search).unwrap();
+        assert_eq!(
+            original, r#"{"hits":[],"hits":[]}"#,
+            "the helper hands back the captured JSON text, repeated member and all"
+        );
+        let _: fn(&str, RecallTool) -> Result<Value, RecallError> = decode;
     }
 }
