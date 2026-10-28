@@ -11081,12 +11081,14 @@ fn restore_commit_source_item(
         .source_binding
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("a source planned item without a binding"))?;
+    let mapping_domain = journal_mapping_domain(journal).map_err(source_restore_error)?;
     let capture = provenance_from_manifest_view(view);
     let job = prepare_restore_source_job(
         &journal.data_dir,
         &capture,
         binding,
         std::sync::Arc::clone(safety),
+        mapping_domain,
     )
     .map_err(source_restore_error_from_ingest)?;
     // The real admission sits between the real prepared job and the commit
@@ -12083,7 +12085,8 @@ fn validate_restore_source_structure(
         crate::indexer::source_ingest::exclusion_epoch_for_code_version(&profile.code_version)
             .ok_or(SourceRestoreError::MaterialMismatch)?;
     if profile.fad_pin != crate::indexer::source_ingest::FAD_PIN
-        || profile.mapping_domain != crate::indexer::source_ingest::SOURCE_MAPPING_DOMAIN
+        || crate::indexer::source_ingest::SourceMappingDomain::parse(&profile.mapping_domain)
+            .is_none()
         || profile.exclusion_epoch != epoch
         || profile.redaction_fingerprint
             != crate::indexer::redact_secrets::redaction_algorithm_fingerprint()
@@ -12133,6 +12136,23 @@ fn validate_restore_source_structure(
     Ok(first_batch_planned)
 }
 
+/// The mapping identity this journal declares for its source plan.
+///
+/// The journal carries the identity in plaintext; structure validation has
+/// already refused an unknown spelling. A journal without a source profile has
+/// no declared identity, and every caller of this helper has already established
+/// that one is present.
+fn journal_mapping_domain(
+    journal: &RestoreJournal,
+) -> Result<crate::indexer::source_ingest::SourceMappingDomain, SourceRestoreError> {
+    let profile = journal
+        .source_profile
+        .as_ref()
+        .ok_or(SourceRestoreError::MaterialMismatch)?;
+    crate::indexer::source_ingest::SourceMappingDomain::parse(&profile.mapping_domain)
+        .ok_or(SourceRestoreError::MaterialMismatch)
+}
+
 fn validate_restore_source_materials(
     journal: &RestoreJournal,
 ) -> Result<Option<std::sync::Arc<crate::indexer::source_ingest::FixedSafetyConfig>>, SourceRestoreError> {
@@ -12158,6 +12178,7 @@ fn validate_restore_source_materials(
     )
     .map_err(|_| SourceRestoreError::MaterialMismatch)?;
     let safety = std::sync::Arc::new(safety);
+    let mapping_domain = journal_mapping_domain(journal)?;
 
     let views = crate::raw_mirror::manifest_views(&journal.data_dir)
         .map_err(|_| SourceRestoreError::MaterialMismatch)?;
@@ -12171,12 +12192,15 @@ fn validate_restore_source_materials(
             .ok_or(SourceRestoreError::MaterialMismatch)?;
         let capture = provenance_from_manifest_view(view);
         // One shared assembly: the declared-input adapter, the read-only safety
-        // preview, the restore admission and the seven-field proof.
+        // preview, the restore admission and the seven-field proof. The
+        // journal's declared identity decides the profile; the binding's
+        // digest-only normalizer corroborates it.
         crate::indexer::source_ingest::prepare_restore_source_job(
             &journal.data_dir,
             &capture,
             binding,
             std::sync::Arc::clone(&safety),
+            mapping_domain,
         )
         .map_err(SourceRestoreError::from_ingest)?;
     }
@@ -20222,6 +20246,346 @@ mod source_restore_context_tests {
             assert_eq!(summary.blob_id, view.blob_blake3);
         }
         println!("R14_UNIT row=healthy-unvisited-third-no-lf result=pass");
+    }
+
+    // ── R16: the journal's declared identity drives the real preparation ──
+    //
+    // The journal names the mapping identity in plaintext; each planned item
+    // carries only the seven binding fields, of which the normalizer is a bare
+    // digest. The positive side re-derives the job under the declared identity
+    // and proves all seven fields against the real job, its sealed bytes and
+    // its parser context. The negative sides refuse a declaration and a binding
+    // that name different identities, in both directions.
+    const R16_FIXED_SAFETY_UTF8: &str =
+        "memory_files = []\ninjection_only_files = []\nworkspace_scoped_files = []\nproject_read_documents = []\n";
+    const R16_CLAUDE_ONE: &[u8] = br#"{"type":"user","uuid":"R16-J-U","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"R16 journal question"}}
+"#;
+
+    struct R16World {
+        _temp: tempfile::TempDir,
+        data_dir: std::path::PathBuf,
+        safety: std::sync::Arc<crate::indexer::source_ingest::FixedSafetyConfig>,
+        capture: crate::raw_mirror::RawMirrorCaptureRecord,
+        declaration: RestoreSourceContextDeclaration,
+    }
+
+    fn r16_world() -> R16World {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let fixed_path = temp.path().join("fixed-safety.toml");
+        std::fs::write(&fixed_path, R16_FIXED_SAFETY_UTF8).expect("write the fixed copy");
+        let safety =
+            std::sync::Arc::new(load_fixed_safety_config(&fixed_path).expect("load the fixed copy"));
+        let live = temp
+            .path()
+            .join("home/.claude/projects/R16-ws/session.jsonl");
+        std::fs::create_dir_all(live.parent().expect("live parent")).expect("mkdir the live parent");
+        std::fs::write(&live, R16_CLAUDE_ONE).expect("write the payload");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let capture = crate::raw_mirror::capture_source_file_with_identity(
+            crate::raw_mirror::RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "claude",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &live,
+                db_links: &[],
+            },
+            crate::raw_mirror::RawMirrorSessionIdentity {
+                identity_host: crate::raw_mirror::RAW_MIRROR_LOCAL_IDENTITY_HOST,
+                external_id: None,
+            },
+        )
+        .expect("capture the fixture");
+        let declaration = RestoreSourceContextDeclaration {
+            manifest_id: capture.manifest_id.clone(),
+            identity_namespace: "R16_NAMESPACE".to_string(),
+            connector: "claude_code".to_string(),
+            scan_root: live
+                .parent()
+                .expect("live parent")
+                .to_string_lossy()
+                .into_owned(),
+            relative_locator: "session.jsonl".to_string(),
+            role: SourceInputRole::PrimarySessionLog,
+            origin: RestoreSourceContextOrigin {
+                source_id: "local".to_string(),
+                kind: franken_agent_detection::types::SourceKind::Local,
+                host: None,
+                source_version: None,
+            },
+            platform: None,
+            workspace_rewrites: Vec::new(),
+        };
+        R16World { _temp: temp, data_dir, safety, capture, declaration }
+    }
+
+    /// The seven binding fields one declared identity produces for this world.
+    fn r16_binding(
+        world: &R16World,
+        mapping_domain: crate::indexer::source_ingest::SourceMappingDomain,
+    ) -> SourceBindingMaterial {
+        let job = source_binding::prepare_declared_restore_source_input_for_mapping(
+            &world.data_dir,
+            &world.capture,
+            &world.declaration,
+            std::sync::Arc::clone(&world.safety),
+            mapping_domain,
+            None,
+        )
+        .expect("the declared input prepares");
+        SourceBindingMaterial {
+            declaration: world.declaration.clone(),
+            context_digest: job
+                .input
+                .identity_tuple()
+                .get(11)
+                .cloned()
+                .flatten()
+                .expect("the identity tuple carries the context digest"),
+            sealed_sha256: job.input.manifest().sealed_sha256().hex(),
+            byte_len: job.input.manifest().byte_len(),
+            normalizer_id: job.normalizer_id.clone(),
+            safety_contract_id: job.safety_contract_id.clone(),
+            input_key: job.input.input_key().hex(),
+        }
+    }
+
+    fn r16_journal(
+        world: &R16World,
+        declared: &str,
+        binding: SourceBindingMaterial,
+    ) -> RestoreJournal {
+        let contexts = source_contexts::RestoreSourceContexts {
+            schema: "cass.restore-source-contexts/1".to_string(),
+            inputs: vec![world.declaration.clone()],
+        };
+        let digest = source_contexts_digest(&contexts).expect("the contexts digest");
+        let mut profile = source_profile_material(&world.safety).expect("the profile material");
+        profile.mapping_domain = declared.to_string();
+        RestoreJournal {
+            schema_version: RESTORE_JOURNAL_SCHEMA_VERSION,
+            operation_id: "r16-op-0001".to_string(),
+            state: RestoreJournalState::Planned,
+            data_dir: world.data_dir.clone(),
+            scratch_dir: world.data_dir.join("scratch"),
+            db_path: world.data_dir.join("r16.sqlite"),
+            marker_path: world.data_dir.join(W1_COMMIT_MARKER_FILENAME),
+            snapshot_root: "r16-snapshot-root".to_string(),
+            generation: "gen-r16-0001".to_string(),
+            planned: vec![RestorePlanItem {
+                manifest_id: world.capture.manifest_id.clone(),
+                action: PlannedAction::RestoreNew,
+                source_binding: Some(binding),
+            }],
+            holds_count: 0,
+            origin_unmapped_count: 0,
+            committed: Vec::new(),
+            published: Vec::new(),
+            analytics_now_ms: None,
+            source_contexts: Some(contexts),
+            source_contexts_digest: Some(digest),
+            source_profile: Some(profile),
+        }
+    }
+
+    fn r16_mirror_bytes(world: &R16World) -> Vec<(String, Vec<u8>)> {
+        fn walk(root: &std::path::Path, base: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+            let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(root)
+                .expect("read the mirror directory")
+                .map(|entry| entry.expect("read entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(&path, base, out);
+                } else {
+                    out.push((
+                        path.strip_prefix(base)
+                            .expect("inside the mirror")
+                            .to_string_lossy()
+                            .into_owned(),
+                        std::fs::read(&path).expect("read the mirror file"),
+                    ));
+                }
+            }
+        }
+        let root = world.data_dir.join("raw-mirror");
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        out
+    }
+
+    #[test]
+    fn r16_mapping_journal_mismatch_refused() {
+        use crate::indexer::source_ingest::SourceMappingDomain;
+
+        let world = r16_world();
+        let binding_two = r16_binding(&world, SourceMappingDomain::V2);
+        let binding_three = r16_binding(&world, SourceMappingDomain::V3);
+        assert_ne!(
+            binding_two.normalizer_id, binding_three.normalizer_id,
+            "the two identities really produce different normalizers"
+        );
+        assert_eq!(binding_two.context_digest, binding_three.context_digest);
+        assert_eq!(binding_two.sealed_sha256, binding_three.sealed_sha256);
+        assert_eq!(binding_two.safety_contract_id, binding_three.safety_contract_id);
+        assert_ne!(binding_two.input_key, binding_three.input_key);
+
+        // Positive: declared /3, binding produced under /3. The structural
+        // boundary admits the journal and the real preparation re-derives all
+        // seven fields plus the sealed bytes and the parser context digest.
+        let journal = r16_journal(&world, SourceMappingDomain::V3.as_str(), binding_three.clone());
+        assert_eq!(
+            validate_restore_source_structure(&journal).expect("the /3 journal is structurally valid"),
+            true,
+            "the /3 plan carries one first-batch binding"
+        );
+        // The production gate reads the identity off the journal itself and
+        // hands it to the same preparation; the positive side must pass
+        // through that wiring, not only through an explicit argument.
+        assert!(
+            validate_restore_source_materials(&journal)
+                .expect("the /3 journal reaches the real material gate")
+                .is_some(),
+            "the declared /3 material is admitted"
+        );
+        let job = crate::indexer::source_ingest::prepare_restore_source_job(
+            &world.data_dir,
+            &world.capture,
+            &binding_three,
+            std::sync::Arc::clone(&world.safety),
+            SourceMappingDomain::V3,
+        )
+        .expect("the declared /3 job prepares");
+        assert_eq!(job.normalizer_id, binding_three.normalizer_id);
+        assert_eq!(job.safety_contract_id, binding_three.safety_contract_id);
+        assert_eq!(job.input.input_key().hex(), binding_three.input_key);
+        assert_eq!(
+            job.input.identity_tuple()[11].clone(),
+            Some(binding_three.context_digest.clone())
+        );
+        assert_eq!(
+            job.input.manifest().sealed_sha256().hex(),
+            binding_three.sealed_sha256
+        );
+        assert_eq!(job.input.manifest().byte_len(), binding_three.byte_len);
+        let blob = std::fs::read(&job.blob_path).expect("read the sealed blob");
+        assert_eq!(
+            crate::storage::source_facts::Sha256Digest::of(&blob).hex(),
+            binding_three.sealed_sha256,
+            "the sealed bytes are the ones the binding names"
+        );
+        assert_eq!(blob.len() as u64, binding_three.byte_len);
+
+        // Negative: the declaration and the binding disagree. The structure
+        // passes (both labels are readable), and the material boundary refuses
+        // the mixed pair in both directions without writing anything.
+        let mirror = r16_mirror_bytes(&world);
+        for (declared, binding, case) in [
+            (
+                SourceMappingDomain::V3.as_str(),
+                binding_two.clone(),
+                "bindings_two_declared_three",
+            ),
+            (
+                SourceMappingDomain::V2.as_str(),
+                binding_three.clone(),
+                "bindings_three_declared_two",
+            ),
+        ] {
+            let journal = r16_journal(&world, declared, binding.clone());
+            assert!(
+                validate_restore_source_structure(&journal).is_ok(),
+                "{case}: a readable label is not itself a material error"
+            );
+            // The production gate is the one that must refuse the mixed pair.
+            assert_eq!(
+                validate_restore_source_materials(&journal).expect_err(case),
+                SourceRestoreError::MaterialMismatch,
+                "{case}: the gate refuses the mixed declaration and binding"
+            );
+            let error = crate::indexer::source_ingest::prepare_restore_source_job(
+                &world.data_dir,
+                &world.capture,
+                &binding,
+                std::sync::Arc::clone(&world.safety),
+                SourceMappingDomain::parse(declared).expect("the declared identity"),
+            )
+            .expect_err(case);
+            assert_eq!(
+                error.to_string(),
+                "source safety configuration: source_restore_material_mismatch",
+                "{case}: the fixed material refusal"
+            );
+        }
+        assert_eq!(
+            r16_mirror_bytes(&world),
+            mirror,
+            "every refusal leaves the sealed mirror byte-identical"
+        );
+        assert!(
+            !world.data_dir.join("r16.sqlite").exists(),
+            "the boundary never opened a database"
+        );
+
+        // An identity outside the readable set is refused by the structural
+        // boundary before any preparation runs.
+        let unknown_journal =
+            r16_journal(&world, "cass-source-mapping/4", binding_three.clone());
+        assert_eq!(
+            validate_restore_source_structure(&unknown_journal),
+            Err(SourceRestoreError::MaterialMismatch)
+        );
+
+        // The item-level commit path reads the identity from the journal too.
+        // One real drive over a private database proves the stored evidence
+        // carries the declared /3 normalizer rather than the current default.
+        let db_path = world.data_dir.join("r16-drive.sqlite");
+        let scratch = world.data_dir.join("scratch");
+        std::fs::create_dir_all(&scratch).expect("mkdir the scratch dir");
+        let journal_path = world._temp.path().join("r16-journal.json");
+        let plan = RestoreRunPlan {
+            operation_id: "r16-op-0002".to_string(),
+            data_dir: world.data_dir.clone(),
+            scratch_dir: scratch,
+            db_path: db_path.clone(),
+            marker_path: world.data_dir.join(W1_COMMIT_MARKER_FILENAME),
+            snapshot_root: "r16-snapshot-root".to_string(),
+            generation: "gen-r16-0002".to_string(),
+            holds_count: 0,
+            origin_unmapped_count: 0,
+            planned: vec![RestorePlanItem {
+                manifest_id: world.capture.manifest_id.clone(),
+                action: PlannedAction::RestoreNew,
+                source_binding: Some(binding_three.clone()),
+            }],
+            source_contexts: journal.source_contexts.clone(),
+            source_contexts_digest: journal.source_contexts_digest.clone(),
+            source_profile: journal.source_profile.clone(),
+        };
+        let outcome = restore_apply_journaled(plan, &journal_path)
+            .expect("the declared /3 journal restores end to end");
+        assert_eq!(outcome.restored, 1, "one new source input is installed");
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(&db_path)
+            .expect("open the restored database");
+        let stored: Vec<String> = storage
+            .raw()
+            .query_all_map(
+                "SELECT normalizer_id FROM source_inputs ORDER BY id",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .expect("read the stored normalizers");
+        storage.close_best_effort_in_place();
+        assert_eq!(
+            stored,
+            vec![binding_three.normalizer_id.clone()],
+            "the committed evidence keeps the declared /3 identity"
+        );
+
+        println!("R16_MAPPING group=journal_mismatch_refused result=pass");
     }
 }
 

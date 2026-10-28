@@ -70,7 +70,23 @@ pub(crate) const SOURCE_SAFETY_CONTRACT: &str = "cass.source-safety/1";
 /// The normalizer identity's domain tag.
 pub(crate) const SOURCE_NORMALIZER_DOMAIN: &str = "cass.source-normalizer/1";
 
-/// The mapping identity's domain tag.
+/// The second mapping identity this build can read.
+///
+/// `/2` is the native-document framing epoch and remains the producer default.
+/// The domain is part of the normalizer identity, so a declared `/3` material
+/// gets its own normalizer and its own input identity; nothing here produces
+/// `/3` by default.
+pub(crate) const SOURCE_MAPPING_DOMAIN_V2: &str = "cass-source-mapping/2";
+
+/// The next mapping identity this build can read.
+///
+/// Read-only support: a declared export material or restore journal that names
+/// `/3` is verified under `/3`, and a digest-only consumer may select it when
+/// exactly one readable identity matches. The producer default does not move
+/// here.
+pub(crate) const SOURCE_MAPPING_DOMAIN_V3: &str = "cass-source-mapping/3";
+
+/// The mapping identity the producer default assembles.
 ///
 /// `/2` is the native-document framing epoch. Revision `/1` framed every
 /// discovered file as JSONL, so a whole-document input and a line-oriented one
@@ -78,7 +94,44 @@ pub(crate) const SOURCE_NORMALIZER_DOMAIN: &str = "cass.source-normalizer/1";
 /// bytes. The domain is part of the normalizer identity, so the upgrade keeps
 /// both generations: every `/1` record, link, receipt and mirror stays exactly
 /// as it was, and each source re-scans once under the new identity.
-pub(crate) const SOURCE_MAPPING_DOMAIN: &str = "cass-source-mapping/2";
+pub(crate) const SOURCE_MAPPING_DOMAIN: &str = SOURCE_MAPPING_DOMAIN_V2;
+
+/// The finite set of mapping identities this build can read.
+///
+/// Two fixed values and nothing else: no registry, no configuration and no
+/// parsing of arbitrary tags. `CURRENT` is the producer default; a reader that
+/// was handed a declared material uses that declaration instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceMappingDomain {
+    V2,
+    V3,
+}
+
+impl SourceMappingDomain {
+    /// The identity regular writes keep producing.
+    pub(crate) const CURRENT: Self = Self::V2;
+
+    /// Every identity this build can read, in a fixed order.
+    pub(crate) const READABLE: [Self; 2] = [Self::V2, Self::V3];
+
+    /// The stored spelling of this identity.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::V2 => SOURCE_MAPPING_DOMAIN_V2,
+            Self::V3 => SOURCE_MAPPING_DOMAIN_V3,
+        }
+    }
+
+    /// The identity one declared spelling names, or `None` for anything else.
+    ///
+    /// An unknown spelling is refused by the caller; it is never replaced by
+    /// [`Self::CURRENT`].
+    pub(crate) fn parse(declared: &str) -> Option<Self> {
+        Self::READABLE
+            .into_iter()
+            .find(|domain| domain.as_str() == declared)
+    }
+}
 
 /// Everything that can stop this path before a source fact is written.
 ///
@@ -1153,8 +1206,9 @@ fn canonical_digest(value: &serde_json::Value) -> Result<String, SourceIngestErr
 /// factory: nothing else in this path may hand-write either string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceProfile {
-    /// `SHA256(["cass.source-normalizer/1", FAD pin, "cass-source-mapping/2",
-    /// effective_config_digest])`.
+    /// `SHA256(["cass.source-normalizer/1", FAD pin, mapping identity,
+    /// effective_config_digest])`, where the mapping identity is one of the two
+    /// spellings in [`SourceMappingDomain`].
     pub(crate) normalizer_id: String,
     /// `SHA256(["cass.source-safety/1", "cass-source-exclusion/1", redaction
     /// algorithm fingerprint, config source identity, fixed config sha256,
@@ -1172,9 +1226,26 @@ impl SourceProfile {
     /// platform and the workspace rewrites. `relative_locator`, `mtime` and
     /// `since_ts` are excluded, so two files under one root share a profile
     /// while two roots never do.
+    ///
+    /// This wrapper keeps the producer default. A caller holding a declared
+    /// mapping identity uses [`Self::assemble_with_mapping_domain`].
     pub(crate) fn assemble(
         safety: &FixedSafetyConfig,
         effective_config: &serde_json::Value,
+    ) -> Result<Self, SourceIngestError> {
+        Self::assemble_with_mapping_domain(safety, effective_config, SourceMappingDomain::CURRENT)
+    }
+
+    /// Assemble the profile one explicit mapping identity names.
+    ///
+    /// Only [`SourceMappingDomain`] reaches the normalizer array, so no caller
+    /// can hand in an arbitrary tag. The safety contract does not depend on the
+    /// mapping identity: the same fixed configuration yields the same safety
+    /// contract under every readable identity.
+    pub(crate) fn assemble_with_mapping_domain(
+        safety: &FixedSafetyConfig,
+        effective_config: &serde_json::Value,
+        mapping_domain: SourceMappingDomain,
     ) -> Result<Self, SourceIngestError> {
         let effective_config_digest = canonical_digest(effective_config)?;
         let identity = safety.config.verify().map_err(SourceIngestError::Verify)?;
@@ -1192,7 +1263,7 @@ impl SourceProfile {
         let normalizer = serde_json::json!([
             SOURCE_NORMALIZER_DOMAIN,
             FAD_PIN,
-            SOURCE_MAPPING_DOMAIN,
+            mapping_domain.as_str(),
             effective_config_digest,
         ]);
         let safety_array = serde_json::json!([
@@ -1210,6 +1281,43 @@ impl SourceProfile {
             safety_contract_id: canonical_digest(&safety_array)?,
             effective_config_digest,
         })
+    }
+}
+
+/// The one readable mapping identity whose normalizer equals a digest-only
+/// claim, together with the profile it produced.
+///
+/// `source_inputs` stores no version label, so a consumer holding only the
+/// normalizer digest cannot read the identity off it. Both readable candidates
+/// are recomputed over the same verified material under the same fixed safety
+/// configuration and the same FAD pin. Exactly one match selects that
+/// identity; zero matches and two matches are both refused. The producer
+/// default is never used as a fallback, and neither the digest length nor the
+/// digest value is inspected.
+pub(crate) fn profile_for_normalizer(
+    safety: &FixedSafetyConfig,
+    effective_config: &serde_json::Value,
+    claimed_normalizer_id: &str,
+) -> Result<(SourceMappingDomain, SourceProfile), SourceIngestError> {
+    let mut matched: Option<(SourceMappingDomain, SourceProfile)> = None;
+    for domain in SourceMappingDomain::READABLE {
+        let profile =
+            SourceProfile::assemble_with_mapping_domain(safety, effective_config, domain)?;
+        if profile.normalizer_id != claimed_normalizer_id {
+            continue;
+        }
+        if matched.is_some() {
+            return Err(mapping_domain_unresolved());
+        }
+        matched = Some((domain, profile));
+    }
+    matched.ok_or_else(mapping_domain_unresolved)
+}
+
+/// The one refusal for a normalizer that names no unique readable identity.
+fn mapping_domain_unresolved() -> SourceIngestError {
+    SourceIngestError::Config {
+        detail: "source_mapping_domain_unresolved".to_string(),
     }
 }
 
@@ -1646,6 +1754,14 @@ pub(crate) struct SourceInputMaterialRequest<'a> {
     pub(crate) parser_context: &'a fad::SourceParserContext,
     pub(crate) capture: &'a crate::raw_mirror::VerifiedRawMirrorCapture,
     pub(crate) safety: &'a FixedSafetyConfig,
+    /// The mapping identity this input is assembled under. The ordinary path
+    /// passes [`SourceMappingDomain::CURRENT`]; a declared restore material
+    /// passes the identity its journal names.
+    pub(crate) mapping_domain: SourceMappingDomain,
+    /// A digest-only claim about this same material. When present, the declared
+    /// identity must be the unique readable match for it, and a claim that
+    /// matches nothing is refused instead of falling back to the default.
+    pub(crate) claimed_normalizer_id: Option<&'a str>,
 }
 
 /// The structure one verified capture yields.
@@ -1681,8 +1797,26 @@ pub(crate) fn verify_source_input_materials(
     // `effective_config_digest` is written into a *copy*: the caller keeps its
     // own object, and only this one carries the digest the declaration names.
     let mut parser_context = request.parser_context.clone();
-    let profile =
-        SourceProfile::assemble(request.safety, &effective_config_material(&parser_context)?)?;
+    let effective_material = effective_config_material(&parser_context)?;
+    // A digest-only claim is checked before the declared identity is trusted:
+    // the declared identity must be the one unique readable match for it, so
+    // a material labelled with the wrong identity is refused rather than
+    // quietly recomputed under that label.
+    let profile = match request.claimed_normalizer_id {
+        Some(claimed) => {
+            let (resolved, profile) =
+                profile_for_normalizer(request.safety, &effective_material, claimed)?;
+            if resolved != request.mapping_domain {
+                return Err(mapping_domain_unresolved());
+            }
+            profile
+        }
+        None => SourceProfile::assemble_with_mapping_domain(
+            request.safety,
+            &effective_material,
+            request.mapping_domain,
+        )?,
+    };
     parser_context.effective_config_digest = Some(
         fad::Sha256Digest::from_hex(&profile.effective_config_digest).map_err(|_| {
             SourceIngestError::Config {
@@ -1842,6 +1976,10 @@ pub(crate) struct SealedSourceInputRequest<'a> {
     pub(crate) capture: &'a crate::raw_mirror::RawMirrorCaptureRecord,
     pub(crate) verified: &'a crate::raw_mirror::VerifiedRawMirrorCapture,
     pub(crate) safety: &'a Arc<FixedSafetyConfig>,
+    /// The mapping identity this input is assembled under.
+    pub(crate) mapping_domain: SourceMappingDomain,
+    /// A digest-only claim about this same material, when the caller holds one.
+    pub(crate) claimed_normalizer_id: Option<&'a str>,
 }
 
 /// Build one sealed `SourceInputJob` from an already verified capture.
@@ -1865,6 +2003,8 @@ pub(crate) fn prepare_sealed_source_input(
         parser_context: request.parser_context,
         capture: request.verified,
         safety: fixed_safety,
+        mapping_domain: request.mapping_domain,
+        claimed_normalizer_id: request.claimed_normalizer_id,
     })?;
     let VerifiedSourceMaterials { input, profile, parser_context, summary } = materials;
     // The verified input's own manifest is the downstream authority for the
@@ -2112,6 +2252,9 @@ pub(crate) fn prepare_source_input(
             capture: &capture,
             verified: &verified,
             safety,
+            // Regular writes keep the producer default.
+            mapping_domain: SourceMappingDomain::CURRENT,
+            claimed_normalizer_id: None,
         },
     )
 }
@@ -4386,23 +4529,33 @@ pub(crate) fn preview_source_input_safety(
 /// This function never opens storage, never reads the live source and never
 /// captures. A projection count above one keeps its own exact code; every other
 /// material failure is one fixed mismatch code.
+///
+/// `mapping_domain` is the identity the journal declares for this plan. The job
+/// is re-derived under exactly that identity, and the binding's digest-only
+/// normalizer must be its unique readable match; a declaration and a binding
+/// that disagree are refused before any field can be copied between them.
 pub(crate) fn prepare_restore_source_job(
     data_dir: &Path,
     capture: &crate::raw_mirror::RawMirrorCaptureRecord,
     binding: &crate::phase3_restore::SourceBindingMaterial,
     safety: Arc<FixedSafetyConfig>,
+    mapping_domain: SourceMappingDomain,
 ) -> Result<SourceInputJob, SourceIngestError> {
     let mismatch = || SourceIngestError::Config {
         detail: "source_restore_material_mismatch".to_string(),
     };
 
     // 1. The existing declared-input adapter: declaration admission, one
-    // same-capture open and the one shared sealed preparation.
-    let job = crate::phase3_restore::source_binding::prepare_declared_restore_source_input(
+    // same-capture open and the one shared sealed preparation. The journal's
+    // declared identity selects the profile, and the binding's normalizer is
+    // the digest-only claim that has to corroborate it.
+    let job = crate::phase3_restore::source_binding::prepare_declared_restore_source_input_for_mapping(
         data_dir,
         capture,
         &binding.declaration,
         safety,
+        mapping_domain,
+        Some(binding.normalizer_id.as_str()),
     )?;
 
     // 2. The read-only preview re-verifies the sealed bytes and produces both
@@ -6795,6 +6948,8 @@ mod content_identity_tests {
                     capture,
                     verified,
                     safety,
+                    mapping_domain: SourceMappingDomain::CURRENT,
+                    claimed_normalizer_id: None,
                 },
             )
         }
@@ -10655,6 +10810,7 @@ mod restore_source_job_tests {
                 &bench.capture,
                 &bench.expected,
                 safety,
+                SourceMappingDomain::CURRENT,
             )
             .unwrap_or_else(|error| panic!("row {row}: the factory refused the job: {error}"));
             assert_job_binding(&job, &bench);
@@ -10761,9 +10917,14 @@ mod restore_source_job_tests {
                 }
                 other => panic!("unhandled material refusal row {other}"),
             }
-            let error =
-                prepare_restore_source_job(&bench.data_dir, &bench.capture, &binding, safety)
-                    .expect_err(&format!("row {row}: the factory must refuse"));
+            let error = prepare_restore_source_job(
+                &bench.data_dir,
+                &bench.capture,
+                &binding,
+                safety,
+                SourceMappingDomain::CURRENT,
+            )
+            .expect_err(&format!("row {row}: the factory must refuse"));
             assert_eq!(
                 config_detail(error),
                 "source_restore_material_mismatch",
@@ -11441,5 +11602,212 @@ mod mcp_activate_v2_tests {
             )
             .expect("count the v1 database's complete inputs");
         assert_eq!(complete_a, 1, "the v1 database keeps its one completion");
+    }
+}
+
+#[cfg(test)]
+mod r16_mapping_tests {
+    //! R16 compatibility: this build reads exactly two mapping identities.
+    //!
+    //! The expected digests below were computed independently by the control
+    //! plane from the same canonical JSON rule, so a factory that drifts from
+    //! that rule fails here instead of agreeing with itself. The producer
+    //! default stays `/2`; reading `/3` never moves what regular writes emit.
+
+    use super::*;
+
+    /// One fixed material, shared by every case in this module.
+    const GOLDEN_EFFECTIVE_DIGEST: &str =
+        "9429b38fbcc2b29c2fafeaf8580448c67d6dac5190064cbe1f512073512e7913";
+    const GOLDEN_NORMALIZER_TWO
+        : &str = "6ed42e31a838ad5db97a43dc824f88ab4f07bf061959b54650fb4a74cada8f7e";
+    const GOLDEN_NORMALIZER_THREE
+        : &str = "319afe606aa05162ba0effd339e38f5b99bb2a15fe765df5f27177c64afcef60";
+
+    fn golden_material() -> serde_json::Value {
+        serde_json::json!({"fixed": "r16-compat"})
+    }
+
+    fn fixed_safety() -> (tempfile::TempDir, Arc<FixedSafetyConfig>) {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let copy = temp.path().join("fixed-safety.toml");
+        std::fs::write(
+            &copy,
+            include_bytes!("../../config/excluded_context_paths.toml"),
+        )
+        .expect("write the fixed copy");
+        let safety = Arc::new(load_fixed_safety_config(&copy).expect("load the fixed copy"));
+        (temp, safety)
+    }
+
+    fn refusal_detail(error: SourceIngestError) -> String {
+        match error {
+            SourceIngestError::Config { detail } => detail,
+            other => panic!("unexpected refusal variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn r16_mapping_explicit_two_three() {
+        let (_temp, safety) = fixed_safety();
+        let material = golden_material();
+
+        let two = SourceProfile::assemble_with_mapping_domain(
+            &safety,
+            &material,
+            SourceMappingDomain::V2,
+        )
+        .expect("the /2 profile assembles");
+        let three = SourceProfile::assemble_with_mapping_domain(
+            &safety,
+            &material,
+            SourceMappingDomain::V3,
+        )
+        .expect("the /3 profile assembles");
+
+        assert_eq!(
+            two.effective_config_digest, GOLDEN_EFFECTIVE_DIGEST,
+            "the effective digest is independent of the mapping identity"
+        );
+        assert_eq!(three.effective_config_digest, GOLDEN_EFFECTIVE_DIGEST);
+        assert_eq!(two.normalizer_id, GOLDEN_NORMALIZER_TWO, "independent /2 digest");
+        assert_eq!(three.normalizer_id, GOLDEN_NORMALIZER_THREE, "independent /3 digest");
+        assert_ne!(two.normalizer_id, three.normalizer_id);
+        assert_eq!(
+            two.safety_contract_id, three.safety_contract_id,
+            "the same fixed safety configuration yields one safety contract"
+        );
+
+        // The default wrapper is the /2 identity, byte for byte.
+        let default = SourceProfile::assemble(&safety, &material).expect("the default profile");
+        assert_eq!(default, two);
+
+        // Determinism: a second assembly of each identity is the same value.
+        assert_eq!(
+            SourceProfile::assemble_with_mapping_domain(
+                &safety,
+                &material,
+                SourceMappingDomain::V2
+            )
+            .expect("the /2 profile assembles again"),
+            two
+        );
+        assert_eq!(
+            SourceProfile::assemble_with_mapping_domain(
+                &safety,
+                &material,
+                SourceMappingDomain::V3
+            )
+            .expect("the /3 profile assembles again"),
+            three
+        );
+
+        println!(
+            "R16_MAPPING group=explicit_two_three two={} three={} result=pass",
+            two.normalizer_id, three.normalizer_id
+        );
+    }
+
+    #[test]
+    fn r16_mapping_hash_only_selection() {
+        let (_temp, safety) = fixed_safety();
+        let material = golden_material();
+
+        let (domain, profile) =
+            profile_for_normalizer(&safety, &material, GOLDEN_NORMALIZER_TWO)
+                .expect("the /2 digest names one identity");
+        assert_eq!(domain, SourceMappingDomain::V2);
+        assert_eq!(profile.normalizer_id, GOLDEN_NORMALIZER_TWO);
+        let safety_id = profile.safety_contract_id.clone();
+
+        let (domain, profile) =
+            profile_for_normalizer(&safety, &material, GOLDEN_NORMALIZER_THREE)
+                .expect("the /3 digest names one identity");
+        assert_eq!(domain, SourceMappingDomain::V3);
+        assert_eq!(profile.normalizer_id, GOLDEN_NORMALIZER_THREE);
+        assert_eq!(profile.safety_contract_id, safety_id);
+
+        // Zero matches is a refusal, never the producer default.
+        let unknown = "0".repeat(64);
+        let error = profile_for_normalizer(&safety, &material, &unknown)
+            .expect_err("an unknown digest must be refused");
+        assert_eq!(
+            refusal_detail(error),
+            "source_mapping_domain_unresolved",
+            "one fixed refusal for no unique identity"
+        );
+
+        // The pre-/2 identity is readable nowhere: its digest matches neither
+        // candidate, so it is refused instead of being treated as /2.
+        let v1_profile = canonical_digest(&serde_json::json!([
+            SOURCE_NORMALIZER_DOMAIN,
+            FAD_PIN,
+            "cass-source-mapping/1",
+            GOLDEN_EFFECTIVE_DIGEST,
+        ]))
+        .expect("the /1 digest computes");
+        assert!(profile_for_normalizer(&safety, &material, &v1_profile).is_err());
+
+        // The same digest under different material names no identity: the
+        // candidates are recomputed from the material in hand, not remembered.
+        let other_material = serde_json::json!({"fixed": "r16-compat", "drift": 1});
+        assert!(profile_for_normalizer(&safety, &other_material, GOLDEN_NORMALIZER_TWO).is_err());
+        assert!(profile_for_normalizer(&safety, &other_material, GOLDEN_NORMALIZER_THREE).is_err());
+
+        println!("R16_MAPPING group=hash_only_selection result=pass");
+    }
+
+    #[test]
+    fn r16_mapping_current_default() {
+        use franken_agent_detection as fad;
+
+        assert_eq!(SourceMappingDomain::CURRENT, SourceMappingDomain::V2);
+        assert_eq!(SOURCE_MAPPING_DOMAIN, SourceMappingDomain::V2.as_str());
+        assert_eq!(
+            SourceMappingDomain::parse("cass-source-mapping/2"),
+            Some(SourceMappingDomain::V2)
+        );
+        assert_eq!(
+            SourceMappingDomain::parse("cass-source-mapping/3"),
+            Some(SourceMappingDomain::V3)
+        );
+        for unknown in ["cass-source-mapping/1", "cass-source-mapping/4", "", "2"] {
+            assert_eq!(SourceMappingDomain::parse(unknown), None, "{unknown:?}");
+        }
+
+        // The scan-path read entry keeps the default identity.
+        let (_temp, safety) = fixed_safety();
+        let root = crate::connectors::ScanRoot::local(std::path::PathBuf::from(
+            "/synthetic/r16-compat/root",
+        ));
+        let role = fad::SourceInputRole::PrimarySessionLog;
+        let scanned = root_profile(&safety, "claude", &root, role)
+            .expect("the scan profile assembles");
+
+        let context = fad::SourceParserContext {
+            schema: "cass.source-parser-context/1".to_string(),
+            connector: fad_connector_name("claude"),
+            roots: vec![fad::SourceParserRoot {
+                path: root.path.clone(),
+                origin: fad::SourceOrigin { origin: root.origin.clone(), source_version: None },
+                platform: root.platform,
+                workspace_rewrites: root.workspace_rewrites.clone(),
+            }],
+            relative_locator: String::new(),
+            role,
+            effective_config_digest: None,
+        };
+        let material = effective_config_material(&context).expect("the effective material");
+        let default = SourceProfile::assemble(&safety, &material).expect("the default profile");
+        let three = SourceProfile::assemble_with_mapping_domain(
+            &safety,
+            &material,
+            SourceMappingDomain::V3,
+        )
+        .expect("the /3 profile");
+        assert_eq!(scanned, default, "reads still pass through the default wrapper");
+        assert_ne!(scanned.normalizer_id, three.normalizer_id);
+
+        println!("R16_MAPPING group=current_default result=pass");
     }
 }

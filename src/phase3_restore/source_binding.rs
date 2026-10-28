@@ -16,7 +16,7 @@ use franken_agent_detection as fad;
 
 use crate::indexer::source_ingest::{
     fad_connector_name, prepare_sealed_source_input, FixedSafetyConfig, SealedSourceInputRequest,
-    SourceIngestError, SourceInputJob, SEALED_ROLES,
+    SourceIngestError, SourceInputJob, SourceMappingDomain, SEALED_ROLES,
 };
 use crate::phase3_bundle::Origin;
 use crate::phase3_restore::normalize_provider_to_origin;
@@ -66,11 +66,40 @@ fn is_clean_relative(value: &str) -> bool {
 /// The seven steps are the spec's fixed order. Every refusal is one of the two
 /// short codes; no material value, path, provider or parser debug reaches the
 /// returned error.
+///
+/// This wrapper keeps the producer default mapping identity. A restore journal
+/// that declares another readable identity uses
+/// [`prepare_declared_restore_source_input_for_mapping`].
 pub(crate) fn prepare_declared_restore_source_input(
     data_dir: &Path,
     capture: &RawMirrorCaptureRecord,
     declaration: &RestoreSourceContextDeclaration,
     safety: Arc<FixedSafetyConfig>,
+) -> Result<SourceInputJob, SourceIngestError> {
+    prepare_declared_restore_source_input_for_mapping(
+        data_dir,
+        capture,
+        declaration,
+        safety,
+        SourceMappingDomain::CURRENT,
+        None,
+    )
+}
+
+/// The same preparation under one declared mapping identity.
+///
+/// A restore journal names the identity its bindings were produced under; the
+/// seven-field proof downstream re-derives the job under exactly that identity.
+/// `claimed_normalizer_id` carries a digest-only binding claim when the caller
+/// has one: the declared identity then has to be the unique readable match for
+/// it, and a mismatch is the same fixed material refusal as every other step.
+pub(crate) fn prepare_declared_restore_source_input_for_mapping(
+    data_dir: &Path,
+    capture: &RawMirrorCaptureRecord,
+    declaration: &RestoreSourceContextDeclaration,
+    safety: Arc<FixedSafetyConfig>,
+    mapping_domain: SourceMappingDomain,
+    claimed_normalizer_id: Option<&str>,
 ) -> Result<SourceInputJob, SourceIngestError> {
     // 1. The declaration alone. Strings keep their original spelling; only the
     // namespace's trimmed emptiness and the locator's shape are inspected.
@@ -201,6 +230,8 @@ pub(crate) fn prepare_declared_restore_source_input(
             capture: &prepared_capture,
             verified: &verified,
             safety: &safety,
+            mapping_domain,
+            claimed_normalizer_id,
         },
     )
     .map_err(|_| material_mismatch())
@@ -601,6 +632,21 @@ mod tests {
         scan_root: &str,
         safety: &FixedSafetyConfig,
     ) -> Expected {
+        independent_expected_with_domain(
+            spec,
+            scan_root,
+            safety,
+            SourceMappingDomain::CURRENT,
+        )
+    }
+
+    /// The same independent oracle under one explicit mapping identity.
+    fn independent_expected_with_domain(
+        spec: &Spec,
+        scan_root: &str,
+        safety: &FixedSafetyConfig,
+        mapping_domain: SourceMappingDomain,
+    ) -> Expected {
         let cass_connector = match spec.connector {
             "claude_code" => "claude",
             "codex" => "codex",
@@ -622,8 +668,12 @@ mod tests {
             }],
             "role": spec.role,
         });
-        let profile = SourceProfile::assemble(safety, &effective_material)
-            .expect("assemble the independent profile");
+        let profile = SourceProfile::assemble_with_mapping_domain(
+            safety,
+            &effective_material,
+            mapping_domain,
+        )
+        .expect("assemble the independent profile");
         let context_wire = serde_json::json!({
             "schema": "cass.source-parser-context/1",
             "connector": &fad_connector,
@@ -1389,5 +1439,126 @@ mod tests {
             );
             pass(TEST, "blob_same_length_tampered");
         }
+    }
+
+    #[test]
+    fn r16_mapping_declared_preparation() {
+        let spec = base_spec();
+        let scenario = build(&spec);
+
+        let expected_two = independent_expected_with_domain(
+            &spec,
+            &scenario.scan_root_text,
+            &scenario.safety,
+            SourceMappingDomain::V2,
+        );
+        let expected_three = independent_expected_with_domain(
+            &spec,
+            &scenario.scan_root_text,
+            &scenario.safety,
+            SourceMappingDomain::V3,
+        );
+        let expected_default =
+            independent_expected(&spec, &scenario.scan_root_text, &scenario.safety);
+        assert_eq!(
+            expected_default.normalizer_id, expected_two.normalizer_id,
+            "the default oracle is the /2 identity"
+        );
+        assert_eq!(expected_default.input_key, expected_two.input_key);
+        assert_eq!(
+            expected_two.tuple[11], expected_three.tuple[11],
+            "the parser-context digest does not depend on the mapping identity"
+        );
+        assert_eq!(expected_two.tuple[12], expected_three.tuple[12]);
+        assert_eq!(
+            expected_two.safety_contract_id, expected_three.safety_contract_id,
+            "one fixed safety configuration carries both identities"
+        );
+        assert_ne!(expected_two.normalizer_id, expected_three.normalizer_id);
+        assert_ne!(expected_two.input_key, expected_three.input_key);
+
+        let before = mirror_digest(&scenario.data_dir);
+        let two = prepare_declared_restore_source_input_for_mapping(
+            &scenario.data_dir,
+            &scenario.capture,
+            &scenario.declaration,
+            Arc::clone(&scenario.safety),
+            SourceMappingDomain::V2,
+            None,
+        )
+        .expect("the declared /2 input prepares");
+        assert_matches(&spec, &expected_two, &scenario, &scenario.scan_root_text, &two);
+
+        // The declaration alone decides the identity: no digest-only claim is
+        // supplied here, so only the journal's plaintext label can select /3.
+        let three = prepare_declared_restore_source_input_for_mapping(
+            &scenario.data_dir,
+            &scenario.capture,
+            &scenario.declaration,
+            Arc::clone(&scenario.safety),
+            SourceMappingDomain::V3,
+            None,
+        )
+        .expect("the declared /3 input prepares");
+        assert_matches(&spec, &expected_three, &scenario, &scenario.scan_root_text, &three);
+        assert_eq!(mirror_digest(&scenario.data_dir), before, "the mirror is unchanged");
+
+        // With the digest-only claim present, the same declaration prepares
+        // the same job; the claim corroborates the label instead of replacing
+        // it.
+        let claimed = prepare_declared_restore_source_input_for_mapping(
+            &scenario.data_dir,
+            &scenario.capture,
+            &scenario.declaration,
+            Arc::clone(&scenario.safety),
+            SourceMappingDomain::V3,
+            Some(expected_three.normalizer_id.as_str()),
+        )
+        .expect("the claimed /3 input prepares");
+        assert_matches(&spec, &expected_three, &scenario, &scenario.scan_root_text, &claimed);
+        assert_eq!(claimed.input.input_key(), three.input.input_key());
+
+        // A declaration and a claim that name different identities are refused
+        // in both directions, and a claim that names no identity is refused
+        // rather than defaulted.
+        let unknown = "0".repeat(64);
+        for (domain, claim, case) in [
+            (
+                SourceMappingDomain::V2,
+                Some(expected_three.normalizer_id.as_str()),
+                "two_declared_three_claimed",
+            ),
+            (
+                SourceMappingDomain::V3,
+                Some(expected_two.normalizer_id.as_str()),
+                "three_declared_two_claimed",
+            ),
+            (
+                SourceMappingDomain::V3,
+                Some(unknown.as_str()),
+                "three_declared_unknown_claimed",
+            ),
+        ] {
+            let error = prepare_declared_restore_source_input_for_mapping(
+                &scenario.data_dir,
+                &scenario.capture,
+                &scenario.declaration,
+                Arc::clone(&scenario.safety),
+                domain,
+                claim,
+            )
+            .expect_err(case);
+            assert_eq!(
+                error.to_string(),
+                format!("source safety configuration: {MATERIAL_MISMATCH}"),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            mirror_digest(&scenario.data_dir),
+            before,
+            "every refusal leaves the sealed mirror unchanged"
+        );
+        pass("r16_mapping_declared_preparation", "declared_and_claimed");
     }
 }
