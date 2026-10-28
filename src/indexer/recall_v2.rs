@@ -1020,7 +1020,9 @@ const CONST_REJECTED_BINDINGS: [&str; 48] = [
 /// trimmed it. The declaration name and the printed name must be the same
 /// identifier, so the value that reaches `text` is the call result and nothing
 /// else. Only one declaration and one print are accepted, both semicolons are
-/// required, and the expression must end there. The argument object reuses the
+/// required, and the expression must end there. One optional bare
+/// `store("key", IDENT);` side write may sit between the call and the print; it
+/// names the same binding and nothing else. The argument object reuses the
 /// ticket 06 literal parser unchanged.
 fn parse_const_mcp_call_literal(expression: &str) -> Option<(RecallTool, Value)> {
     let expression = expression.trim();
@@ -1061,6 +1063,33 @@ fn parse_const_mcp_call_literal(expression: &str) -> Option<(RecallTool, Value)>
     parser.skip_whitespace();
     parser.expect_byte(b';')?;
     parser.skip_whitespace();
+    // Ticket R15: one optional bare `store("key", IDENT);` side write. It has
+    // exactly two arguments: a double-quoted JSON string and the very binding
+    // the call produced. It must not shadow a binding that is itself named
+    // `store`; without a side write, `const store = ...; text(store);` stays
+    // valid.
+    if parser.expect_keyword("store").is_some() {
+        if binding == "store" {
+            return None;
+        }
+        parser.skip_whitespace();
+        parser.expect_byte(b'(')?;
+        parser.skip_whitespace();
+        if !parser.parse_value(1)?.is_string() {
+            return None;
+        }
+        parser.skip_whitespace();
+        parser.expect_byte(b',')?;
+        parser.skip_whitespace();
+        if parser.take_identifier()? != binding {
+            return None;
+        }
+        parser.skip_whitespace();
+        parser.expect_byte(b')')?;
+        parser.skip_whitespace();
+        parser.expect_byte(b';')?;
+        parser.skip_whitespace();
+    }
     parser.expect_keyword("text")?;
     parser.skip_whitespace();
     parser.expect_byte(b'(')?;
@@ -6133,5 +6162,184 @@ mod tests {
             let (outcome, _, _) = exec_outcome(expression, Value::String("partial".into()));
             assert_preserved(outcome, UncoveredReason::UnsupportedShell);
         }
+    }
+
+    // ========================================================================
+    // Ticket R15: one bare `store("key", IDENT);` side write between the
+    // single `const` call and the printed binding. Every case below goes
+    // through `exec_outcome` / `decide_for_record`; a successful parse is
+    // never taken in place of the production judgment.
+    // ========================================================================
+
+    /// The exact native script from ticket 15, byte for byte.
+    const R15_NATIVE_SCRIPT: &str = "const r = await tools.mcp__cass_mcp__cass_search({query:\"cassseedfreshx20261024z\"}); store(\"cassSearch\",r); text(r);";
+
+    /// One R15 store form for the given method and argument value.
+    fn r15_store_expression(method: &str, args: &Value) -> String {
+        format!("const r=await tools.{method}({args});store(\"cassSearch\",r);text(r);")
+    }
+
+    /// One complete C04 search result in the MCP transport shape.
+    fn r15_search_output() -> Value {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value())
+            .expect("frozen wrapper encodes");
+        mcp_output(&mcp_application(&wrapper))
+    }
+
+    #[test]
+    fn r15_store_four_tools_exclude() {
+        let (outcome, _, _) = exec_outcome(R15_NATIVE_SCRIPT, r15_search_output());
+        let Outcome::Exclude(judged) = outcome else {
+            panic!("r15 native search store script must exclude, got {outcome:?}")
+        };
+        assert!(
+            judged.parse_error.is_none(),
+            "r15 native search: no parse error"
+        );
+        println!("r15-store native-search: excluded through decide_for_record");
+
+        for (literal_id, tool) in [
+            ("L01", RecallTool::Search),
+            ("L02", RecallTool::Expand),
+            ("L03", RecallTool::Sessions),
+            ("L04", RecallTool::Timeline),
+        ] {
+            let case = alien_literal_case(literal_id);
+            let method = case["expected"]["method"].as_str().expect("literal method");
+            let args = case["expected"]["args"].clone();
+            let expression = r15_store_expression(method, &args);
+            let wrapper = recall_output::encode(tool, &alien_tool_value(tool))
+                .expect("frozen wrapper encodes");
+            let output = mcp_output(&mcp_application(&wrapper));
+            let (outcome, _, _) = exec_outcome(&expression, output);
+            let Outcome::Exclude(judged) = outcome else {
+                panic!("{literal_id}: the store form must exclude, got {outcome:?}")
+            };
+            assert!(judged.parse_error.is_none(), "{literal_id}: no parse error");
+            println!("r15-store {literal_id}: {method} excluded through decide_for_record");
+        }
+    }
+
+    #[test]
+    fn r15_store_adjacent_forms_preserve() {
+        let method = "mcp__cass_mcp__cass_search";
+        let args = "{query:\"synthetic\"}";
+
+        // Every adjacent shape below is a recognized CASS candidate with a
+        // complete result, so each one reaches the existing syntax refusal.
+        let negatives = [
+            (
+                "await store",
+                format!("const r=await tools.{method}({args});await store(\"k\",r);text(r);"),
+            ),
+            (
+                "globalThis.store",
+                format!("const r=await tools.{method}({args});globalThis.store(\"k\",r);text(r);"),
+            ),
+            (
+                "member store",
+                format!("const r=await tools.{method}({args});obj.store(\"k\",r);text(r);"),
+            ),
+            (
+                "alias store",
+                format!("const r=await tools.{method}({args});st(\"k\",r);text(r);"),
+            ),
+            (
+                "one argument",
+                format!("const r=await tools.{method}({args});store(\"k\");text(r);"),
+            ),
+            (
+                "three arguments",
+                format!("const r=await tools.{method}({args});store(\"k\",r,1);text(r);"),
+            ),
+            (
+                "spread argument",
+                format!("const r=await tools.{method}({args});store(\"k\",...r);text(r);"),
+            ),
+            (
+                "other binding",
+                format!("const r=await tools.{method}({args});store(\"k\",x);text(r);"),
+            ),
+            (
+                "second store",
+                format!(
+                    "const r=await tools.{method}({args});store(\"k\",r);store(\"k2\",r);text(r);"
+                ),
+            ),
+            (
+                "load instead of text",
+                format!("const r=await tools.{method}({args});store(\"k\",r);load(r);"),
+            ),
+            (
+                "text of a member",
+                format!("const r=await tools.{method}({args});store(\"k\",r);text(r.length);"),
+            ),
+            (
+                "stored member",
+                format!("const r=await tools.{method}({args});store(\"k\",r.length);text(r);"),
+            ),
+            (
+                "shadowed store binding",
+                format!("const store=await tools.{method}({args});store(\"k\",store);text(store);"),
+            ),
+            (
+                "missing store semicolon",
+                format!("const r=await tools.{method}({args});store(\"k\",r) text(r);"),
+            ),
+            (
+                "trailing statement",
+                format!("const r=await tools.{method}({args});store(\"k\",r);text(r);extra();"),
+            ),
+        ];
+        for (label, expression) in negatives {
+            let (outcome, _, _) = exec_outcome(&expression, r15_search_output());
+            assert_eq!(
+                outcome,
+                Outcome::Preserve(Some(UncoveredReason::UnsupportedShell)),
+                "{label}: {expression}"
+            );
+            println!("r15-store negative {label}: preserved unsupported_shell");
+        }
+
+        // The original legal forms without a side write stay excluded.
+        for (label, expression) in [
+            (
+                "const without store",
+                format!("const r=await tools.{method}({args});text(r);"),
+            ),
+            (
+                "const store binding without side write",
+                format!("const store=await tools.{method}({args});text(store);"),
+            ),
+        ] {
+            let (outcome, _, _) = exec_outcome(&expression, r15_search_output());
+            let Outcome::Exclude(_) = outcome else {
+                panic!("{label}: the legal const form must still exclude, got {outcome:?}")
+            };
+            println!("r15-store positive {label}: excluded through decide_for_record");
+        }
+    }
+
+    #[test]
+    fn r15_store_truncated_result_preserves() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value())
+            .expect("frozen wrapper encodes");
+        // The native sample's recorded output was cut off mid-JSON by the
+        // client. This uses a prefix of the real bytes; it invents no complete
+        // envelope and claims no truncation-specific diagnosis.
+        let mut cut = wrapper.len() / 2;
+        while !wrapper.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let (outcome, _, _) = exec_outcome(
+            R15_NATIVE_SCRIPT,
+            mcp_output(&mcp_application(&wrapper[..cut])),
+        );
+        assert_eq!(
+            outcome,
+            Outcome::Preserve(Some(UncoveredReason::InvalidRecallFormat)),
+            "a truncated recorded output must keep its existing reason"
+        );
+        println!("r15-store truncated: preserved invalid_recall_format");
     }
 }
