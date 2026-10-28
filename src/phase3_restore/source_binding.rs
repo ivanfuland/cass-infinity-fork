@@ -1461,10 +1461,10 @@ mod tests {
         let expected_default =
             independent_expected(&spec, &scenario.scan_root_text, &scenario.safety);
         assert_eq!(
-            expected_default.normalizer_id, expected_two.normalizer_id,
-            "the default oracle is the /2 identity"
+            expected_default.normalizer_id, expected_three.normalizer_id,
+            "the default oracle is the /3 identity"
         );
-        assert_eq!(expected_default.input_key, expected_two.input_key);
+        assert_eq!(expected_default.input_key, expected_three.input_key);
         assert_eq!(
             expected_two.tuple[11], expected_three.tuple[11],
             "the parser-context digest does not depend on the mapping identity"

@@ -24,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
 const FAD_PIN: &str = "61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5";
-const MAPPING_DOMAIN: &str = "cass-source-mapping/2";
+const MAPPING_DOMAIN: &str = "cass-source-mapping/3";
 const EXCLUSION_EPOCH: &str = "cass-source-exclusion/1";
 /// The epoch the current producer writes (Task10). Kept apart from
 /// [`EXCLUSION_EPOCH`], which the fixed v1 calibration vector above still
@@ -610,7 +610,7 @@ fn assert_synthetic_material_formula() {
     let normalizer = sha256_canonical(&serde_json::json!([
         NORMALIZER_DOMAIN,
         FAD_PIN,
-        MAPPING_DOMAIN,
+        "cass-source-mapping/2",
         effective_digest,
     ]));
     assert_eq!(

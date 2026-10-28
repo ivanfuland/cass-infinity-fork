@@ -20541,7 +20541,7 @@ mod source_restore_context_tests {
 
         // The item-level commit path reads the identity from the journal too.
         // One real drive over a private database proves the stored evidence
-        // carries the declared /3 normalizer rather than the current default.
+        // carries the journal-declared /3 normalizer through installation.
         let db_path = world.data_dir.join("r16-drive.sqlite");
         let scratch = world.data_dir.join("scratch");
         std::fs::create_dir_all(&scratch).expect("mkdir the scratch dir");

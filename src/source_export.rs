@@ -1798,8 +1798,8 @@ mod r16_mapping_export_tests {
         std::sync::Arc::new(load_fixed_safety_config(&copy).expect("load the fixed copy"))
     }
 
-    /// The ordinary `/2` input, produced by the ordinary sealed entry.
-    fn ordinary_two_input(
+    /// The ordinary `/3` input, produced by the ordinary sealed entry.
+    fn ordinary_three_input(
         temp: &Path,
         safety: &std::sync::Arc<FixedSafetyConfig>,
     ) -> SourceInputJob {
@@ -1847,8 +1847,8 @@ mod r16_mapping_export_tests {
         .expect("the ordinary input prepares")
     }
 
-    /// The declared `/3` input, produced by the declared restore entry.
-    fn declared_three_input(
+    /// The declared `/2` input, produced by the declared restore entry.
+    fn declared_two_input(
         temp: &Path,
         safety: &std::sync::Arc<FixedSafetyConfig>,
     ) -> SourceInputJob {
@@ -1905,17 +1905,17 @@ mod r16_mapping_export_tests {
             &capture,
             &declaration,
             std::sync::Arc::clone(safety),
-            SourceMappingDomain::V3,
+            SourceMappingDomain::V2,
             None,
         )
-        .expect("the declared /3 input prepares")
+        .expect("the declared /2 input prepares")
     }
 
     fn build() -> Case {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let safety = fixed_safety(temp.path());
-        let two = ordinary_two_input(temp.path(), &safety);
-        let three = declared_three_input(temp.path(), &safety);
+        let three = ordinary_three_input(temp.path(), &safety);
+        let two = declared_two_input(temp.path(), &safety);
         assert_ne!(
             two.normalizer_id, three.normalizer_id,
             "the two inputs really carry different normalizers"

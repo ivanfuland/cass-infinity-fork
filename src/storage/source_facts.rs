@@ -38,6 +38,7 @@ use crate::storage::schema::{CURRENT_SCHEMA_VERSION, SOURCE_FACTS_REVISION_META_
 
 mod framing;
 mod reader;
+pub(crate) use reader::input_header_in_tx;
 mod standard;
 
 pub use framing::{
@@ -4042,6 +4043,97 @@ pub fn read_installed_link_evidence(
         Some(installation) => InstalledLinkEvidence::Installed(Box::new(installation)),
         None => InstalledLinkEvidence::Pending,
     })
+}
+
+/// Same native record under an earlier capture. Every returned installation
+/// was decoded from its immutable envelope and checked against its SQL columns.
+pub(crate) fn first_seen_record_anchors(
+    tx: &Tx<'_>,
+    current: &SourceFactsInput,
+    claim: &SourceClaim,
+) -> Result<Vec<(SourceFactsInput, OriginalBinding)>, SourceInstallError> {
+    let current_id = registered_source_input_id(tx, &current.input_key)?.ok_or_else(|| {
+        SourceInstallError::Staging {
+            detail: "replay input not staged".into(),
+        }
+    })?;
+    let record: (Vec<u8>, Vec<u8>) = tx.query_row_map(
+        "SELECT position_bin, expected_source_record_sha256 FROM source_records
+         WHERE input_id = ?1 AND ordinal = ?2 AND record_pointer = ?3",
+        &[
+            Value::Integer(current_id),
+            ordinal_blob(claim.record_ordinal),
+            Value::Text(claim.record_pointer.clone()),
+        ],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+    )?;
+    decode_position_bin(&record.0, claim.record_ordinal, &claim.record_pointer)?;
+    let candidates: Vec<(i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = tx.query_all_map(
+        "SELECT i.id, i.input_key, r.position_bin, r.expected_source_record_sha256, l.source_positions_bin
+         FROM source_inputs i JOIN source_records r ON r.input_id = i.id
+         JOIN source_message_links l ON l.record_id = r.id
+         WHERE i.id <> ?1 AND i.source_id = ?2 AND i.identity_namespace = ?3 AND i.connector = ?4
+           AND i.root_id_bin = ?5 AND i.relative_locator_bin = ?6
+           AND r.ordinal = ?7 AND r.record_pointer = ?8 AND l.projection_key = ?9
+           AND l.authority = 'canonical'",
+        &[Value::Integer(current_id), Value::Text(current.source_id.clone()),
+          Value::Text(current.identity_namespace.clone()), Value::Text(current.connector.clone()),
+          Value::Blob(current.root_id.as_bytes().to_vec()), Value::Blob(current.relative_locator.as_bytes().to_vec()),
+          ordinal_blob(claim.record_ordinal), Value::Text(claim.record_pointer.clone()),
+          Value::Blob(claim.projection_key().as_bytes().to_vec())],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?, row.get_typed(4)?)),
+    )?;
+    let mut anchors = Vec::new();
+    for (id, key, position, raw_sha, envelope) in candidates {
+        let key = Sha256Digest::from_slice(&key).ok_or_else(|| SourceInstallError::Corrupt {
+            detail: "replay input key".into(),
+        })?;
+        let header = input_header_in_tx(tx, &key)
+            .map_err(|error| SourceInstallError::Corrupt {
+                detail: format!("replay input header: {error:?}"),
+            })?
+            .ok_or_else(|| SourceInstallError::Corrupt {
+                detail: "missing replay input".into(),
+            })?;
+        if header
+            .identity_tuple
+            .iter()
+            .zip(&current.identity_tuple)
+            .enumerate()
+            .any(|(index, (old, new))| index != 12 && index != 13 && old != new)
+        {
+            continue;
+        }
+        let old_claim = decode_link_evidence(&envelope)?.claim;
+        if old_claim.input_key != key
+            || old_claim.record_ordinal != claim.record_ordinal
+            || old_claim.record_pointer != claim.record_pointer
+            || old_claim.projection_key() != claim.projection_key()
+        {
+            return Err(SourceInstallError::Corrupt {
+                detail: "replay envelope disagrees with its record/projection key".into(),
+            });
+        }
+        let installation = read_installed_link_evidence(tx, id, &old_claim)?;
+        decode_position_bin(
+            &position,
+            old_claim.record_ordinal,
+            &old_claim.record_pointer,
+        )?;
+        let mut expected = claim.clone();
+        expected.input_key = key;
+        if old_claim != expected || position != record.0 || raw_sha != record.1 {
+            continue;
+        }
+        if let InstalledLinkEvidence::Installed(installation) = installation {
+            if installation.class == InstallationClass::CanonicalBound {
+                if let Some(binding) = installation.binding {
+                    anchors.push((header, binding));
+                }
+            }
+        }
+    }
+    Ok(anchors)
 }
 
 /// Install one bounded page of claim links for `input_id` (§11).
