@@ -9293,6 +9293,45 @@ impl FrankenStorage {
                 })
     }
 
+    /// Ordinary verified-source ingestion may retain narrowly defined derived
+    /// metadata after proving the old immutable source binding in this transaction.
+    /// Restore Replace continues to use the strict projection entry below.
+    pub(crate) fn install_source_conversation_projection_in_tx(
+        &self,
+        data_dir: &Path,
+        tx: &FrankenTransaction<'_>,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        conv: &Conversation,
+        input_key: &crate::storage::source_facts::Sha256Digest,
+        conversation_ordinal: u32,
+        claims: &[crate::storage::source_facts::SourceClaim],
+    ) -> std::result::Result<
+        crate::storage::source_facts::SourceAwareInsertOutcome,
+        crate::storage::source_facts::SourceInstallError,
+    > {
+        let normalized = normalized_conversation_for_storage(conv);
+        let final_view = source_first_seen_projection(
+            tx,
+            data_dir,
+            agent_id,
+            normalized.as_ref(),
+            input_key,
+            conversation_ordinal,
+            claims,
+        )
+        .map_err(anyhow_error_into_source_install)?;
+        self.install_conversation_projection_in_tx(
+            tx,
+            agent_id,
+            workspace_id,
+            final_view.as_ref(),
+            input_key,
+            conversation_ordinal,
+            claims,
+        )
+    }
+
     /// SRC05A §11: install one conversation projection inside a caller's
     /// transaction and report a real outcome for every incoming message.
     ///
@@ -12748,6 +12787,270 @@ impl SourceStoredMessage {
             excluded_semantic_digest,
         })
     }
+}
+
+/// Resolve only the two approved derived differences. All other fields still
+/// reach the existing merge and full-field binder without an exemption.
+fn source_first_seen_projection<'a>(
+    tx: &FrankenTransaction<'_>,
+    data_dir: &Path,
+    agent_id: i64,
+    conv: &'a Conversation,
+    input_key: &crate::storage::source_facts::Sha256Digest,
+    conversation_ordinal: u32,
+    claims: &[crate::storage::source_facts::SourceClaim],
+) -> Result<Cow<'a, Conversation>> {
+    use crate::storage::source_facts as facts;
+    let key = conversation_merge_key(agent_id, conv);
+    let Some(parent) = franken_find_existing_conversation_with_tail_by_key(tx, &key, Some(conv))?
+    else {
+        return Ok(Cow::Borrowed(conv));
+    };
+    let mut final_view = Cow::Borrowed(conv);
+    let mut current = None;
+    for (position, incoming) in conv.messages.iter().enumerate() {
+        let Some(stored) = franken_source_stored_message(tx, parent.id, incoming.idx)? else {
+            continue;
+        };
+        let extra = stored.strict_extra_value()?;
+        let excluded = stored.excluded_marker()?;
+        if extra == incoming.extra_json && excluded == incoming.excluded {
+            continue;
+        }
+        if stored.content != incoming.content
+            || stored.merge_fingerprint()? != message_merge_fingerprint(incoming)?
+        {
+            continue;
+        }
+        let Some(projected_extra) = first_seen_usage_extra(&extra, &incoming.extra_json) else {
+            continue;
+        };
+        let mut projected_excluded = incoming.excluded.clone();
+        if let (Some(old), Some(new)) = (excluded.as_ref(), projected_excluded.as_mut()) {
+            new.raw.blob = old.raw.blob.clone();
+        }
+        if projected_excluded != excluded {
+            continue;
+        }
+        if current.is_none() {
+            current = facts::input_header_in_tx(tx, input_key)
+                .map_err(|error| anyhow::anyhow!("replay input header: {error:?}"))?;
+        }
+        let header = current.as_ref().context("replay input not staged")?;
+        if replay_mapping_domain(header)?
+            != Some(crate::indexer::source_ingest::SourceMappingDomain::V3)
+        {
+            continue;
+        }
+        let relevant: Vec<_> = claims
+            .iter()
+            .filter(|claim| {
+                claim.input_key == *input_key
+                    && claim.conversation_ordinal == Some(conversation_ordinal)
+                    && claim.final_message_idx == Some(incoming.idx)
+            })
+            .collect();
+        if relevant.is_empty() {
+            continue;
+        }
+        let identity = source_parent_identity_digest(tx, parent.id)?;
+        let mut qualified = true;
+        for claim in relevant {
+            let anchors = facts::first_seen_record_anchors(tx, header, claim)?;
+            let mut target = None;
+            let mut matched = false;
+            for (old_header, binding) in anchors {
+                if replay_mapping_domain(&old_header)?.is_none() {
+                    continue;
+                }
+                let target_id = (
+                    binding.original_conversation_id,
+                    binding.original_message_id,
+                );
+                if target.is_some_and(|previous| previous != target_id) {
+                    qualified = false;
+                }
+                target = Some(target_id);
+                // Recompute the entire original evidence from the actual row,
+                // including physical extra bytes and the actual parent identity.
+                let Some(mut actual) = franken_source_stored_message(
+                    tx,
+                    binding.original_conversation_id,
+                    binding.stored_idx,
+                )?
+                else {
+                    anyhow::bail!("missing canonical replay target");
+                };
+                actual.extra_value = actual.strict_extra_value()?;
+                let actual_identity = if binding.original_conversation_id == parent.id {
+                    identity
+                } else {
+                    source_parent_identity_digest(tx, binding.original_conversation_id)?
+                };
+                let evidence = actual.into_evidence(
+                    binding.original_conversation_id,
+                    actual_identity,
+                    binding.outcome,
+                )?;
+                anyhow::ensure!(
+                    evidence.to_original_binding() == binding,
+                    "canonical replay binding no longer matches stored facts"
+                );
+                if target_id != (parent.id, stored.id) {
+                    qualified = false;
+                    continue;
+                }
+                if let (Some(old), Some(new)) = (excluded.as_ref(), incoming.excluded.as_ref()) {
+                    if !marker_capture_matches(old, &old_header, data_dir)?
+                        || !marker_capture_matches(new, header, data_dir)?
+                    {
+                        continue;
+                    }
+                }
+                matched = true;
+            }
+            qualified &= matched;
+        }
+        if qualified {
+            let message = &mut final_view.to_mut().messages[position];
+            message.extra_json = projected_extra;
+            message.excluded = projected_excluded;
+        }
+    }
+    Ok(final_view)
+}
+
+fn source_parent_identity_digest(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+) -> Result<crate::storage::source_facts::Sha256Digest> {
+    let library: String = tx.query_row_map(
+        "SELECT value FROM meta WHERE key = ?1",
+        fparams![crate::storage::schema::LIBRARY_IDENTITY_META_KEY],
+        |row| row.get_typed(0),
+    )?;
+    let (host, agent, external, path): (String, i64, Option<String>, String) = tx.query_row_map(
+        "SELECT identity_host, agent_id, external_id, source_path FROM conversations WHERE id = ?1",
+        fparams![conversation_id],
+        |row| {
+            Ok((
+                row.get_typed(0)?,
+                row.get_typed(1)?,
+                row.get_typed(2)?,
+                row.get_typed(3)?,
+            ))
+        },
+    )?;
+    Ok(crate::storage::source_facts::conversation_identity_digest(
+        &library,
+        conversation_id,
+        &host,
+        agent,
+        external.as_deref(),
+        &path,
+    ))
+}
+
+fn replay_header_json(
+    value: &franken_agent_detection::LosslessSourceValue,
+) -> Result<serde_json::Value> {
+    let mut bytes = Vec::new();
+    value
+        .write_canonical(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("replay header JSON: {error:?}"))?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn replay_mapping_domain(
+    header: &crate::storage::source_facts::SourceFactsInput,
+) -> Result<Option<crate::indexer::source_ingest::SourceMappingDomain>> {
+    use crate::indexer::source_ingest::{SourceMappingDomain, normalizer_for_mapping_digest};
+    let context = replay_header_json(&header.parser_context)?;
+    let Some(digest) = context
+        .pointer("/effective_config_summary/effective_digest")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    if crate::storage::source_facts::Sha256Digest::from_hex(digest).is_none() {
+        return Ok(None);
+    }
+    let matches: Vec<_> = SourceMappingDomain::READABLE
+        .into_iter()
+        .filter(|domain| {
+            normalizer_for_mapping_digest(digest, *domain)
+                .is_ok_and(|normalizer| normalizer == header.normalizer_id)
+        })
+        .collect();
+    Ok(match matches.as_slice() {
+        [domain] => Some(*domain),
+        _ => None,
+    })
+}
+
+fn marker_capture_matches(
+    marker: &crate::indexer::exclusion::ExcludedMarker,
+    header: &crate::storage::source_facts::SourceFactsInput,
+    data_dir: &Path,
+) -> Result<bool> {
+    let sealed = replay_header_json(&header.sealed_ref)?;
+    let Some(digest) = sealed
+        .get("blob_digest")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(false);
+    };
+    if crate::storage::source_facts::Sha256Digest::from_hex(digest).is_none() {
+        return Ok(false);
+    }
+    let relative = format!("blobs/blake3/{}/{}.raw", &digest[..2], digest);
+    Ok(
+        sealed.get("transport").and_then(serde_json::Value::as_str) == Some("raw_blob")
+            && sealed
+                .get("blob_algorithm")
+                .and_then(serde_json::Value::as_str)
+                == Some("blake3")
+            && sealed
+                .get("blob_relative_path")
+                .and_then(serde_json::Value::as_str)
+                == Some(relative.as_str())
+            && Path::new(&marker.raw.blob) == data_dir.join("raw-mirror/v1").join(relative),
+    )
+}
+
+fn first_seen_usage_extra(
+    old: &serde_json::Value,
+    new: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if old == new {
+        return Some(new.clone());
+    }
+    let mut projected = new.clone();
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cached_input_tokens",
+        "total_tokens",
+    ] {
+        let pointer = format!("/cass/token_usage/{field}");
+        match (old.pointer(&pointer), projected.pointer_mut(&pointer)) {
+            (Some(old), Some(new))
+                if old.is_number()
+                    && new.is_number()
+                    && old
+                        .as_f64()
+                        .is_some_and(|value| value.is_finite() && value >= 0.0)
+                    && new
+                        .as_f64()
+                        .is_some_and(|value| value.is_finite() && value >= 0.0) =>
+            {
+                *new = old.clone()
+            }
+            (None, None) => (),
+            _ => return None,
+        }
+    }
+    (projected == *old).then_some(projected)
 }
 
 /// Replay identity for source projections. Legacy replay keys omit metadata.

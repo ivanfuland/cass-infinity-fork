@@ -1,0 +1,437 @@
+{
+  "schema": "alien-codex-followup-indirect/1",
+  "synthetic": true,
+  "source_cases_sha256": "7bbf9cebe618e1a0680b6752a4c89fe1645aff3212ae783b011afa567ff05df7",
+  "cases": [
+    {
+      "id": "L01-call",
+      "group": "call",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search.call(null,{\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L01-optional",
+      "group": "optional",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search?.({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L01-alias",
+      "group": "alias",
+      "expression": "const f=tools.mcp__cass_mcp__cass_search;const r=await f({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L01-direct",
+      "group": "direct_control",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": "unsupported_shell",
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L01-bound-unused",
+      "group": "negative",
+      "expression": "const f=tools.mcp__cass_mcp__cass_search;text(typeof f);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L01-typeof",
+      "group": "negative",
+      "expression": "text(typeof tools.mcp__cass_mcp__cass_search);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L01-property",
+      "group": "negative",
+      "expression": "text(tools.mcp__cass_mcp__cass_search);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L01-let-reassign",
+      "group": "negative",
+      "expression": "let f=tools.mcp__cass_mcp__cass_search;f=()=>({content:[]});const r=await f({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L01-var-reassign",
+      "group": "negative",
+      "expression": "var f=tools.mcp__cass_mcp__cass_search;f=()=>({content:[]});const r=await f({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L01-inner-shadow",
+      "group": "negative",
+      "expression": "const f=tools.mcp__cass_mcp__cass_search;{const f=()=>({content:[]});const r=await f({\"query\":\"synthetic\"});text(r.content.length);}",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L02-call",
+      "group": "call",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_expand.call(null,{\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L02-optional",
+      "group": "optional",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_expand?.({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L02-alias",
+      "group": "alias",
+      "expression": "const f=tools.mcp__cass_mcp__cass_expand;const r=await f({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L02-direct",
+      "group": "direct_control",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_expand({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": "unsupported_shell",
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L02-bound-unused",
+      "group": "negative",
+      "expression": "const f=tools.mcp__cass_mcp__cass_expand;text(typeof f);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L02-typeof",
+      "group": "negative",
+      "expression": "text(typeof tools.mcp__cass_mcp__cass_expand);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L02-property",
+      "group": "negative",
+      "expression": "text(tools.mcp__cass_mcp__cass_expand);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L02-let-reassign",
+      "group": "negative",
+      "expression": "let f=tools.mcp__cass_mcp__cass_expand;f=()=>({content:[]});const r=await f({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L02-var-reassign",
+      "group": "negative",
+      "expression": "var f=tools.mcp__cass_mcp__cass_expand;f=()=>({content:[]});const r=await f({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L02-inner-shadow",
+      "group": "negative",
+      "expression": "const f=tools.mcp__cass_mcp__cass_expand;{const f=()=>({content:[]});const r=await f({\"query\":\"synthetic\"});text(r.content.length);}",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L03-call",
+      "group": "call",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_sessions.call(null,{\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L03-optional",
+      "group": "optional",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_sessions?.({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L03-alias",
+      "group": "alias",
+      "expression": "const f=tools.mcp__cass_mcp__cass_sessions;const r=await f({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L03-direct",
+      "group": "direct_control",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_sessions({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": "unsupported_shell",
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L03-bound-unused",
+      "group": "negative",
+      "expression": "const f=tools.mcp__cass_mcp__cass_sessions;text(typeof f);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L03-typeof",
+      "group": "negative",
+      "expression": "text(typeof tools.mcp__cass_mcp__cass_sessions);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L03-property",
+      "group": "negative",
+      "expression": "text(tools.mcp__cass_mcp__cass_sessions);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L03-let-reassign",
+      "group": "negative",
+      "expression": "let f=tools.mcp__cass_mcp__cass_sessions;f=()=>({content:[]});const r=await f({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L03-var-reassign",
+      "group": "negative",
+      "expression": "var f=tools.mcp__cass_mcp__cass_sessions;f=()=>({content:[]});const r=await f({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L03-inner-shadow",
+      "group": "negative",
+      "expression": "const f=tools.mcp__cass_mcp__cass_sessions;{const f=()=>({content:[]});const r=await f({\"query\":\"synthetic\"});text(r.content.length);}",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L04-call",
+      "group": "call",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_timeline.call(null,{\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L04-optional",
+      "group": "optional",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_timeline?.({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L04-alias",
+      "group": "alias",
+      "expression": "const f=tools.mcp__cass_mcp__cass_timeline;const r=await f({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L04-direct",
+      "group": "direct_control",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_timeline({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "output": "partial",
+      "expected_baseline_reason": "unsupported_shell",
+      "expected_reason_after_own_shape": "unsupported_shell",
+      "expected_exclusion": false
+    },
+    {
+      "id": "L04-bound-unused",
+      "group": "negative",
+      "expression": "const f=tools.mcp__cass_mcp__cass_timeline;text(typeof f);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L04-typeof",
+      "group": "negative",
+      "expression": "text(typeof tools.mcp__cass_mcp__cass_timeline);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L04-property",
+      "group": "negative",
+      "expression": "text(tools.mcp__cass_mcp__cass_timeline);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L04-let-reassign",
+      "group": "negative",
+      "expression": "let f=tools.mcp__cass_mcp__cass_timeline;f=()=>({content:[]});const r=await f({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L04-var-reassign",
+      "group": "negative",
+      "expression": "var f=tools.mcp__cass_mcp__cass_timeline;f=()=>({content:[]});const r=await f({\"query\":\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "L04-inner-shadow",
+      "group": "negative",
+      "expression": "const f=tools.mcp__cass_mcp__cass_timeline;{const f=()=>({content:[]});const r=await f({\"query\":\"synthetic\"});text(r.content.length);}",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "N-string",
+      "group": "negative",
+      "expression": "text(\"tools.mcp__cass_mcp__cass_search?.(\");",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "N-comment",
+      "group": "negative",
+      "expression": "// tools.mcp__cass_mcp__cass_search.call(null,{})\n",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    },
+    {
+      "id": "N-foreign",
+      "group": "negative",
+      "expression": "const r=await tools.mcp__other__cass_search({query:\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 0,
+      "output": "partial",
+      "expected_baseline_reason": null,
+      "expected_reason_after_own_shape": null,
+      "expected_exclusion": false
+    }
+  ]
+}

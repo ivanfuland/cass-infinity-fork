@@ -70,7 +70,16 @@ pub(crate) const SOURCE_SAFETY_CONTRACT: &str = "cass.source-safety/1";
 /// The normalizer identity's domain tag.
 pub(crate) const SOURCE_NORMALIZER_DOMAIN: &str = "cass.source-normalizer/1";
 
-/// The mapping identity's domain tag.
+/// The second mapping identity this build can read.
+///
+/// `/2` is the native-document framing epoch. It remains readable with
+/// its original normalizer and input identity; new ordinary inputs use `/3`.
+pub(crate) const SOURCE_MAPPING_DOMAIN_V2: &str = "cass-source-mapping/2";
+
+/// Mapping identity for source-aware first-seen metadata replay.
+pub(crate) const SOURCE_MAPPING_DOMAIN_V3: &str = "cass-source-mapping/3";
+
+/// The mapping identity the producer default assembles.
 ///
 /// `/2` is the native-document framing epoch. Revision `/1` framed every
 /// discovered file as JSONL, so a whole-document input and a line-oriented one
@@ -78,7 +87,44 @@ pub(crate) const SOURCE_NORMALIZER_DOMAIN: &str = "cass.source-normalizer/1";
 /// bytes. The domain is part of the normalizer identity, so the upgrade keeps
 /// both generations: every `/1` record, link, receipt and mirror stays exactly
 /// as it was, and each source re-scans once under the new identity.
-pub(crate) const SOURCE_MAPPING_DOMAIN: &str = "cass-source-mapping/2";
+pub(crate) const SOURCE_MAPPING_DOMAIN: &str = SourceMappingDomain::CURRENT.as_str();
+
+/// The finite set of mapping identities this build can read.
+///
+/// Two fixed values and nothing else: no registry, no configuration and no
+/// parsing of arbitrary tags. `CURRENT` is the producer default; a reader that
+/// was handed a declared material uses that declaration instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceMappingDomain {
+    V2,
+    V3,
+}
+
+impl SourceMappingDomain {
+    /// The identity regular writes produce.
+    pub(crate) const CURRENT: Self = Self::V3;
+
+    /// Every identity this build can read, in a fixed order.
+    pub(crate) const READABLE: [Self; 2] = [Self::V2, Self::V3];
+
+    /// The stored spelling of this identity.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::V2 => SOURCE_MAPPING_DOMAIN_V2,
+            Self::V3 => SOURCE_MAPPING_DOMAIN_V3,
+        }
+    }
+
+    /// The identity one declared spelling names, or `None` for anything else.
+    ///
+    /// An unknown spelling is refused by the caller; it is never replaced by
+    /// [`Self::CURRENT`].
+    pub(crate) fn parse(declared: &str) -> Option<Self> {
+        Self::READABLE
+            .into_iter()
+            .find(|domain| domain.as_str() == declared)
+    }
+}
 
 /// Everything that can stop this path before a source fact is written.
 ///
@@ -1153,8 +1199,9 @@ fn canonical_digest(value: &serde_json::Value) -> Result<String, SourceIngestErr
 /// factory: nothing else in this path may hand-write either string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceProfile {
-    /// `SHA256(["cass.source-normalizer/1", FAD pin, "cass-source-mapping/2",
-    /// effective_config_digest])`.
+    /// `SHA256(["cass.source-normalizer/1", FAD pin, mapping identity,
+    /// effective_config_digest])`, where the mapping identity is one of the two
+    /// spellings in [`SourceMappingDomain`].
     pub(crate) normalizer_id: String,
     /// `SHA256(["cass.source-safety/1", "cass-source-exclusion/1", redaction
     /// algorithm fingerprint, config source identity, fixed config sha256,
@@ -1172,9 +1219,26 @@ impl SourceProfile {
     /// platform and the workspace rewrites. `relative_locator`, `mtime` and
     /// `since_ts` are excluded, so two files under one root share a profile
     /// while two roots never do.
+    ///
+    /// This wrapper keeps the producer default. A caller holding a declared
+    /// mapping identity uses [`Self::assemble_with_mapping_domain`].
     pub(crate) fn assemble(
         safety: &FixedSafetyConfig,
         effective_config: &serde_json::Value,
+    ) -> Result<Self, SourceIngestError> {
+        Self::assemble_with_mapping_domain(safety, effective_config, SourceMappingDomain::CURRENT)
+    }
+
+    /// Assemble the profile one explicit mapping identity names.
+    ///
+    /// Only [`SourceMappingDomain`] reaches the normalizer array, so no caller
+    /// can hand in an arbitrary tag. The safety contract does not depend on the
+    /// mapping identity: the same fixed configuration yields the same safety
+    /// contract under every readable identity.
+    pub(crate) fn assemble_with_mapping_domain(
+        safety: &FixedSafetyConfig,
+        effective_config: &serde_json::Value,
+        mapping_domain: SourceMappingDomain,
     ) -> Result<Self, SourceIngestError> {
         let effective_config_digest = canonical_digest(effective_config)?;
         let identity = safety.config.verify().map_err(SourceIngestError::Verify)?;
@@ -1189,12 +1253,6 @@ impl SourceProfile {
                 }
             })?;
 
-        let normalizer = serde_json::json!([
-            SOURCE_NORMALIZER_DOMAIN,
-            FAD_PIN,
-            SOURCE_MAPPING_DOMAIN,
-            effective_config_digest,
-        ]);
         let safety_array = serde_json::json!([
             SOURCE_SAFETY_CONTRACT,
             epoch,
@@ -1206,10 +1264,60 @@ impl SourceProfile {
         ]);
 
         Ok(Self {
-            normalizer_id: canonical_digest(&normalizer)?,
+            normalizer_id: normalizer_for_mapping_digest(&effective_config_digest, mapping_domain)?,
             safety_contract_id: canonical_digest(&safety_array)?,
             effective_config_digest,
         })
+    }
+}
+
+/// The normalizer formula shared by profile assembly and strict replay reads.
+pub(crate) fn normalizer_for_mapping_digest(
+    effective_digest: &str,
+    domain: SourceMappingDomain,
+) -> Result<String, SourceIngestError> {
+    canonical_digest(&serde_json::json!([
+        SOURCE_NORMALIZER_DOMAIN,
+        FAD_PIN,
+        domain.as_str(),
+        effective_digest,
+    ]))
+}
+
+/// The one readable mapping identity whose normalizer equals a digest-only
+/// claim, together with the profile it produced.
+///
+/// `source_inputs` stores no version label, so a consumer holding only the
+/// normalizer digest cannot read the identity off it. Both readable candidates
+/// are recomputed over the same verified material under the same fixed safety
+/// configuration and the same FAD pin. Exactly one match selects that
+/// identity; zero matches and two matches are both refused. The producer
+/// default is never used as a fallback, and neither the digest length nor the
+/// digest value is inspected.
+pub(crate) fn profile_for_normalizer(
+    safety: &FixedSafetyConfig,
+    effective_config: &serde_json::Value,
+    claimed_normalizer_id: &str,
+) -> Result<(SourceMappingDomain, SourceProfile), SourceIngestError> {
+    let mut matched: Option<(SourceMappingDomain, SourceProfile)> = None;
+    for domain in SourceMappingDomain::READABLE {
+        let profile =
+            SourceProfile::assemble_with_mapping_domain(safety, effective_config, domain)?;
+        if profile.normalizer_id != claimed_normalizer_id {
+            continue;
+        }
+        if matched.is_some() {
+            return Err(mapping_domain_unresolved());
+        }
+        matched = Some((domain, profile));
+    }
+    matched.ok_or_else(mapping_domain_unresolved)
+}
+
+/// The one refusal for a normalizer that names no unique readable identity.
+fn mapping_domain_unresolved() -> SourceIngestError {
+    SourceIngestError::Config {
+        detail: "source_mapping_domain_unresolved".to_string(),
     }
 }
 
@@ -1646,6 +1754,14 @@ pub(crate) struct SourceInputMaterialRequest<'a> {
     pub(crate) parser_context: &'a fad::SourceParserContext,
     pub(crate) capture: &'a crate::raw_mirror::VerifiedRawMirrorCapture,
     pub(crate) safety: &'a FixedSafetyConfig,
+    /// The mapping identity this input is assembled under. The ordinary path
+    /// passes [`SourceMappingDomain::CURRENT`]; a declared restore material
+    /// passes the identity its journal names.
+    pub(crate) mapping_domain: SourceMappingDomain,
+    /// A digest-only claim about this same material. When present, the declared
+    /// identity must be the unique readable match for it, and a claim that
+    /// matches nothing is refused instead of falling back to the default.
+    pub(crate) claimed_normalizer_id: Option<&'a str>,
 }
 
 /// The structure one verified capture yields.
@@ -1681,8 +1797,26 @@ pub(crate) fn verify_source_input_materials(
     // `effective_config_digest` is written into a *copy*: the caller keeps its
     // own object, and only this one carries the digest the declaration names.
     let mut parser_context = request.parser_context.clone();
-    let profile =
-        SourceProfile::assemble(request.safety, &effective_config_material(&parser_context)?)?;
+    let effective_material = effective_config_material(&parser_context)?;
+    // A digest-only claim is checked before the declared identity is trusted:
+    // the declared identity must be the one unique readable match for it, so
+    // a material labelled with the wrong identity is refused rather than
+    // quietly recomputed under that label.
+    let profile = match request.claimed_normalizer_id {
+        Some(claimed) => {
+            let (resolved, profile) =
+                profile_for_normalizer(request.safety, &effective_material, claimed)?;
+            if resolved != request.mapping_domain {
+                return Err(mapping_domain_unresolved());
+            }
+            profile
+        }
+        None => SourceProfile::assemble_with_mapping_domain(
+            request.safety,
+            &effective_material,
+            request.mapping_domain,
+        )?,
+    };
     parser_context.effective_config_digest = Some(
         fad::Sha256Digest::from_hex(&profile.effective_config_digest).map_err(|_| {
             SourceIngestError::Config {
@@ -1842,6 +1976,10 @@ pub(crate) struct SealedSourceInputRequest<'a> {
     pub(crate) capture: &'a crate::raw_mirror::RawMirrorCaptureRecord,
     pub(crate) verified: &'a crate::raw_mirror::VerifiedRawMirrorCapture,
     pub(crate) safety: &'a Arc<FixedSafetyConfig>,
+    /// The mapping identity this input is assembled under.
+    pub(crate) mapping_domain: SourceMappingDomain,
+    /// A digest-only claim about this same material, when the caller holds one.
+    pub(crate) claimed_normalizer_id: Option<&'a str>,
 }
 
 /// Build one sealed `SourceInputJob` from an already verified capture.
@@ -1865,6 +2003,8 @@ pub(crate) fn prepare_sealed_source_input(
         parser_context: request.parser_context,
         capture: request.verified,
         safety: fixed_safety,
+        mapping_domain: request.mapping_domain,
+        claimed_normalizer_id: request.claimed_normalizer_id,
     })?;
     let VerifiedSourceMaterials { input, profile, parser_context, summary } = materials;
     // The verified input's own manifest is the downstream authority for the
@@ -2112,6 +2252,9 @@ pub(crate) fn prepare_source_input(
             capture: &capture,
             verified: &verified,
             safety,
+            // Regular writes keep the producer default.
+            mapping_domain: SourceMappingDomain::CURRENT,
+            claimed_normalizer_id: None,
         },
     )
 }
@@ -4386,23 +4529,33 @@ pub(crate) fn preview_source_input_safety(
 /// This function never opens storage, never reads the live source and never
 /// captures. A projection count above one keeps its own exact code; every other
 /// material failure is one fixed mismatch code.
+///
+/// `mapping_domain` is the identity the journal declares for this plan. The job
+/// is re-derived under exactly that identity, and the binding's digest-only
+/// normalizer must be its unique readable match; a declaration and a binding
+/// that disagree are refused before any field can be copied between them.
 pub(crate) fn prepare_restore_source_job(
     data_dir: &Path,
     capture: &crate::raw_mirror::RawMirrorCaptureRecord,
     binding: &crate::phase3_restore::SourceBindingMaterial,
     safety: Arc<FixedSafetyConfig>,
+    mapping_domain: SourceMappingDomain,
 ) -> Result<SourceInputJob, SourceIngestError> {
     let mismatch = || SourceIngestError::Config {
         detail: "source_restore_material_mismatch".to_string(),
     };
 
     // 1. The existing declared-input adapter: declaration admission, one
-    // same-capture open and the one shared sealed preparation.
-    let job = crate::phase3_restore::source_binding::prepare_declared_restore_source_input(
+    // same-capture open and the one shared sealed preparation. The journal's
+    // declared identity selects the profile, and the binding's normalizer is
+    // the digest-only claim that has to corroborate it.
+    let job = crate::phase3_restore::source_binding::prepare_declared_restore_source_input_for_mapping(
         data_dir,
         capture,
         &binding.declaration,
         safety,
+        mapping_domain,
+        Some(binding.normalizer_id.as_str()),
     )?;
 
     // 2. The read-only preview re-verifies the sealed bytes and produces both
@@ -4499,7 +4652,8 @@ pub(crate) fn install_source_input_in_tx(
         tx,
         prepared,
         |tx, agent_id, workspace_id, conversation, input_key, conversation_ordinal, claims| {
-            storage.install_conversation_projection_in_tx(
+            storage.install_source_conversation_projection_in_tx(
+                &prepared.job.data_dir,
                 tx,
                 agent_id,
                 workspace_id,
@@ -6795,6 +6949,8 @@ mod content_identity_tests {
                     capture,
                     verified,
                     safety,
+                    mapping_domain: SourceMappingDomain::CURRENT,
+                    claimed_normalizer_id: None,
                 },
             )
         }
@@ -9371,6 +9527,405 @@ mod source_safety_preview_tests {
         );
     }
 
+    fn r16_usage(value: u64) -> serde_json::Value {
+        let usage = serde_json::json!({"input_tokens":value, "output_tokens":value,
+            "cached_input_tokens":value, "reasoning_output_tokens":0, "total_tokens":value * 2});
+        serde_json::json!({"timestamp":"2026-01-01T00:00:03.000Z", "type":"event_msg",
+            "payload":{"type":"token_count", "info":{"last_token_usage":usage,
+                "total_token_usage":usage, "model_context_window":128000}, "rate_limits":null}})
+    }
+
+    fn r16_append_fixture(connector: &str) -> (Fixture, Vec<serde_json::Value>) {
+        let mut lines = if connector == "codex" {
+            codex_exclusion_lines()
+        } else {
+            claude_exclusion_lines()
+        };
+        if connector == "codex" {
+            lines.push(r16_usage(10));
+        }
+        (fixture(connector, "jsonl", &lines_body(&lines)), lines)
+    }
+
+    fn r16_stored(
+        storage: &crate::storage::sqlite::FrankenStorage,
+    ) -> Vec<(i64, String, Option<Vec<u8>>, Option<String>)> {
+        storage
+            .raw()
+            .query_all_map(
+                "SELECT id, content, extra_bin, json(excluded) FROM messages ORDER BY id",
+                &[],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                    ))
+                },
+            )
+            .expect("read actual canonical messages")
+    }
+
+    #[test]
+    fn r16_replay_prefix_append_preserves_actual_rows() {
+        for connector in ["claude", "codex"] {
+            let (fixture, mut lines) = r16_append_fixture(connector);
+            let prefix = prepare(&fixture);
+            let storage = crate::storage::sqlite::FrankenStorage::open(
+                &fixture.data_dir.join("agent_search.db"),
+            )
+            .unwrap();
+            let first = commit_source_input(&storage, &prefix).unwrap();
+            assert!(
+                matches!(
+                    first.outcome,
+                    SourceInputOutcome::Completed { replay: false, .. }
+                ),
+                "{connector}: {:?}",
+                first.outcome
+            );
+            let old = r16_stored(&storage);
+            assert!(
+                old.iter().any(|row| row.3.is_some()),
+                "real exclusion required"
+            );
+            if connector == "codex" {
+                let extra: serde_json::Value =
+                    rmp_serde::from_slice(old.last().unwrap().2.as_ref().unwrap()).unwrap();
+                assert_eq!(
+                    extra.pointer("/cass/token_usage/input_tokens"),
+                    Some(&serde_json::json!(10))
+                );
+                lines.push(r16_usage(40));
+            } else {
+                lines.push(serde_json::json!({"cwd":WORKSPACE,"sessionId":"preview-claude-ex", "type":"assistant", "uuid":"r16-tail",
+                    "message":{"role":"assistant","content":"R16 appended answer"}}));
+            }
+            std::fs::write(&fixture.discovered.source_path, lines_body(&lines)).unwrap();
+            let append = prepare(&fixture);
+            assert_ne!(prefix.input.input_key(), append.input.input_key());
+            let second = commit_source_input(&storage, &append).unwrap();
+            assert!(
+                matches!(
+                    second.outcome,
+                    SourceInputOutcome::Completed { replay: false, .. }
+                ),
+                "{connector}: {:?}",
+                second.outcome
+            );
+            let now = r16_stored(&storage);
+            assert_eq!(
+                &now[..old.len()],
+                old.as_slice(),
+                "retain exact first-seen rows including extra bytes/raw provenance"
+            );
+            let replay = commit_source_input(&storage, &append).unwrap();
+            assert!(
+                matches!(
+                    replay.outcome,
+                    SourceInputOutcome::Completed { replay: true, .. }
+                ),
+                "{connector}: {:?}",
+                replay.outcome
+            );
+            assert_eq!(r16_stored(&storage), now);
+            let complete: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT count(*) FROM source_inputs WHERE state = 'complete'",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            assert_eq!(complete, 2);
+        }
+    }
+
+    #[test]
+    fn r16_replay_rejects_unproved_metadata_and_preserves_core_rejection() {
+        use crate::storage::api::TxMode;
+        use source_facts::IncomingStatus;
+        for case in [
+            "native-extra",
+            "fifth-stat",
+            "negative-stat",
+            "missing-stat",
+            "stat-type",
+            "blob",
+            "marker-field",
+            "body",
+            "role",
+            "author",
+            "time",
+            "missing-anchor",
+            "record-sha",
+            "record-position",
+            "claim-position",
+            "source",
+            "context",
+            "unknown-normalizer",
+            "binding-digest",
+            "stored-extra",
+        ] {
+            let (mut fixture, mut lines) = r16_append_fixture("codex");
+            let prefix = prepare(&fixture);
+            let storage = crate::storage::sqlite::FrankenStorage::open(
+                &fixture.data_dir.join("agent_search.db"),
+            )
+            .unwrap();
+            assert!(matches!(
+                commit_source_input(&storage, &prefix).unwrap().outcome,
+                SourceInputOutcome::Completed { .. }
+            ));
+            let before = r16_stored(&storage);
+            lines.push(r16_usage(40));
+            std::fs::write(&fixture.discovered.source_path, lines_body(&lines)).unwrap();
+            if case == "context" {
+                fixture.root = fixture.root.clone().with_rewrite("/unmatched", "/other");
+            }
+            let append = prepare(&fixture);
+            let prepared = prepare_source_input_commit(&append).unwrap();
+            let observed = std::cell::Cell::new(None);
+            let result = storage.raw().with_tx(TxMode::Immediate, |tx| {
+                let sql = match case {
+                    "missing-anchor" => Some("UPDATE source_message_links SET authority = 'historical', message_id = NULL"),
+                    "record-sha" => Some("UPDATE source_records SET expected_source_record_sha256 = zeroblob(32), observed_source_record_sha256 = zeroblob(32)"),
+                    "record-position" => Some("UPDATE source_records SET position_bin = x'00'"),
+                    "source" => Some("UPDATE source_inputs SET source_id = 'other-source'"),
+                    "unknown-normalizer" => Some("UPDATE source_inputs SET normalizer_id = 'unknown'"),
+                    "binding-digest" => Some("UPDATE source_message_links SET binding_digest = zeroblob(32)"),
+                    "stored-extra" => Some("UPDATE messages SET extra_bin = x'c1' WHERE idx = 1"),
+                    _ => None,
+                };
+                if let Some(sql) = sql { tx.execute(sql, &[])?; }
+                install_source_input_with_projection_in_tx(tx, &prepared,
+                    |tx, agent, workspace, conversation, key, ordinal, claims| {
+                        let mut conv = conversation.clone();
+                        let target = if matches!(case, "blob" | "marker-field") { 0 } else { 1 };
+                        let msg = &mut conv.messages[target];
+                        match case {
+                            "native-extra" => msg.extra_json["native_drift"] = serde_json::json!(true),
+                            "fifth-stat" => msg.extra_json["cass"]["token_usage"]["fifth"] = serde_json::json!(1),
+                            "negative-stat" => msg.extra_json["cass"]["token_usage"]["input_tokens"] = serde_json::json!(-1),
+                            "missing-stat" => { msg.extra_json["cass"]["token_usage"].as_object_mut().unwrap().remove("total_tokens"); },
+                            "stat-type" => msg.extra_json["cass"]["token_usage"]["input_tokens"] = serde_json::json!("40"),
+                            "blob" => msg.excluded.as_mut().unwrap().raw.blob = "/unmanaged/fake.raw".into(),
+                            "marker-field" => msg.excluded.as_mut().unwrap().raw.idx += 1,
+                            "body" => msg.content.push_str(" changed"),
+                            "role" => msg.role = crate::model::types::MessageRole::User,
+                            "author" => msg.author = Some("changed-author".into()),
+                            "time" => msg.created_at = msg.created_at.map(|time| time + 1),
+                            _ => (),
+                        }
+                        let mut changed_claims = claims.to_vec();
+                        if case == "claim-position" {
+                            for claim in &mut changed_claims {
+                                if claim.final_message_idx == Some(1) {
+                                    claim.positions[0].original_pointer_sha256 = Sha256Digest::of(b"other-position");
+                                }
+                            }
+                        }
+                        let outcome = storage.install_source_conversation_projection_in_tx(
+                            &fixture.data_dir, tx, agent, workspace, &conv, key, ordinal, &changed_claims,
+                        )?;
+                        observed.set(Some(outcome.incoming.iter().find(|item| item.incoming_final_message_idx == target as i64).unwrap().status));
+                        Ok(outcome)
+                    }).map_err(source_ingest_error_to_storage)
+            });
+            let observed = observed.get();
+            if let Some(status) = observed {
+                assert!(
+                    matches!(
+                        status,
+                        IncomingStatus::Unresolved | IncomingStatus::Rejected
+                    ),
+                    "{case}: {status:?}"
+                );
+                if matches!(case, "body" | "role" | "author" | "time") {
+                    assert_eq!(
+                        status,
+                        IncomingStatus::Rejected,
+                        "real core winner rejection remains valid"
+                    );
+                } else {
+                    assert_eq!(
+                        status,
+                        IncomingStatus::Unresolved,
+                        "metadata-only must not fabricate WinnerRejected"
+                    );
+                }
+            } else {
+                assert!(result.is_err(), "{case}: corrupted evidence must fail");
+            }
+            println!(
+                "R16_REPLAY negative={case} status={observed:?} transaction_ok={}",
+                result.is_ok()
+            );
+            // The implementation never overwrites canonical rows; the one
+            // deliberate message-corruption case is checked through its error.
+            if !matches!(case, "stored-extra") {
+                assert_eq!(r16_stored(&storage), before, "{case}");
+            }
+        }
+    }
+
+    fn r16_prepare_mapping(fixture: &Fixture, domain: SourceMappingDomain) -> SourceInputJob {
+        use crate::phase3_restore::source_contexts::{
+            RestoreSourceContextDeclaration, RestoreSourceContextOrigin,
+        };
+        let ordinary = prepare(fixture);
+        let declaration = RestoreSourceContextDeclaration {
+            manifest_id: ordinary.capture.manifest_id.clone(),
+            identity_namespace: ordinary.input.identity_tuple()[1].clone().unwrap(),
+            connector: fixture.discovered.provider_slug.clone(),
+            scan_root: fixture.root.path.to_str().unwrap().to_string(),
+            relative_locator: fixture
+                .discovered
+                .source_path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
+            role: fad::SourceInputRole::PrimarySessionLog,
+            origin: RestoreSourceContextOrigin {
+                source_id: "local".into(),
+                kind: fad::types::SourceKind::Local,
+                host: None,
+                source_version: None,
+            },
+            platform: None,
+            workspace_rewrites: fixture.root.workspace_rewrites.clone(),
+        };
+        let job = crate::phase3_restore::source_binding::prepare_declared_restore_source_input_for_mapping(
+            &fixture.data_dir, &ordinary.capture, &declaration, Arc::clone(&fixture.safety), domain, None,
+        ).unwrap();
+        if domain == SourceMappingDomain::V3 {
+            assert_eq!(job.input.input_key(), ordinary.input.input_key());
+        }
+        job
+    }
+
+    fn r16_link_snapshot(
+        storage: &crate::storage::sqlite::FrankenStorage,
+        key: &Sha256Digest,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        storage
+            .raw()
+            .query_all_map(
+                "SELECT l.binding_digest, l.source_positions_bin FROM source_message_links l
+             JOIN source_records r ON r.id = l.record_id JOIN source_inputs i ON i.id = r.input_id
+             WHERE i.input_key = ?1 ORDER BY l.id",
+                &[crate::storage::api::Value::Blob(key.as_bytes().to_vec())],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn r16_replay_current_three_completes_without_rewriting_failed_two() {
+        for connector in ["claude", "codex"] {
+            let (fixture, mut lines) = r16_append_fixture(connector);
+            let prefix = r16_prepare_mapping(&fixture, SourceMappingDomain::V2);
+            let storage = crate::storage::sqlite::FrankenStorage::open(
+                &fixture.data_dir.join("agent_search.db"),
+            )
+            .unwrap();
+            assert!(matches!(
+                commit_source_input(&storage, &prefix).unwrap().outcome,
+                SourceInputOutcome::Completed { .. }
+            ));
+            let old_rows = r16_stored(&storage);
+            if connector == "codex" {
+                lines.push(r16_usage(40));
+            } else {
+                lines.push(serde_json::json!({"cwd":WORKSPACE,"sessionId":"preview-claude-ex", "type":"assistant", "uuid":"r16-tail",
+                "message":{"role":"assistant","content":"R16 upgrade answer"}}));
+            }
+            std::fs::write(&fixture.discovered.source_path, lines_body(&lines)).unwrap();
+            let old_append = r16_prepare_mapping(&fixture, SourceMappingDomain::V2);
+            // Declared /2 must retain the pre-repair strict behavior even
+            // when invoked through the ordinary installation entry.
+            let old_result = commit_source_input(&storage, &old_append).unwrap();
+            assert!(
+                !matches!(old_result.outcome, SourceInputOutcome::Completed { .. }),
+                "old /2 must not acquire /3 replay semantics"
+            );
+            let old_links = r16_link_snapshot(&storage, old_append.input.input_key());
+            assert!(!old_links.is_empty());
+            let current = r16_prepare_mapping(&fixture, SourceMappingDomain::V3);
+            assert_ne!(old_append.input.input_key(), current.input.input_key());
+            let result = commit_source_input(&storage, &current).unwrap();
+            assert!(
+                matches!(
+                    result.outcome,
+                    SourceInputOutcome::Completed { replay: false, .. }
+                ),
+                "{connector}: {:?}",
+                result.outcome
+            );
+            assert_eq!(&r16_stored(&storage)[..old_rows.len()], old_rows.as_slice());
+            assert_eq!(
+                r16_link_snapshot(&storage, old_append.input.input_key()),
+                old_links
+            );
+            let replay = commit_source_input(&storage, &current).unwrap();
+            assert!(matches!(
+                replay.outcome,
+                SourceInputOutcome::Completed { replay: true, .. }
+            ));
+            assert_eq!(
+                r16_link_snapshot(&storage, old_append.input.input_key()),
+                old_links
+            );
+        }
+    }
+
+    #[test]
+    fn r16_replay_refuses_two_real_canonical_targets() {
+        use crate::storage::api::TxMode;
+        let (fixture, mut lines) = r16_append_fixture("codex");
+        let prefix = prepare(&fixture);
+        let storage =
+            crate::storage::sqlite::FrankenStorage::open(&fixture.data_dir.join("agent_search.db"))
+                .unwrap();
+        assert!(matches!(
+            commit_source_input(&storage, &prefix).unwrap().outcome,
+            SourceInputOutcome::Completed { .. }
+        ));
+        let mut blank_variant = lines_body(&lines);
+        blank_variant.push(b'\n');
+        std::fs::write(&fixture.discovered.source_path, blank_variant).unwrap();
+        let second = prepare(&fixture);
+        let prepared = prepare_source_input_commit(&second).unwrap();
+        storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                install_source_input_with_projection_in_tx(
+                    tx,
+                    &prepared,
+                    |tx, agent, workspace, conv, key, ordinal, claims| {
+                        let mut alternate = conv.clone();
+                        alternate.external_id = Some("r16-other-canonical-target".into());
+                        storage.install_conversation_projection_in_tx(
+                            tx, agent, workspace, &alternate, key, ordinal, claims,
+                        )
+                    },
+                )
+                .map_err(source_ingest_error_to_storage)
+            })
+            .unwrap();
+        lines.push(r16_usage(40));
+        std::fs::write(&fixture.discovered.source_path, lines_body(&lines)).unwrap();
+        let append = prepare(&fixture);
+        let result = commit_source_input(&storage, &append).unwrap();
+        assert!(
+            !matches!(result.outcome, SourceInputOutcome::Completed { .. }),
+            "ambiguous targets cannot qualify"
+        );
+    }
+
     #[test]
     fn p1_preview_matches_commit() {
         for case in ["claude_jsonl", "claude_document", "codex_jsonl", "codex_document"] {
@@ -10655,6 +11210,7 @@ mod restore_source_job_tests {
                 &bench.capture,
                 &bench.expected,
                 safety,
+                SourceMappingDomain::CURRENT,
             )
             .unwrap_or_else(|error| panic!("row {row}: the factory refused the job: {error}"));
             assert_job_binding(&job, &bench);
@@ -10761,9 +11317,14 @@ mod restore_source_job_tests {
                 }
                 other => panic!("unhandled material refusal row {other}"),
             }
-            let error =
-                prepare_restore_source_job(&bench.data_dir, &bench.capture, &binding, safety)
-                    .expect_err(&format!("row {row}: the factory must refuse"));
+            let error = prepare_restore_source_job(
+                &bench.data_dir,
+                &bench.capture,
+                &binding,
+                safety,
+                SourceMappingDomain::CURRENT,
+            )
+            .expect_err(&format!("row {row}: the factory must refuse"));
             assert_eq!(
                 config_detail(error),
                 "source_restore_material_mismatch",
@@ -11441,5 +12002,212 @@ mod mcp_activate_v2_tests {
             )
             .expect("count the v1 database's complete inputs");
         assert_eq!(complete_a, 1, "the v1 database keeps its one completion");
+    }
+}
+
+#[cfg(test)]
+mod r16_mapping_tests {
+    //! R16 compatibility: this build reads exactly two mapping identities.
+    //!
+    //! The expected digests below were computed independently by the control
+    //! plane from the same canonical JSON rule, so a factory that drifts from
+    //! that rule fails here instead of agreeing with itself. The producer
+    //! default is `/3`; explicit `/2` remains readable with its original identity.
+
+    use super::*;
+
+    /// One fixed material, shared by every case in this module.
+    const GOLDEN_EFFECTIVE_DIGEST: &str =
+        "9429b38fbcc2b29c2fafeaf8580448c67d6dac5190064cbe1f512073512e7913";
+    const GOLDEN_NORMALIZER_TWO
+        : &str = "6ed42e31a838ad5db97a43dc824f88ab4f07bf061959b54650fb4a74cada8f7e";
+    const GOLDEN_NORMALIZER_THREE
+        : &str = "319afe606aa05162ba0effd339e38f5b99bb2a15fe765df5f27177c64afcef60";
+
+    fn golden_material() -> serde_json::Value {
+        serde_json::json!({"fixed": "r16-compat"})
+    }
+
+    fn fixed_safety() -> (tempfile::TempDir, Arc<FixedSafetyConfig>) {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let copy = temp.path().join("fixed-safety.toml");
+        std::fs::write(
+            &copy,
+            include_bytes!("../../config/excluded_context_paths.toml"),
+        )
+        .expect("write the fixed copy");
+        let safety = Arc::new(load_fixed_safety_config(&copy).expect("load the fixed copy"));
+        (temp, safety)
+    }
+
+    fn refusal_detail(error: SourceIngestError) -> String {
+        match error {
+            SourceIngestError::Config { detail } => detail,
+            other => panic!("unexpected refusal variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn r16_mapping_explicit_two_three() {
+        let (_temp, safety) = fixed_safety();
+        let material = golden_material();
+
+        let two = SourceProfile::assemble_with_mapping_domain(
+            &safety,
+            &material,
+            SourceMappingDomain::V2,
+        )
+        .expect("the /2 profile assembles");
+        let three = SourceProfile::assemble_with_mapping_domain(
+            &safety,
+            &material,
+            SourceMappingDomain::V3,
+        )
+        .expect("the /3 profile assembles");
+
+        assert_eq!(
+            two.effective_config_digest, GOLDEN_EFFECTIVE_DIGEST,
+            "the effective digest is independent of the mapping identity"
+        );
+        assert_eq!(three.effective_config_digest, GOLDEN_EFFECTIVE_DIGEST);
+        assert_eq!(two.normalizer_id, GOLDEN_NORMALIZER_TWO, "independent /2 digest");
+        assert_eq!(three.normalizer_id, GOLDEN_NORMALIZER_THREE, "independent /3 digest");
+        assert_ne!(two.normalizer_id, three.normalizer_id);
+        assert_eq!(
+            two.safety_contract_id, three.safety_contract_id,
+            "the same fixed safety configuration yields one safety contract"
+        );
+
+        // The default wrapper produces /3; explicit /2 keeps its golden.
+        let default = SourceProfile::assemble(&safety, &material).expect("the default profile");
+        assert_eq!(default, three);
+
+        // Determinism: a second assembly of each identity is the same value.
+        assert_eq!(
+            SourceProfile::assemble_with_mapping_domain(
+                &safety,
+                &material,
+                SourceMappingDomain::V2
+            )
+            .expect("the /2 profile assembles again"),
+            two
+        );
+        assert_eq!(
+            SourceProfile::assemble_with_mapping_domain(
+                &safety,
+                &material,
+                SourceMappingDomain::V3
+            )
+            .expect("the /3 profile assembles again"),
+            three
+        );
+
+        println!(
+            "R16_MAPPING group=explicit_two_three two={} three={} result=pass",
+            two.normalizer_id, three.normalizer_id
+        );
+    }
+
+    #[test]
+    fn r16_mapping_hash_only_selection() {
+        let (_temp, safety) = fixed_safety();
+        let material = golden_material();
+
+        let (domain, profile) =
+            profile_for_normalizer(&safety, &material, GOLDEN_NORMALIZER_TWO)
+                .expect("the /2 digest names one identity");
+        assert_eq!(domain, SourceMappingDomain::V2);
+        assert_eq!(profile.normalizer_id, GOLDEN_NORMALIZER_TWO);
+        let safety_id = profile.safety_contract_id.clone();
+
+        let (domain, profile) =
+            profile_for_normalizer(&safety, &material, GOLDEN_NORMALIZER_THREE)
+                .expect("the /3 digest names one identity");
+        assert_eq!(domain, SourceMappingDomain::V3);
+        assert_eq!(profile.normalizer_id, GOLDEN_NORMALIZER_THREE);
+        assert_eq!(profile.safety_contract_id, safety_id);
+
+        // Zero matches is a refusal, never the producer default.
+        let unknown = "0".repeat(64);
+        let error = profile_for_normalizer(&safety, &material, &unknown)
+            .expect_err("an unknown digest must be refused");
+        assert_eq!(
+            refusal_detail(error),
+            "source_mapping_domain_unresolved",
+            "one fixed refusal for no unique identity"
+        );
+
+        // The pre-/2 identity is readable nowhere: its digest matches neither
+        // candidate, so it is refused instead of being treated as /2.
+        let v1_profile = canonical_digest(&serde_json::json!([
+            SOURCE_NORMALIZER_DOMAIN,
+            FAD_PIN,
+            "cass-source-mapping/1",
+            GOLDEN_EFFECTIVE_DIGEST,
+        ]))
+        .expect("the /1 digest computes");
+        assert!(profile_for_normalizer(&safety, &material, &v1_profile).is_err());
+
+        // The same digest under different material names no identity: the
+        // candidates are recomputed from the material in hand, not remembered.
+        let other_material = serde_json::json!({"fixed": "r16-compat", "drift": 1});
+        assert!(profile_for_normalizer(&safety, &other_material, GOLDEN_NORMALIZER_TWO).is_err());
+        assert!(profile_for_normalizer(&safety, &other_material, GOLDEN_NORMALIZER_THREE).is_err());
+
+        println!("R16_MAPPING group=hash_only_selection result=pass");
+    }
+
+    #[test]
+    fn r16_mapping_current_default() {
+        use franken_agent_detection as fad;
+
+        assert_eq!(SourceMappingDomain::CURRENT, SourceMappingDomain::V3);
+        assert_eq!(SOURCE_MAPPING_DOMAIN, SourceMappingDomain::V3.as_str());
+        assert_eq!(
+            SourceMappingDomain::parse("cass-source-mapping/2"),
+            Some(SourceMappingDomain::V2)
+        );
+        assert_eq!(
+            SourceMappingDomain::parse("cass-source-mapping/3"),
+            Some(SourceMappingDomain::V3)
+        );
+        for unknown in ["cass-source-mapping/1", "cass-source-mapping/4", "", "2"] {
+            assert_eq!(SourceMappingDomain::parse(unknown), None, "{unknown:?}");
+        }
+
+        // The scan-path read entry keeps the default identity.
+        let (_temp, safety) = fixed_safety();
+        let root = crate::connectors::ScanRoot::local(std::path::PathBuf::from(
+            "/synthetic/r16-compat/root",
+        ));
+        let role = fad::SourceInputRole::PrimarySessionLog;
+        let scanned = root_profile(&safety, "claude", &root, role)
+            .expect("the scan profile assembles");
+
+        let context = fad::SourceParserContext {
+            schema: "cass.source-parser-context/1".to_string(),
+            connector: fad_connector_name("claude"),
+            roots: vec![fad::SourceParserRoot {
+                path: root.path.clone(),
+                origin: fad::SourceOrigin { origin: root.origin.clone(), source_version: None },
+                platform: root.platform,
+                workspace_rewrites: root.workspace_rewrites.clone(),
+            }],
+            relative_locator: String::new(),
+            role,
+            effective_config_digest: None,
+        };
+        let material = effective_config_material(&context).expect("the effective material");
+        let default = SourceProfile::assemble(&safety, &material).expect("the default profile");
+        let two = SourceProfile::assemble_with_mapping_domain(
+            &safety,
+            &material,
+            SourceMappingDomain::V2,
+        )
+        .expect("the /2 profile");
+        assert_eq!(scanned, default, "reads still pass through the default wrapper");
+        assert_ne!(scanned.normalizer_id, two.normalizer_id);
+
+        println!("R16_MAPPING group=current_default result=pass");
     }
 }

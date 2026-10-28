@@ -22,8 +22,8 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde_json::{Value, json};
 
 use crate::indexer::source_ingest::{
-    FixedSafetyConfig, SourceProfile, exclusion_epoch_for_code_version,
-    load_fixed_safety_config_for_code_version, load_restore_fixed_safety,
+    FixedSafetyConfig, SourceMappingDomain, exclusion_epoch_for_code_version,
+    load_fixed_safety_config_for_code_version, load_restore_fixed_safety, profile_for_normalizer,
 };
 use crate::storage::source_facts::{
     AttemptHistory, DiagnosticsEnvelope, RawSourceFactsRecord, Sha256Digest, SourceFactsFilter,
@@ -453,7 +453,6 @@ struct ProfileMaterials {
 }
 
 const FAD_PIN: &str = "61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5";
-const MAPPING_DOMAIN: &str = "cass-source-mapping/2";
 const REDACTION_FINGERPRINT: &str =
     "redact-v1:fe8bda3a83e4f2f4fe85f0de5c84428140bfa658b7865706c43877488ec2bb47";
 
@@ -590,8 +589,11 @@ fn parse_profile_item(value: &StrictValue) -> Result<ProfileMaterial, ExportErro
 }
 
 fn check_referenced_versions(material: &ProfileMaterial) -> Result<(), ExportError> {
+    // The mapping identity set is closed: exactly the identities this build can
+    // read. An unknown tag is refused here, before any recomputation, so a
+    // material cannot name an identity the reader would have to guess.
     if material.fad_pin != FAD_PIN
-        || material.mapping_domain != MAPPING_DOMAIN
+        || SourceMappingDomain::parse(&material.mapping_domain).is_none()
         || material.redaction_fingerprint != REDACTION_FINGERPRINT
     {
         return Err(ExportError::ProfileInvalid);
@@ -1295,11 +1297,27 @@ fn validate_input(
         .ok_or(ExportError::ProfileMissing)?;
     let material = &materials.items[index];
     check_referenced_versions(material)?;
+    // The supported-set gate above ran first; only then is the declared
+    // identity used to recompute the profile.
+    let declared_domain =
+        SourceMappingDomain::parse(&material.mapping_domain).ok_or(ExportError::ProfileInvalid)?;
 
     let restored = load_restored(material)?;
     let context = extract_context(&input.parser_context)?;
-    let assembled = SourceProfile::assemble(&restored, &effective_material(&context))
-        .map_err(|_| ExportError::ProfileMismatch)?;
+    let effective = effective_material(&context);
+    // The stored normalizer carries no version label. Exactly one readable
+    // identity may reproduce it from this same material; that identity has to
+    // be the one the material declares, which also rules out a label paired
+    // with another identity's summary.
+    let (resolved_domain, assembled) =
+        profile_for_normalizer(&restored, &effective, &input.normalizer_id)
+            .map_err(|_| ExportError::ProfileMismatch)?;
+    if resolved_domain != declared_domain
+        || assembled.normalizer_id != material.normalizer_id
+        || assembled.safety_contract_id != material.safety_contract_id
+    {
+        return Err(ExportError::ProfileMismatch);
+    }
     if assembled.effective_config_digest != context.effective_digest {
         return Err(ExportError::ProfileMismatch);
     }
@@ -1726,3 +1744,323 @@ mod context_grammar_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod r16_mapping_export_tests {
+    //! R16: the real export entry reads both mapping identities.
+    //!
+    //! Both inputs are produced and installed by production entries -- the
+    //! ordinary sealed preparation for `/3` and the declared restore
+    //! preparation for `/2` -- over one fixed safety copy, and then exported
+    //! end to end through [`run_export`]. The profile-materials FILE is the
+    //! only place the identity label is written, so a label paired with another
+    //! identity's summary is refused by the same gate the CLI uses.
+
+    use super::*;
+    use franken_agent_detection as fad;
+
+    use crate::connectors::claude_code::ClaudeCodeConnector;
+    use crate::indexer::source_ingest::{
+        FixedSafetyConfig, SourceInputJob, SourceInputRequest, commit_source_input,
+        load_fixed_safety_config, prepare_source_input,
+    };
+    use crate::phase3_restore::source_binding::prepare_declared_restore_source_input_for_mapping;
+    use crate::phase3_restore::source_contexts::{
+        RestoreSourceContextDeclaration, RestoreSourceContextOrigin,
+    };
+    use crate::raw_mirror::{
+        RAW_MIRROR_LOCAL_IDENTITY_HOST, RawMirrorCaptureInput, RawMirrorSessionIdentity,
+        capture_source_file_with_identity,
+    };
+    use crate::storage::sqlite::FrankenStorage;
+
+    const CLAUDE_LINES: &[u8] = br#"{"type":"user","uuid":"R16-U","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"R16 export question"}}
+{"type":"assistant","uuid":"R16-A","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"R16 export answer"}],"model":"R16-model"}}
+"#;
+
+    const CODEX_LINES: &[u8] = br#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"R16-CODEX","cwd":"/synthetic/r16-project","cli_version":"0.42.0"}}
+{"timestamp":"2026-01-01T00:00:01.000Z","type":"response_item","payload":{"type":"message","id":"R16-CU","role":"user","content":[{"type":"input_text","text":"R16 export question"}]}}
+{"timestamp":"2026-01-01T00:00:02.000Z","type":"response_item","payload":{"type":"message","id":"R16-CA","role":"assistant","content":[{"type":"output_text","text":"R16 export answer"}]}}
+"#;
+
+    struct Case {
+        _temp: tempfile::TempDir,
+        safety: std::sync::Arc<FixedSafetyConfig>,
+        two: SourceInputJob,
+        three: SourceInputJob,
+        db: std::path::PathBuf,
+    }
+
+    fn fixed_safety(temp: &Path) -> std::sync::Arc<FixedSafetyConfig> {
+        let copy = temp.join("fixed-safety.toml");
+        std::fs::write(&copy, include_bytes!("../config/excluded_context_paths.toml"))
+            .expect("write the fixed copy");
+        std::sync::Arc::new(load_fixed_safety_config(&copy).expect("load the fixed copy"))
+    }
+
+    /// The ordinary `/3` input, produced by the ordinary sealed entry.
+    fn ordinary_three_input(
+        temp: &Path,
+        safety: &std::sync::Arc<FixedSafetyConfig>,
+    ) -> SourceInputJob {
+        let home = temp.join("home-claude");
+        let projects = home.join(".claude/projects/proj");
+        std::fs::create_dir_all(&projects).expect("mkdir the claude project");
+        let session = projects.join("session.jsonl");
+        std::fs::write(&session, CLAUDE_LINES).expect("write the claude session");
+        let data_dir = temp.join("data-claude");
+        std::fs::create_dir_all(&data_dir).expect("mkdir the claude data dir");
+
+        let root = crate::connectors::ScanRoot::local(home.join(".claude/projects"));
+        let meta = crate::indexer::scan_root_meta::ScanRootMeta {
+            root_id: "home:claude:r16".to_string(),
+            origin_host: "local".to_string(),
+            readonly: false,
+            canonical_path: home.join(".claude/projects"),
+            source_name: "claude".to_string(),
+            watermarks_enabled: true,
+            mirror_root: false,
+        };
+        let discovered = crate::connectors::DiscoveredSourceFile {
+            provider_slug: "claude_code".to_string(),
+            scan_root: home.join(".claude/projects"),
+            source_path: session,
+            role: crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            origin: crate::connectors::Origin::local(),
+            platform: None,
+            required_for_reconstruction: true,
+            size_bytes: None,
+            modified_at_ms: None,
+        };
+        let connector = ClaudeCodeConnector::new();
+        prepare_source_input(
+            &connector,
+            &SourceInputRequest {
+                connector_name: "claude",
+                data_dir: &data_dir,
+                root: &root,
+                meta: &meta,
+                discovered: &discovered,
+                safety,
+            },
+        )
+        .expect("the ordinary input prepares")
+    }
+
+    /// The declared `/2` input, produced by the declared restore entry.
+    fn declared_two_input(
+        temp: &Path,
+        safety: &std::sync::Arc<FixedSafetyConfig>,
+    ) -> SourceInputJob {
+        let home = temp.join("home-codex");
+        let sessions = home.join(".codex/sessions/2026/01");
+        std::fs::create_dir_all(&sessions).expect("mkdir the codex sessions");
+        let session = sessions.join("rollout-2026-01-01T00-00-00-r16.jsonl");
+        std::fs::write(&session, CODEX_LINES).expect("write the codex session");
+        let data_dir = temp.join("data-codex");
+        std::fs::create_dir_all(&data_dir).expect("mkdir the codex data dir");
+
+        let capture = capture_source_file_with_identity(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "codex",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &session,
+                db_links: &[],
+            },
+            RawMirrorSessionIdentity {
+                identity_host: RAW_MIRROR_LOCAL_IDENTITY_HOST,
+                external_id: None,
+            },
+        )
+        .expect("capture the codex session");
+        let declaration = RestoreSourceContextDeclaration {
+            manifest_id: capture.manifest_id.clone(),
+            identity_namespace: "R16_NAMESPACE".to_string(),
+            connector: "codex".to_string(),
+            scan_root: session
+                .parent()
+                .expect("the session has a parent")
+                .to_string_lossy()
+                .into_owned(),
+            relative_locator: session
+                .file_name()
+                .expect("the session has a name")
+                .to_string_lossy()
+                .into_owned(),
+            role: fad::SourceInputRole::PrimarySessionLog,
+            origin: RestoreSourceContextOrigin {
+                source_id: "local".to_string(),
+                kind: fad::types::SourceKind::Local,
+                host: None,
+                source_version: None,
+            },
+            platform: None,
+            workspace_rewrites: Vec::new(),
+        };
+        prepare_declared_restore_source_input_for_mapping(
+            &data_dir,
+            &capture,
+            &declaration,
+            std::sync::Arc::clone(safety),
+            SourceMappingDomain::V2,
+            None,
+        )
+        .expect("the declared /2 input prepares")
+    }
+
+    fn build() -> Case {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let safety = fixed_safety(temp.path());
+        let three = ordinary_three_input(temp.path(), &safety);
+        let two = declared_two_input(temp.path(), &safety);
+        assert_ne!(
+            two.normalizer_id, three.normalizer_id,
+            "the two inputs really carry different normalizers"
+        );
+        assert_eq!(
+            two.safety_contract_id, three.safety_contract_id,
+            "one fixed safety copy carries both identities"
+        );
+
+        let db = temp.path().join("archive.sqlite");
+        let mut storage = FrankenStorage::open(&db).expect("open the archive");
+        for job in [&two, &three] {
+            let commit = commit_source_input(&storage, job).expect("the input installs");
+            assert!(commit.outcome.is_success(), "the input completes: {:?}", commit.outcome);
+        }
+        storage.close_best_effort_in_place();
+        Case { _temp: temp, safety, two, three, db }
+    }
+
+    fn material(
+        job: &SourceInputJob,
+        domain: SourceMappingDomain,
+        safety: &FixedSafetyConfig,
+    ) -> Value {
+        let verified = safety.config().verify().expect("the fixed config verifies");
+        json!({
+            "normalizer_id": job.normalizer_id,
+            "safety_contract_id": job.safety_contract_id,
+            "fad_pin": FAD_PIN,
+            "mapping_domain": domain.as_str(),
+            "exclusion_epoch": exclusion_epoch_for_code_version(&safety.config().code_version)
+                .expect("the fixed copy names a readable epoch"),
+            "redaction_fingerprint": REDACTION_FINGERPRINT,
+            "code_version": safety.config().code_version,
+            "config_source_identity": safety.config_source_identity(),
+            "fixed_copy_path": safety.original_path(),
+            "fixed_config_sha256": verified.fixed_config_sha256().hex(),
+            "effective_four_arrays_sha256": verified.effective_four_arrays_sha256().hex(),
+            "desensitization_enabled": true,
+        })
+    }
+
+    fn write_materials(path: &Path, profiles: Vec<Value>) {
+        let document = json!({
+            "schema": "cass.source-profile-materials/1",
+            "profiles": profiles,
+        });
+        std::fs::write(path, serde_json::to_vec(&document).expect("encode the materials"))
+            .expect("write the materials file");
+    }
+
+    fn export(
+        db: &Path,
+        materials: &Path,
+        output: &Path,
+    ) -> Result<ExportSummary, ExportError> {
+        run_export(&ExportOptions {
+            output: output.to_path_buf(),
+            profile_materials: materials.to_path_buf(),
+            db_path: db.to_path_buf(),
+            filter: SourceFactsFilter::default(),
+            max_records: 64,
+            target_bytes: 1 << 20,
+        })
+    }
+
+    #[test]
+    fn r16_mapping_export_both_versions() {
+        let case = build();
+
+        // The positive side: one materials file carrying each input's own
+        // identity, exported through the real entry.
+        let materials = case._temp.path().join("materials.json");
+        write_materials(
+            &materials,
+            vec![
+                material(&case.two, SourceMappingDomain::V2, &case.safety),
+                material(&case.three, SourceMappingDomain::V3, &case.safety),
+            ],
+        );
+        let output = case._temp.path().join("export-ok");
+        let summary = export(&case.db, &materials, &output).expect("both identities export");
+        assert_eq!(summary.unique_input_count, 2, "both inputs are exported");
+
+        let index: Value = serde_json::from_slice(
+            &std::fs::read(output.join("index.json")).expect("read the index"),
+        )
+        .expect("parse the index");
+        let domains: Vec<String> = index["profiles"]
+            .as_array()
+            .expect("the index lists profiles")
+            .iter()
+            .map(|profile| {
+                profile["mapping_domain"]
+                    .as_str()
+                    .expect("each profile names its identity")
+                    .to_string()
+            })
+            .collect();
+        let mut sorted = domains.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![
+                "cass-source-mapping/2".to_string(),
+                "cass-source-mapping/3".to_string()
+            ],
+            "the export records each input under its own identity"
+        );
+
+        // Wrong labels are refused on both sides: a `/2` summary under a `/3`
+        // label and a `/3` summary under a `/2` label.
+        let swapped = case._temp.path().join("materials-swapped.json");
+        write_materials(
+            &swapped,
+            vec![
+                material(&case.two, SourceMappingDomain::V3, &case.safety),
+                material(&case.three, SourceMappingDomain::V2, &case.safety),
+            ],
+        );
+        let refused = export(&case.db, &swapped, &case._temp.path().join("export-swapped"))
+            .expect_err("a label paired with another identity's summary is refused");
+        assert_eq!(refused, ExportError::ProfileMismatch);
+        assert!(
+            !case._temp.path().join("export-swapped").join("index.json").exists(),
+            "a refused export publishes no index"
+        );
+
+        // An identity outside the readable set is refused before any
+        // recomputation, even though its summary is the right one.
+        let mut unknown = material(&case.three, SourceMappingDomain::V3, &case.safety);
+        unknown["mapping_domain"] = json!("cass-source-mapping/4");
+        let materials = case._temp.path().join("materials-unknown.json");
+        write_materials(
+            &materials,
+            vec![
+                material(&case.two, SourceMappingDomain::V2, &case.safety),
+                unknown,
+            ],
+        );
+        let refused = export(&case.db, &materials, &case._temp.path().join("export-unknown"))
+            .expect_err("an unreadable identity label is refused");
+        assert_eq!(refused, ExportError::ProfileInvalid);
+
+        println!("R16_MAPPING group=export_both_versions result=pass");
+    }
+}
+

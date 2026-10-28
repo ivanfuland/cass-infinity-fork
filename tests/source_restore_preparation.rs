@@ -24,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
 const FAD_PIN: &str = "61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5";
-const MAPPING_DOMAIN: &str = "cass-source-mapping/2";
+const MAPPING_DOMAIN: &str = "cass-source-mapping/3";
 const EXCLUSION_EPOCH: &str = "cass-source-exclusion/2";
 const NORMALIZER_DOMAIN: &str = "cass.source-normalizer/1";
 const SAFETY_CONTRACT: &str = "cass.source-safety/1";

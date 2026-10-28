@@ -1283,6 +1283,16 @@ fn fetch_input_columns(
     .map_err(|_| db_error())
 }
 
+/// Read the input header with the same strict checks as source export.
+pub(crate) fn input_header_in_tx(
+    tx: &Tx<'_>,
+    key: &Sha256Digest,
+) -> Result<Option<SourceFactsInput>, SourceFactsReadError> {
+    fetch_input_columns(tx, key.as_bytes())?
+        .map(|columns| decode_input(&columns))
+        .transpose()
+}
+
 fn decode_identity_tuple(value: &Value) -> Result<Vec<Option<String>>, SourceFactsReadError> {
     let bytes = blob(value)?;
     let parsed: serde_json::Value =
