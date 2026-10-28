@@ -1160,6 +1160,10 @@ fn pi_judgment_event(event: &RawEvent, binding_id: &str) -> RawEvent {
     judged
 }
 
+/// The frozen nesting bound shared by every copy carrier. A value deeper than
+/// this is never proven, whether it is compared structurally or only by bytes.
+const PI_COPY_DEPTH_BOUND: usize = 128;
+
 /// One of the three fixed carriers under `/message/details` that R18 may
 /// clean once its value is proven equal to the verified result. The position
 /// alone never grants permission; the value proof must hold at the same time.
@@ -1540,7 +1544,16 @@ fn prove_pi_copy_slot(
         return PiCopyProof::Unproven;
     };
     let proven = match slot {
-        PiCopySlot::Raw => matches!(legacy_body, Some(body) if candidate.as_str() == Some(body)),
+        PiCopySlot::Raw => match (legacy_body, reference) {
+            // The raw carrier is byte-identical only; it still honours the
+            // frozen comparison bound, so a deeply nested legacy body cannot
+            // be proven through any carrier.
+            (Some(body), Some(reference)) => {
+                candidate.as_str() == Some(body)
+                    && within_copy_depth(reference, PI_COPY_DEPTH_BOUND)
+            }
+            _ => false,
+        },
         PiCopySlot::StructuredContent => {
             matches!(candidate, LosslessSourceValue::Object(_))
                 && reference.is_some_and(|reference| lossless_copy_equal(reference, candidate))
@@ -1567,8 +1580,9 @@ fn prove_pi_copy_slot(
 /// token, never to an equal float or a rounded neighbour. Values that exceed
 /// the comparison bound are never proven.
 fn lossless_copy_equal(reference: &LosslessSourceValue, candidate: &LosslessSourceValue) -> bool {
-    const MAX_DEPTH: usize = 128;
-    if !within_copy_depth(reference, MAX_DEPTH) || !within_copy_depth(candidate, MAX_DEPTH) {
+    if !within_copy_depth(reference, PI_COPY_DEPTH_BOUND)
+        || !within_copy_depth(candidate, PI_COPY_DEPTH_BOUND)
+    {
         return false;
     }
     let mut stack = vec![(reference, candidate)];
@@ -3332,6 +3346,42 @@ mod tests {
             ),
         );
         assert_r18_preserved("raw inner JSON under a C04 body", &mut variant);
+
+        // A legacy body nested past the frozen 128-level bound. The body and
+        // its raw copy are the same bytes and the shallow control excludes,
+        // but the raw carrier must honour the same depth bound as the other
+        // carriers.
+        let shallow = r#"{"hits":[]}"#;
+        let shallow_details = serde_json::json!({"raw": shallow}).to_string();
+        let mut control = project_literal(
+            "raw-depth-control",
+            &r18_single_result_lines(shallow, Some(&shallow_details)),
+        );
+        assert!(
+            run_r18_cleanup(&mut control)
+                .excluded
+                .iter()
+                .any(Option::is_some),
+            "positive control: a bounded raw copy still excludes"
+        );
+        let mut deep = String::from(
+            r#"{"hits":[{"source_id":"local","source_path":"/synthetic/r18","line_number":1,"content":"synthetic","nested":"#,
+        );
+        deep.push_str(&"[".repeat(129));
+        deep.push('0');
+        deep.push_str(&"]".repeat(129));
+        deep.push_str("}]}");
+        let parsed = LosslessSourceValue::parse(deep.as_bytes()).unwrap();
+        assert!(
+            !within_copy_depth(&parsed, 128),
+            "the candidate sits above the frozen depth bound"
+        );
+        let deep_details = serde_json::json!({"raw": deep}).to_string();
+        let mut variant = project_literal(
+            "raw-depth-too-deep",
+            &r18_single_result_lines(&deep, Some(&deep_details)),
+        );
+        assert_r18_preserved("raw copy above the frozen 128 depth bound", &mut variant);
     }
 
     /// C4: several proven copies are cleared in the same write; one unsafe
