@@ -72,10 +72,8 @@ pub(crate) const SOURCE_NORMALIZER_DOMAIN: &str = "cass.source-normalizer/1";
 
 /// The second mapping identity this build can read.
 ///
-/// `/2` is the native-document framing epoch and remains the producer default.
-/// The domain is part of the normalizer identity, so a declared `/3` material
-/// gets its own normalizer and its own input identity; nothing here produces
-/// `/3` by default.
+/// `/2` is the native-document framing epoch. It remains readable with
+/// its original normalizer and input identity; new ordinary inputs use `/3`.
 pub(crate) const SOURCE_MAPPING_DOMAIN_V2: &str = "cass-source-mapping/2";
 
 /// Mapping identity for source-aware first-seen metadata replay.
@@ -9827,7 +9825,6 @@ mod source_safety_preview_tests {
 
     #[test]
     fn r16_replay_current_three_completes_without_rewriting_failed_two() {
-        use crate::storage::api::TxMode;
         for connector in ["claude", "codex"] {
             let (fixture, mut lines) = r16_append_fixture(connector);
             let prefix = r16_prepare_mapping(&fixture, SourceMappingDomain::V2);
@@ -9848,28 +9845,13 @@ mod source_safety_preview_tests {
             }
             std::fs::write(&fixture.discovered.source_path, lines_body(&lines)).unwrap();
             let old_append = r16_prepare_mapping(&fixture, SourceMappingDomain::V2);
-            let old_prepared = prepare_source_input_commit(&old_append).unwrap();
-            // Reproduce the pre-repair strict projection, leaving real immutable
-            // Unresolved installations behind under the old /2 input key.
-            let old_result = storage
-                .raw()
-                .with_tx(TxMode::Immediate, |tx| {
-                    install_source_input_with_projection_in_tx(
-                        tx,
-                        &old_prepared,
-                        |tx, agent, workspace, conv, key, ordinal, claims| {
-                            storage.install_conversation_projection_in_tx(
-                                tx, agent, workspace, conv, key, ordinal, claims,
-                            )
-                        },
-                    )
-                    .map_err(source_ingest_error_to_storage)
-                })
-                .unwrap();
-            assert!(!matches!(
-                old_result.outcome,
-                source_facts::SourceActivationOutcome::Activated { .. }
-            ));
+            // Declared /2 must retain the pre-repair strict behavior even
+            // when invoked through the ordinary installation entry.
+            let old_result = commit_source_input(&storage, &old_append).unwrap();
+            assert!(
+                !matches!(old_result.outcome, SourceInputOutcome::Completed { .. }),
+                "old /2 must not acquire /3 replay semantics"
+            );
             let old_links = r16_link_snapshot(&storage, old_append.input.input_key());
             assert!(!old_links.is_empty());
             let current = r16_prepare_mapping(&fixture, SourceMappingDomain::V3);

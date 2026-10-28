@@ -12837,7 +12837,9 @@ fn source_first_seen_projection<'a>(
                 .map_err(|error| anyhow::anyhow!("replay input header: {error:?}"))?;
         }
         let header = current.as_ref().context("replay input not staged")?;
-        if !readable_replay_normalizer(header)? {
+        if replay_mapping_domain(header)?
+            != Some(crate::indexer::source_ingest::SourceMappingDomain::V3)
+        {
             continue;
         }
         let relevant: Vec<_> = claims
@@ -12858,7 +12860,7 @@ fn source_first_seen_projection<'a>(
             let mut target = None;
             let mut matched = false;
             for (old_header, binding) in anchors {
-                if !readable_replay_normalizer(&old_header)? {
+                if replay_mapping_domain(&old_header)?.is_none() {
                     continue;
                 }
                 let target_id = (
@@ -12959,24 +12961,31 @@ fn replay_header_json(
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn readable_replay_normalizer(
+fn replay_mapping_domain(
     header: &crate::storage::source_facts::SourceFactsInput,
-) -> Result<bool> {
+) -> Result<Option<crate::indexer::source_ingest::SourceMappingDomain>> {
     use crate::indexer::source_ingest::{SourceMappingDomain, normalizer_for_mapping_digest};
     let context = replay_header_json(&header.parser_context)?;
     let Some(digest) = context
         .pointer("/effective_config_summary/effective_digest")
         .and_then(serde_json::Value::as_str)
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if crate::storage::source_facts::Sha256Digest::from_hex(digest).is_none() {
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(SourceMappingDomain::READABLE.into_iter().any(|domain| {
-        normalizer_for_mapping_digest(digest, domain)
-            .is_ok_and(|normalizer| normalizer == header.normalizer_id)
-    }))
+    let matches: Vec<_> = SourceMappingDomain::READABLE
+        .into_iter()
+        .filter(|domain| {
+            normalizer_for_mapping_digest(digest, *domain)
+                .is_ok_and(|normalizer| normalizer == header.normalizer_id)
+        })
+        .collect();
+    Ok(match matches.as_slice() {
+        [domain] => Some(*domain),
+        _ => None,
+    })
 }
 
 fn marker_capture_matches(

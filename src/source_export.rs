@@ -1750,8 +1750,8 @@ mod r16_mapping_export_tests {
     //! R16: the real export entry reads both mapping identities.
     //!
     //! Both inputs are produced and installed by production entries -- the
-    //! ordinary sealed preparation for `/2` and the declared restore
-    //! preparation for `/3` -- over one fixed safety copy, and then exported
+    //! ordinary sealed preparation for `/3` and the declared restore
+    //! preparation for `/2` -- over one fixed safety copy, and then exported
     //! end to end through [`run_export`]. The profile-materials FILE is the
     //! only place the identity label is written, so a label paired with another
     //! identity's summary is refused by the same gate the CLI uses.
