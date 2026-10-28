@@ -1653,7 +1653,7 @@ normalization = "{normalization}"
     }
 
     #[test]
-    fn a_response_identity_contradiction_is_refused() {
+    fn a_successful_response_does_not_require_a_backend_identity_match() {
         let good = |body: Value| {
             let fixture = HttpFixture::start(vec![Reply::ok(body)]);
             let api = client(&embedding_config(&fixture.base(), ""));
@@ -1683,19 +1683,19 @@ normalization = "{normalization}"
             ("non string model", with(json!({"model": 7}))),
         ] {
             let (outcome, fixture) = good(body);
-            let failure = outcome.expect_err(label);
-            assert!(
-                matches!(
-                    failure.error().code(),
-                    ApiCallErrorCode::IdentityMismatch | ApiCallErrorCode::InvalidResponse
-                ),
-                "{label}: {:?}",
-                failure.error().code()
-            );
+            let outcome = outcome.expect(label);
+            // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+            assert_eq!(outcome.vectors, vec![vec![1.0, 0.0]], "{label}");
+            // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+            assert_eq!(outcome.attempts.len(), 1, "{label}");
+            // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+            assert_eq!(outcome.attempts[0].http_status, Some(200), "{label}");
+            // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+            assert_eq!(outcome.attempts[0].error_code, None, "{label}");
             assert_eq!(fixture.hits(), 1);
         }
 
-        // The configured alias is accepted.
+        // Existing aliases do not restrict which backend may serve a response.
         let aliased = format!(
             r#"
 version = 1
@@ -1716,6 +1716,35 @@ response_model_aliases = ["m-alias"]
             .embed_once("emb", &["a".to_string()], InputKind::Query)
             .expect("alias accepted");
         assert_eq!(outcome.identity.response_model.as_deref(), Some("m-alias"));
+    }
+
+    #[test]
+    fn a_gateway_backend_change_does_not_trigger_cass_rerank_fallback() {
+        let mut body = rerank_results(2);
+        body["model"] = json!("gateway-cloud-backend");
+        body["revision"] = json!("cloud-revision");
+        body["model_revision"] = json!("another-backend-revision");
+        body["provider"] = json!("cloud-provider");
+        let primary = HttpFixture::start(vec![Reply::ok(body)]);
+        let cloud = TlsFixture::start(vec![Reply::ok(rerank_results(2))]);
+        let text = rerank_pair(&primary.base(), &cloud.base());
+        let api = client_trusting(&text, cloud.ca_pem(), FixedCredentials::default());
+        let outcome = api
+            .rerank_with_fallback(
+                "local",
+                "q",
+                &documents(2),
+                RerankOptions::with_fallback(true),
+            )
+            .expect("the gateway owns its backend routing");
+        // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+        assert_eq!(outcome.scores, vec![2.0, 1.0]);
+        // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+        assert_eq!(outcome.attempts.len(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+        assert_eq!(primary.hits(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+        assert_eq!(cloud.fixture().hits(), 0);
     }
 
     #[test]
@@ -2230,13 +2259,6 @@ provider_only = "pinned-vendor"
                 "truncated json",
                 Reply::raw(
                     "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n{\"a\":",
-                ),
-            ),
-            (
-                "identity mismatch",
-                Reply::Json(
-                    200,
-                    json!({"results": [{"index": 0, "relevance_score": 1.0}], "model": "somebody-else"}),
                 ),
             ),
             (

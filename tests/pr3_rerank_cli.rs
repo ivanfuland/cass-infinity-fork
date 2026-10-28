@@ -69,8 +69,8 @@ enum StubMode {
     MissingScore,
     /// Duplicate one index: a non-permutation, refused whole.
     DuplicateIndex,
-    /// Name a model that is not an accepted alias for the selection.
-    IdentityMismatch,
+    /// Report the gateway's backend model instead of the requested model.
+    BackendModel,
     /// Answer `/models` with a card for a different model.
     WrongModelList,
 }
@@ -261,8 +261,8 @@ fn response_for(mode: StubMode, request: &RecordedRequest) -> Vec<u8> {
             }
             _ => {}
         }
-        let model = if mode == StubMode::IdentityMismatch {
-            "not/the-right-model"
+        let model = if mode == StubMode::BackendModel {
+            "example/gateway-backend"
         } else {
             RERANK_MODEL
         };
@@ -1304,17 +1304,42 @@ fn group2_window_boundaries() {
     );
 }
 
+#[test]
+fn a_backend_model_name_does_not_block_reranking() {
+    let fixture = build_fixture(FixtureOptions::default());
+    let stub = Stub::start(StubMode::BackendModel);
+    let env = RunEnv::with_stub(&fixture, &stub);
+    let output = env.run(&as_args(&rerank_args(DEFAULT_N, DEFAULT_K)));
+    assert_success(&output, "gateway response accepted");
+    let payload = stdout_json(&output);
+    let meta = rerank_meta(&payload).expect("_meta.rerank");
+    // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+    assert_eq!(meta["applied"], serde_json::json!(true));
+    // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+    assert_eq!(meta["scored_count"], serde_json::json!(DEFAULT_N));
+    // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+    assert_eq!(
+        meta["actual_model"],
+        serde_json::json!("example/gateway-backend")
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+    assert_eq!(stub.request_count(), 1);
+    for (_, _, score) in scored_hits(&payload) {
+        // ubs:ignore[rust.panic.assert-macros] -- Regression assertion.
+        assert!(
+            score.is_some(),
+            "accepted responses must supply rerank scores"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Group 3 - failures roll back the whole window, and are not retried
 // ---------------------------------------------------------------------------
 
 #[test]
 fn group3_a_bad_response_keeps_the_original_order_and_is_not_retried() {
-    for mode in [
-        StubMode::MissingScore,
-        StubMode::DuplicateIndex,
-        StubMode::IdentityMismatch,
-    ] {
+    for mode in [StubMode::MissingScore, StubMode::DuplicateIndex] {
         let fixture = build_fixture(FixtureOptions::default());
         let stub = Stub::start(mode);
         let env = RunEnv::with_stub(&fixture, &stub);
