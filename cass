@@ -43,13 +43,17 @@ release() {
   for name in cass-infinity-fork.git franken_agent_detection asupersync source tools; do
     [ ! -L "$BUILD/$name" ] || die "cached path must not be a symlink: $name"
   done
+  for name in asupersync franken_agent_detection; do
+    if [ -d "$BUILD/$name/.git" ]; then
+      [ -z "$(git -C "$BUILD/$name" status --porcelain)" ] || die "cached $name has local changes; kept unchanged"
+    fi
+  done
   mirror="$BUILD/cass-infinity-fork.git"
   if [ ! -d "$mirror" ]; then git clone --quiet --bare --shared -- "$ROOT" "$mirror"; fi
   git -C "$mirror" fetch --quiet "$ROOT" "$commit"
   git -C "$mirror" update-ref refs/heads/cass-release-source "$commit"
   fad="$BUILD/franken_agent_detection"
   if [ ! -d "$fad/.git" ]; then git clone --quiet -- "$fad_repo" "$fad"; fi
-  [ -z "$(git -C "$fad" status --porcelain)" ] || die 'cached FAD has local changes; kept unchanged'
   if ! git -C "$fad" cat-file -e "$fad_rev^{commit}" 2>/dev/null; then git -C "$fad" fetch --quiet origin "$fad_rev"; fi
   git -C "$fad" checkout --quiet "$fad_rev"
   [ "$(git -C "$fad" rev-parse HEAD)" = "$fad_rev" ] || die 'cached FAD pin mismatch'

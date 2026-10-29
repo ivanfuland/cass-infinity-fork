@@ -36,6 +36,15 @@ case "$*" in
 esac
 SH
   chmod +x "$dir/tools/systemctl"
+  cat > "$dir/tools/git" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = clone ]; then
+  printf 'unexpected clone\n' > "${0%/*}/forbidden-clone"
+  exit 89
+fi
+exec /usr/bin/git "$@"
+SH
+  chmod +x "$dir/tools/git"
   case "$kind" in
     help|status)
       before=$(snapshot)
@@ -67,6 +76,20 @@ SH
       exec 8>"$project/.build/release.lock"; flock -n 8
       reject release
       grep -q 'build lock' "$dir/command.log"
+      [ ! -e "$project/.build/cass-infinity-fork.git" ] ;;
+    dirty-asupersync|dirty-fad)
+      local dependency=asupersync
+      [ "$kind" != dirty-fad ] || dependency=franken_agent_detection
+      mkdir -p "$project/.build/$dependency"
+      git -C "$project/.build/$dependency" init -q
+      printf 'original\n' > "$project/.build/$dependency/lib.rs"
+      git -C "$project/.build/$dependency" add lib.rs
+      git -C "$project/.build/$dependency" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm dependency
+      printf 'local change\n' >> "$project/.build/$dependency/lib.rs"
+      before=$(sha256sum "$project/.build/$dependency/lib.rs")
+      reject release
+      grep -qF "cached $dependency has local changes" "$dir/command.log"
+      [ "$before" = "$(sha256sum "$project/.build/$dependency/lib.rs")" ]
       [ ! -e "$project/.build/cass-infinity-fork.git" ] ;;
     existing-output)
       mkdir "$project/dist"
@@ -125,8 +148,9 @@ SH
     *) exit 2 ;;
   esac
   [ ! -e "$dir/tools/forbidden-service-operation" ]
+  [ ! -e "$dir/tools/forbidden-clone" ]
 )
-for kind in help status dirty missing-pin invalid-pin locked existing-output cache-symlink \
+for kind in help status dirty missing-pin invalid-pin locked dirty-asupersync dirty-fad existing-output cache-symlink \
   no-bundle unknown install prefix tampered existing-version wrong-default; do
   set +e
   one_case "$kind" > "$SANDBOX/$kind.log" 2>&1
