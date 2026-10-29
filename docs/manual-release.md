@@ -86,7 +86,7 @@ This uses real binaries and isolated prefixes; it does not activate a service.
 
 Record the current CLI/MCP paths and the service's full command first. Keep that
 version and its configuration. Use the existing service management procedure:
-change only the MCP executable path and its `--cass-path` to the two paths from
+change only the MCP executable path and its `--cass-bin` to the two paths from
 `INSTALL_OK`. Preserve the transport, address, authentication, environment and
 all other arguments. Update any separately configured CLI path explicitly.
 Restart only when deployment is authorized. See [MCP usage](mcp.md).
