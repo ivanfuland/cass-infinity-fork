@@ -64,6 +64,22 @@ existing build entry. Both Cargo workspaces and lock files are preserved.
 It uses no GitHub Actions. Follow the [manual release workflow](docs/manual-release.md)
 for prerequisites, offline installation on another machine, activation and rollback.
 
+Repository map:
+
+| Location | Contents |
+|---|---|
+| `src/`, `mcp/` | CLI and MCP source, with their existing Cargo definitions |
+| [scripts/](scripts/README.md) | Current build/check tools and archived batch scripts |
+| [docs/](docs/README.md) | Operating guides, reference material and historical evidence |
+| `tests/`, `benches/`, `examples/`, `fuzz/` | Tests, benchmarks and development examples |
+| `config/`, `packaging/` | Repository configuration and distribution metadata |
+| `.build/`, `dist/` | Ignored development caches and generated release packages |
+
+Root tool-discovery files and the published `install.sh`/`install.ps1` entry
+points keep their established locations. Completed batch tools live in
+[scripts/archive/](scripts/archive/README.md); historical reports live in
+[docs/artifacts/](docs/artifacts/README.md).
+
 ---
 
 ## 🤖 Agent Quickstart (Robot Mode)

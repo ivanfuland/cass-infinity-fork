@@ -1,13 +1,13 @@
 #!/bin/bash
-# scripts/w1-equiv-gate.sh capture <out_dir>
-# scripts/w1-equiv-gate.sh compare <baseline_dir> <candidate_dir> <out_dir>
+# scripts/archive/w1/w1-equiv-gate.sh capture <out_dir>
+# scripts/archive/w1/w1-equiv-gate.sh compare <baseline_dir> <candidate_dir> <out_dir>
 #
 # 基线等价门 harness（plan Task 0.2 Step2；EXEC.md 测试门口径 + 磁盘铁律）。
 # capture 与 compare 同一脚本、同一 capture_one() 实现，保证两侧口径同构（R0-B02）。
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 export CARGO_PROFILE_DEV_DEBUG=0
 export CARGO_PROFILE_TEST_DEBUG=0
