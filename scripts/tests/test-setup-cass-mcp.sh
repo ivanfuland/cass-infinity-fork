@@ -541,6 +541,46 @@ case_old_mode_cargo_target_dir_not_rejected() {
   end_case
 }
 
+# Release input checks still use the mock boundary above, never release evidence.
+case_release_preflight() {
+  local kind="$1" expected="$2" rc=0
+  shift 2
+  begin_case "release-$kind"
+  run_setup "$CASE_DIR" INSTALL_PATH="$CLI_TARGET" MCP_INSTALL_PATH="$MCP_TARGET" \
+    RELEASE_DIR="$CASE_DIR/releases" "$@" || rc=$?
+  assert_rc_nonzero "$rc"
+  assert_contains "$CASE_DIR/setup.log" "$expected"
+  assert_eq "$(log_lines "$CASE_DIR/git-calls.log")" 0 'git invocations'
+  assert_eq "$(log_lines "$CASE_DIR/cargo-calls.log")" 0 'cargo invocations'
+  assert_no_path "$CLI_TARGET"
+  assert_no_path "$MCP_TARGET"
+  end_case
+}
+
+case_release_existing_output() {
+  local kind="$1" rc=0 commit target
+  begin_case "release-existing-$kind"
+  commit=$("$REAL_GIT" -C "$ORIGIN_WORK" rev-parse HEAD)
+  target="$CASE_DIR/releases/cass-fork-$commit-linux-x86_64"
+  mkdir -p "$CASE_DIR/releases"
+  case "$kind" in
+    dir) mkdir "$target" ;;
+    archive) target="$target.tar.gz"; printf 'keep\n' > "$target" ;;
+    checksum) target="$target.tar.gz.sha256"; ln -s missing "$target" ;;
+  esac
+  run_setup "$CASE_DIR" INSTALL_PATH="$CLI_TARGET" MCP_INSTALL_PATH="$MCP_TARGET" \
+    RELEASE_DIR="$CASE_DIR/releases" || rc=$?
+  assert_rc_nonzero "$rc"
+  assert_contains "$CASE_DIR/setup.log" 'release target already exists'
+  assert_eq "$(log_lines "$CASE_DIR/cargo-calls.log")" 0 'cargo invocations'
+  case "$kind" in
+    dir) [ -d "$target" ] || case_fail 'existing directory changed' ;;
+    archive) assert_eq "$(cat "$target")" keep ;;
+    checksum) [ -L "$target" ] || case_fail 'existing link changed' ;;
+  esac
+  end_case
+}
+
 # ---------------------------------------------------------------------------
 # Run all cases
 # ---------------------------------------------------------------------------
@@ -566,6 +606,14 @@ case_second_publish_fail
 case_stage_digest_probe_failure
 case_old_single_cli
 case_old_mode_cargo_target_dir_not_rejected
+case_release_preflight single 'requires paired mode' MCP_INSTALL_PATH=
+case_release_preflight relative 'RELEASE_DIR must be absolute' RELEASE_DIR=relative
+case_release_preflight target 'unset CARGO_BUILD_TARGET' CARGO_BUILD_TARGET=
+case_release_preflight encoded 'unset CARGO_ENCODED_RUSTFLAGS' CARGO_ENCODED_RUSTFLAGS=
+case_release_preflight isa 'custom CPU/ISA flags are unsupported' RUSTFLAGS='-C target-cpu=native'
+case_release_existing_output dir
+case_release_existing_output archive
+case_release_existing_output checksum
 
 TOTAL=$((PASS + FAIL))
 printf '\nTEST_SUMMARY total=%s pass=%s fail=%s\n' "$TOTAL" "$PASS" "$FAIL"

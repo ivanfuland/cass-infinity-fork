@@ -73,6 +73,12 @@ Paired mode rules:
 
 Legacy single-CLI mode keeps the previous install and `.prev` backup behaviour. See [docs/mcp.md](docs/mcp.md) for the server itself.
 
+For development/production separation, set `RELEASE_DIR` in paired mode to create
+a Linux x86-64 package with checksums and an offline installer. Follow the
+[manual release workflow](docs/manual-release.md) to build, transfer, install,
+activate and roll back. It uses no GitHub Actions; the target needs no source
+code or Rust toolchain.
+
 ---
 
 ## 🤖 Agent Quickstart (Robot Mode)

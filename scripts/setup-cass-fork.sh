@@ -6,8 +6,10 @@
 #   - 默认（MCP_INSTALL_PATH 未设置或为空）：只构建/核验/安装 CLI，旧行为不变。
 #   - 配套（MCP_INSTALL_PATH 非空）：从同一冻结提交分别构建根 CLI 与 mcp/ 独立包，
 #     两件全部核验后才发布到全新的候选路径，不覆盖既有文件。
+#   - 发行（配套且 RELEASE_DIR 非空）：另产可离线安装的版本目录、tar.gz 和校验文件。
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 FORK_REPO="${FORK_REPO:-https://github.com/ivanfuland/cass-infinity-fork.git}"
 FORK_REF="${FORK_REF:-infinity-main}"
 # 专用 build clone（**不是**开发 worktree）：setup 自管这个目录的 checkout 状态，
@@ -19,6 +21,7 @@ ASUPERSYNC_REV="e136c5da4547a44cec3201ada6d94325a7ca216b"
 ASUPERSYNC_DIR="$(dirname "$FORK_DIR")/asupersync"   # 必须是 FORK_DIR 的 ../asupersync sibling
 INSTALL_PATH="${INSTALL_PATH:-}"
 MCP_INSTALL_PATH="${MCP_INSTALL_PATH:-}"
+RELEASE_DIR="${RELEASE_DIR:-}"
 FEATURES="qr,encryption"
 EXPECTED_CASS_VERSION="0.6.17"
 EXPECTED_MCP_VERSION="0.6.17"
@@ -30,6 +33,21 @@ if [ "$PAIRED" = 1 ]; then STEPS=8; else STEPS=7; fi
 step() { printf '\n=== %s ===\n' "$1"; }
 die()  { printf 'FAIL[%s]: %s\n' "$1" "$2" >&2; exit 1; }
 is_abs() { case "$1" in /*) return 0 ;; *) return 1 ;; esac; }
+
+if [ -n "$RELEASE_DIR" ]; then
+  [ "$PAIRED" = 1 ] || die release-mode 'RELEASE_DIR requires paired mode with MCP_INSTALL_PATH'
+  is_abs "$RELEASE_DIR" || die release-path 'RELEASE_DIR must be absolute'
+  [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] || die release-platform 'only native Linux x86-64 GNU releases are supported'
+  [ "${CARGO_BUILD_TARGET+x}" != x ] || die release-env 'unset CARGO_BUILD_TARGET for native releases'
+  [ "${CARGO_ENCODED_RUSTFLAGS+x}" != x ] || die release-env 'unset CARGO_ENCODED_RUSTFLAGS for native releases'
+  case "${RUSTFLAGS:-}" in ''|-Clinker=/usr/bin/gcc) ;; *) die release-env 'release RUSTFLAGS must be -Clinker=/usr/bin/gcc; custom CPU/ISA flags are unsupported' ;; esac
+  export RUSTFLAGS=-Clinker=/usr/bin/gcc
+  for tool in readelf tar sort sha256sum; do command -v "$tool" >/dev/null || die release-tool "missing build-side tool: $tool"; done
+  [ -f "$SCRIPT_DIR/install-cass-fork-release.sh" ] && [ ! -L "$SCRIPT_DIR/install-cass-fork-release.sh" ] || die release-tool 'missing regular offline installer next to setup script'
+  RELEASE_DIR=$(readlink -m -- "$RELEASE_DIR")
+  [ ! -e "$RELEASE_DIR" ] || [ -d "$RELEASE_DIR" ] || die release-path 'RELEASE_DIR is not a directory'
+  [ ! -L "$RELEASE_DIR" ] || [ -d "$RELEASE_DIR" ] || die release-path 'RELEASE_DIR is a dangling symlink'
+fi
 
 # Require an explicit destination before cloning, fetching or building anything.
 [ -n "$INSTALL_PATH" ] || die install-path 'INSTALL_PATH is required; select an explicit candidate binary path'
@@ -80,6 +98,15 @@ if [ "$PAIRED" = 1 ]; then
   FETCHED_COMMIT=$(git -C "$FORK_DIR" rev-parse FETCH_HEAD) || die source-commit "cannot resolve FETCH_HEAD in $FORK_DIR"
   [ "$SRC_COMMIT" = "$FETCHED_COMMIT" ] \
     || die source-commit "checked out HEAD ($SRC_COMMIT) != fetched commit ($FETCHED_COMMIT)"
+  if [ -n "$RELEASE_DIR" ]; then
+    RELEASE_ID="cass-fork-$SRC_COMMIT-linux-x86_64"
+    RELEASE_DEST="$RELEASE_DIR/$RELEASE_ID"
+    RELEASE_ARCHIVE="$RELEASE_DIR/$RELEASE_ID.tar.gz"
+    for target in "$RELEASE_DEST" "$RELEASE_ARCHIVE" "$RELEASE_ARCHIVE.sha256"; do
+      [ ! -e "$target" ] && [ ! -L "$target" ] || die release-target "release target already exists: $target"
+      [ "$target" != "$CLI_DEST" ] && [ "$target" != "$MCP_DEST" ] || die release-target 'release output conflicts with a candidate path'
+    done
+  fi
 fi
 
 step "2/$STEPS asupersync sibling @ pinned rev (path dep; contract forbids git/rev)"
@@ -196,6 +223,46 @@ publish_candidate() {
   [ "$got" = "$want_sha" ] || die publish "$label: published SHA256 $got != built SHA256 $want_sha"
 }
 
+publish_release() {
+  local stage name versions glibc hash archive_stage sum_stage
+  mkdir -p -- "$RELEASE_DIR"
+  stage=$(mktemp -d "$RELEASE_DIR/.cass-release-stage.XXXXXX") || die release-stage 'cannot create release stage'
+  printf 'release_stage: %s\n' "$stage"
+  mkdir -- "$stage/$RELEASE_ID"
+  cp -p -- "$CLI_DEST" "$stage/$RELEASE_ID/cass"
+  cp -p -- "$MCP_DEST" "$stage/$RELEASE_ID/cass-mcp"
+  cp -- "$SCRIPT_DIR/install-cass-fork-release.sh" "$stage/$RELEASE_ID/install.sh"
+  chmod 755 "$stage/$RELEASE_ID/install.sh"
+  [ "$(sha256sum "$stage/$RELEASE_ID/cass" | awk '{print $1}')" = "$CLI_SHA" ] || die release-sha 'release CLI copy changed'
+  [ "$(sha256sum "$stage/$RELEASE_ID/cass-mcp" | awk '{print $1}')" = "$MCP_SHA" ] || die release-sha 'release MCP copy changed'
+  versions="$stage/elf-versions.txt"
+  : > "$versions"
+  for name in cass cass-mcp; do
+    LC_ALL=C readelf -h "$stage/$RELEASE_ID/$name" > "$stage/$name.header" || die release-elf "not an ELF: $name"
+    if ! grep -q 'Class:.*ELF64' "$stage/$name.header" || ! grep -q 'Machine:.*X86-64' "$stage/$name.header"; then
+      die release-elf "not native x86-64 ELF: $name"
+    fi
+    LC_ALL=C readelf --version-info "$stage/$RELEASE_ID/$name" >> "$versions" || die release-elf "cannot inspect ABI: $name"
+  done
+  glibc=$(grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' "$versions" | sed 's/^GLIBC_//' | LC_ALL=C sort -Vu | tail -n 1) || die release-abi 'cannot identify required GLIBC symbols'
+  [ -n "$glibc" ] || die release-abi 'GNU libc release requires versioned GLIBC symbols'
+  printf 'format=cass-fork-release/1\nsource_commit=%s\nplatform=linux-x86_64\ncass_version=%s\nmcp_version=%s\nglibc_min=%s\n' \
+    "$SRC_COMMIT" "$EXPECTED_CASS_VERSION" "$EXPECTED_MCP_VERSION" "$glibc" > "$stage/$RELEASE_ID/release.env"
+  ( cd "$stage/$RELEASE_ID" && sha256sum cass cass-mcp install.sh release.env > SHA256SUMS )
+  archive_stage="$stage/release.tar.gz"
+  tar -czf "$archive_stage" -C "$stage" "$RELEASE_ID" || die release-archive 'cannot create release archive; stage retained'
+  hash=$(sha256sum "$archive_stage" | awk '{print $1}')
+  sum_stage="$stage/release.tar.gz.sha256"
+  printf '%s  %s\n' "$hash" "$RELEASE_ID.tar.gz" > "$sum_stage"
+  # Publish directory and files without replacing a prior version. Keep all
+  # prepared material on failure, including a concurrent destination race.
+  mv -Tn -- "$stage/$RELEASE_ID" "$RELEASE_DEST" || die release-publish 'cannot publish release directory'
+  [ ! -e "$stage/$RELEASE_ID" ] && [ -d "$RELEASE_DEST" ] && [ ! -L "$RELEASE_DEST" ] || die release-publish 'release directory appeared concurrently; stage retained'
+  ln -T -- "$archive_stage" "$RELEASE_ARCHIVE" || die release-publish 'archive target appeared; directory and stage retained'
+  ln -T -- "$sum_stage" "$RELEASE_ARCHIVE.sha256" || die release-publish 'checksum target appeared; directory, archive and stage retained'
+  printf 'RELEASE_OK source_commit=%s platform=linux-x86_64 glibc_min=%s archive=%s sha256=%s\n' "$SRC_COMMIT" "$glibc" "$RELEASE_ARCHIVE" "$hash"
+}
+
 if [ "$PAIRED" = 1 ]; then
   step "7/$STEPS publish paired candidates (stage + ln -T; never overwrite)"
   CLI_SHA=$(sha256sum "$BIN" | awk '{print $1}')
@@ -206,6 +273,7 @@ if [ "$PAIRED" = 1 ]; then
   printf 'PAIR_OK source_commit=%s cass_version=%s mcp_version=%s cass_sha256=%s mcp_sha256=%s cli_strings_hits=%s cli_ldd_hits=%s mcp_strings_hits=%s mcp_ldd_hits=%s\n' \
     "$SRC_COMMIT" "$EXPECTED_CASS_VERSION" "$EXPECTED_MCP_VERSION" "$CLI_SHA" "$MCP_SHA" \
     "$CLI_STR_HITS" "$CLI_LDD_HITS" "$MCP_STR_HITS" "$MCP_LDD_HITS"
+  if [ -n "$RELEASE_DIR" ]; then publish_release; fi
   exit 0
 fi
 
