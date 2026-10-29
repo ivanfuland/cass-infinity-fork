@@ -611,6 +611,11 @@ case_release_preflight relative 'RELEASE_DIR must be absolute' RELEASE_DIR=relat
 case_release_preflight target 'unset CARGO_BUILD_TARGET' CARGO_BUILD_TARGET=
 case_release_preflight encoded 'unset CARGO_ENCODED_RUSTFLAGS' CARGO_ENCODED_RUSTFLAGS=
 case_release_preflight isa 'custom CPU/ISA flags are unsupported' RUSTFLAGS='-C target-cpu=native'
+case_release_preflight cflags 'unset native compiler flags: CFLAGS' CFLAGS=-march=native
+case_release_preflight cxxflags 'unset native compiler flags: CXXFLAGS' CXXFLAGS=-march=native
+case_release_preflight target-cflags 'unset native compiler flags: TARGET_CFLAGS' TARGET_CFLAGS=-march=native
+case_release_preflight target-underscore 'unset native compiler flags: CFLAGS_x86_64_unknown_linux_gnu' CFLAGS_x86_64_unknown_linux_gnu=-march=native
+case_release_preflight target-hyphen 'unset native compiler flags: CFLAGS_x86_64-unknown-linux-gnu' CFLAGS_x86_64-unknown-linux-gnu=-march=native
 case_release_existing_output dir
 case_release_existing_output archive
 case_release_existing_output checksum

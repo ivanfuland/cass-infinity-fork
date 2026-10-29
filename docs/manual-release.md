@@ -34,7 +34,9 @@ The existing source contract checks dependency pins when the sibling checkouts
 exist. Prepare the pinned `franken_agent_detection` sibling at
 `$run_root/franken_agent_detection` before building; confirm it was checked rather
 than skipped. The setup script prepares/pins `$run_root/asupersync` itself.
-Do not add custom CPU/ISA flags. Empty `RUSTFLAGS` uses the gcc linker default.
+Do not add custom CPU/ISA flags. Unset native compiler flag variables such as
+`CFLAGS`, `CXXFLAGS` and their target-specific variants. Empty `RUSTFLAGS` uses
+the gcc linker default.
 
 `PAIR_OK` means only the two candidates succeeded. Wait for **`RELEASE_OK`**.
 The release directory then contains:

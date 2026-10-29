@@ -41,6 +41,14 @@ if [ -n "$RELEASE_DIR" ]; then
   [ "${CARGO_BUILD_TARGET+x}" != x ] || die release-env 'unset CARGO_BUILD_TARGET for native releases'
   [ "${CARGO_ENCODED_RUSTFLAGS+x}" != x ] || die release-env 'unset CARGO_ENCODED_RUSTFLAGS for native releases'
   case "${RUSTFLAGS:-}" in ''|-Clinker=/usr/bin/gcc) ;; *) die release-env 'release RUSTFLAGS must be -Clinker=/usr/bin/gcc; custom CPU/ISA flags are unsupported' ;; esac
+  # cc-based dependencies also inherit native compiler flags, including target
+  # names with hyphens that Bash cannot address as shell variable names.
+  while IFS= read -r -d '' entry; do
+    case "${entry%%=*}" in
+      CFLAGS|CXXFLAGS|TARGET_CFLAGS|TARGET_CXXFLAGS|HOST_CFLAGS|HOST_CXXFLAGS|CFLAGS_*|CXXFLAGS_*)
+        [ -z "${entry#*=}" ] || die release-env "unset native compiler flags: ${entry%%=*}" ;;
+    esac
+  done < <(env -0)
   export RUSTFLAGS=-Clinker=/usr/bin/gcc
   for tool in readelf tar sort sha256sum; do command -v "$tool" >/dev/null || die release-tool "missing build-side tool: $tool"; done
   [ -f "$SCRIPT_DIR/install-cass-fork-release.sh" ] && [ ! -L "$SCRIPT_DIR/install-cass-fork-release.sh" ] || die release-tool 'missing regular offline installer next to setup script'
