@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """w1-equiv-gate 闭世界测试清单抽取器（R0-B4 + R1-B1/B2 + R2-F7/R3-B3 契约）。
 
-用法: python3 scripts/w1-test-inventory.py <dir> [<dir> ...]
+用法: python3 scripts/archive/w1/w1-test-inventory.py <dir> [<dir> ...]
 输出（stdout）: 每个 #[test] 一行 "<路径>::<函数名>::<active|ignored>::<哈希前8>"
 自检（stderr）: 抽取行数 == 行锚定 #[test] 属性总数；不等 -> exit 2（HOLD）。
 

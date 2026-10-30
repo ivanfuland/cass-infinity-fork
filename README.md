@@ -44,34 +44,41 @@ Homebrew bottles are currently published for Linux and Apple Silicon macOS. On I
 
 ---
 
-## 🧱 Building the API-only fork and MCP companion
+## 🧱 Development and manual releases
 
-`scripts/setup-cass-fork.sh` is the only supported build entry. It clones the fork into a dedicated build directory, pins the `asupersync` sibling, and builds the ORT-free feature set.
-
-The default mode builds and installs the `cass` CLI only:
+The CLI and MCP companion share this repository. Run these commands at its root:
 
 ```bash
-INSTALL_PATH="$HOME/bin/cass" bash scripts/setup-cass-fork.sh
+./cass status    # Show development paths and the actual running MCP executable.
+./cass release   # Build this committed HEAD and write an offline package to dist/.
+./cass install   # Install that version; keep the running service unchanged.
 ```
 
-Set `MCP_INSTALL_PATH` to build the paired `cass` + `cass-mcp` candidates from one frozen commit:
+The repository's `./cass` manages releases; the installed `cass` is the search CLI.
+Development clones, pinned dependencies, build caches and logs stay in `.build/`.
+Packages stay in `dist/`. Installed production versions stay outside the checkout,
+under `~/.local/lib/cass-mcp/`; runtime configuration and databases stay separate.
 
-```bash
-env -u CARGO_TARGET_DIR \
-  INSTALL_PATH="$HOME/candidates/cass" \
-  MCP_INSTALL_PATH="$HOME/candidates/cass-mcp" \
-  bash scripts/setup-cass-fork.sh
-```
+The root command delegates compilation to `scripts/setup-cass-fork.sh`, the
+existing build entry. Both Cargo workspaces and lock files are preserved.
+It uses no GitHub Actions. Follow the [manual release workflow](docs/manual-release.md)
+for prerequisites, offline installation on another machine, activation and rollback.
 
-Paired mode rules:
+Repository map:
 
-- Both targets must be absolute, must not already exist, and must resolve to different files. Any existing file, directory or dangling symlink stops the run before cloning or building.
-- `CARGO_TARGET_DIR` must be unset, even when its value is empty. The CLI and the MCP package use their own lock files and target directories.
-- Both programs are built and verified before either is published. Verification covers the source commit, each package's declared version, a real `strings` and `ldd` probe for ONNX symbols, and the binary SHA256.
-- Candidates are staged in their own parent directory and published with `ln -T`, which never overwrites an existing path. If the second publish fails, the first new candidate is kept and the command exits non-zero.
-- A successful paired run prints one `PAIR_OK` line with the source commit, both versions, both SHA256 values and the four probe counts. Save it together with the two absolute paths; it is the evidence for downstream consumption.
+| Location | Contents |
+|---|---|
+| `src/`, `mcp/` | CLI and MCP source, with their existing Cargo definitions |
+| [scripts/](scripts/README.md) | Current build/check tools and archived batch scripts |
+| [docs/](docs/README.md) | Operating guides, reference material and historical evidence |
+| `tests/`, `benches/`, `examples/`, `fuzz/` | Tests, benchmarks and development examples |
+| `config/`, `packaging/` | Repository configuration and distribution metadata |
+| `.build/`, `dist/` | Ignored development caches and generated release packages |
 
-Legacy single-CLI mode keeps the previous install and `.prev` backup behaviour. See [docs/mcp.md](docs/mcp.md) for the server itself.
+Root tool-discovery files and the published `install.sh`/`install.ps1` entry
+points keep their established locations. Completed batch tools live in
+[scripts/archive/](scripts/archive/README.md); historical reports live in
+[docs/artifacts/](docs/artifacts/README.md).
 
 ---
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# scripts/w1-disk-guard.sh <阈值GB> <被守卫的PID>
+# scripts/archive/w1/w1-disk-guard.sh <阈值GB> <被守卫的PID>
 # 契约（R0-B6）：被守卫进程必须由调用方用 `setsid <cmd> &` 启动，使其持有独立 PGID；
 # 守卫杀组前断言目标 PGID 既非自身 PGID 也非自身 SID 所在组，防止把执行会话一起杀掉。
 set -u

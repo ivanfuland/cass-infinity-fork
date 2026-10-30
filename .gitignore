@@ -7,6 +7,7 @@ target/
 *.swp
 *.swo
 /dist/
+/.build/
 /node_modules/
 tests/fixtures/search_demo_data/watch_state.json
 /.venv/lib/python3.12/site-packages/googleapiclient/discovery_cache/documents

@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# One repository entry for building packages, installing versions and status.
+set -euo pipefail
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+BUILD="$ROOT/.build"
+DIST="$ROOT/dist"
+PREFIX="$HOME/.local/lib/cass-mcp"
+die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+usage() {
+  cat <<'HELP'
+Usage: ./cass <command>
+  release                         Build this clean Git HEAD; write packages to dist/.
+  install [bundle-dir] [--prefix /absolute/root]
+                                  Install a version; keep the running service unchanged.
+  status                          Show development, packages and production paths.
+
+Development: .build/  Packages: dist/  Production: ~/.local/lib/cass-mcp/
+No GitHub Actions. Runtime configuration and data stay outside this repository.
+HELP
+}
+commit_id() { git -C "$ROOT" rev-parse --verify HEAD; }
+release_id() { printf 'cass-fork-%s-linux-x86_64' "$1"; }
+cache_root() {
+  [ ! -L "$BUILD" ] || die '.build must not be a symlink'
+  mkdir -p -- "$BUILD"
+}
+release() {
+  local commit id manifest fad_repo fad_rev fad mirror tools name candidates log
+  commit=$(commit_id) || die 'release requires a Git checkout'
+  [ -z "$(git -C "$ROOT" status --porcelain)" ] || die 'commit source changes before release'
+  id=$(release_id "$commit")
+  [ ! -L "$DIST" ] || die 'dist must not be a symlink'
+  for name in "$DIST/$id" "$DIST/$id.tar.gz" "$DIST/$id.tar.gz.sha256"; do
+    [ ! -e "$name" ] && [ ! -L "$name" ] || die "release already exists; kept unchanged: $name"
+  done
+  manifest=$(git -C "$ROOT" show "$commit:Cargo.toml")
+  fad_repo=$(printf '%s\n' "$manifest" | sed -n '/^franken-agent-detection =/s/.*git = "\([^"]*\)".*/\1/p')
+  fad_rev=$(printf '%s\n' "$manifest" | sed -n '/^franken-agent-detection =/s/.*rev = "\([^"]*\)".*/\1/p')
+  [ -n "$fad_repo" ] && [[ "$fad_rev" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || die 'missing or invalid FAD source/pin in Cargo.toml'
+  cache_root
+  exec 9>"$BUILD/release.lock"
+  flock -n 9 || die 'another release holds this repository build lock'
+  for name in cass-infinity-fork.git franken_agent_detection asupersync source tools; do
+    [ ! -L "$BUILD/$name" ] || die "cached path must not be a symlink: $name"
+  done
+  for name in asupersync franken_agent_detection; do
+    if [ -d "$BUILD/$name/.git" ]; then
+      [ -z "$(git -C "$BUILD/$name" status --porcelain)" ] || die "cached $name has local changes; kept unchanged"
+    fi
+  done
+  mirror="$BUILD/cass-infinity-fork.git"
+  if [ ! -d "$mirror" ]; then git clone --quiet --bare --shared -- "$ROOT" "$mirror"; fi
+  git -C "$mirror" fetch --quiet "$ROOT" "$commit"
+  git -C "$mirror" update-ref refs/heads/cass-release-source "$commit"
+  fad="$BUILD/franken_agent_detection"
+  if [ ! -d "$fad/.git" ]; then git clone --quiet -- "$fad_repo" "$fad"; fi
+  if ! git -C "$fad" cat-file -e "$fad_rev^{commit}" 2>/dev/null; then git -C "$fad" fetch --quiet origin "$fad_rev"; fi
+  git -C "$fad" checkout --quiet "$fad_rev"
+  [ "$(git -C "$fad" rev-parse HEAD)" = "$fad_rev" ] || die 'cached FAD pin mismatch'
+  tools="$BUILD/tools/$commit"
+  mkdir -p -- "$tools" "$BUILD/candidates" "$BUILD/logs"
+  for name in setup-cass-fork.sh install-cass-fork-release.sh; do
+    if [ -e "$tools/$name" ]; then
+      cmp -s "$tools/$name" <(git -C "$ROOT" show "$commit:scripts/$name") || die "frozen tool changed: $name"
+    else
+      git -C "$ROOT" show "$commit:scripts/$name" > "$tools/$name"
+      chmod 555 "$tools/$name"
+    fi
+  done
+  candidates=$(mktemp -d "$BUILD/candidates/$commit.XXXXXX")
+  log="$BUILD/logs/${candidates##*/}.log"
+  printf 'Building source_commit=%s\nBuild log: %s\n' "$commit" "$log"
+  # setup owns its dedicated clone. Both dependency siblings stay in .build/.
+  env -u CARGO_TARGET_DIR \
+    PATH="$HOME/.cargo/bin:$PATH" CC=/usr/bin/gcc CC_x86_64_unknown_linux_gnu=/usr/bin/gcc \
+    CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 \
+    CASS_STRICT_PATH_DEP_VALIDATION=1 FORK_REPO="$mirror" FORK_REF="$commit" \
+    FORK_DIR="$BUILD/source" INSTALL_PATH="$candidates/cass" MCP_INSTALL_PATH="$candidates/cass-mcp" \
+    RELEASE_DIR="$DIST" bash "$tools/setup-cass-fork.sh" > "$log" 2>&1 \
+    || die "release failed; build material retained; see $log"
+  grep '^RELEASE_OK ' "$log" || die "missing release success record; see $log"
+  printf 'Package: %s/%s.tar.gz\nInstall locally: ./cass install\n' "$DIST" "$id"
+}
+install_version() {
+  local bundle='' expected='' commit
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --prefix) [ "$#" -ge 2 ] || die '--prefix requires a directory'; PREFIX="$2"; shift 2 ;;
+      -*) die "unknown install option: $1" ;;
+      *) [ -z "$bundle" ] || die 'provide only one bundle directory'; bundle="$1"; shift ;;
+    esac
+  done
+  if [ -z "$bundle" ]; then
+    commit=$(commit_id) || die 'provide a bundle directory outside a Git checkout'
+    expected="$commit"
+    bundle="$DIST/$(release_id "$commit")"
+  fi
+  [ -f "$bundle/install.sh" ] && [ ! -L "$bundle/install.sh" ] || die "release bundle missing: $bundle; run ./cass release first"
+  if [ -n "$expected" ]; then
+    grep -qxF "source_commit=$expected" "$bundle/release.env" || die 'default bundle does not match this Git HEAD'
+  fi
+  bash "$bundle/install.sh" --prefix "$PREFIX"
+  printf 'Installed only. The running service, configuration and data are unchanged.\n'
+}
+status() {
+  local commit pid='' running='not running (or user service unavailable)'
+  commit=$(commit_id 2>/dev/null) || commit=unversioned
+  if command -v systemctl >/dev/null; then
+    pid=$(systemctl --user show cass-mcp.service --property=MainPID --value 2>/dev/null) || pid=''
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && [ -e "/proc/$pid/exe" ]; then
+      running=$(readlink -- "/proc/$pid/exe")
+    fi
+  fi
+  printf 'Source: %s\nGit HEAD: %s\nDevelopment cache: %s\nRelease packages: %s\nProduction versions: %s\nRunning MCP: %s\n' \
+    "$ROOT" "$commit" "$BUILD" "$DIST" "$PREFIX" "$running"
+}
+case "${1:-help}" in
+  help|--help|-h) usage ;;
+  release) [ "$#" -eq 1 ] || die 'release takes no arguments'; release ;;
+  install) shift; install_version "$@" ;;
+  status) [ "$#" -eq 1 ] || die 'status takes no arguments'; status ;;
+  *) usage >&2; die "unknown command: $1" ;;
+esac
