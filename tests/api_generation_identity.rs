@@ -657,21 +657,21 @@ fn a_tampered_record_never_reopens() {
     assert!(fixture.open(good, &profile).is_ok());
 }
 
-/// Two records rebuilt to be self-consistent, yet describing a space the running
-/// profile does not: the refusal is a classification, not a repair.
+/// Configured model names select requests; they do not rewrite stored identity.
 #[test]
-fn a_self_consistent_record_for_another_space_is_an_identity_mismatch() {
+fn a_configured_model_change_opens_the_existing_generation() {
     let fixture = Fixture::new();
     let original = profile_for("p1", ENDPOINT_A, EMBED_MODEL, EMBED_REVISION, &[]);
     let other = profile_for("p1", ENDPOINT_A, "example/other-model", EMBED_REVISION, &[]);
 
     let generation_id = fixture.create(&original, 1024, b"fp-other-space");
     assert!(fixture.open(generation_id, &original).is_ok());
+    let before = meta_value(fixture.conn(), &representation_meta_key(generation_id));
+    assert!(fixture.open(generation_id, &other).is_ok());
     assert_eq!(
-        fixture.reopen_error(generation_id, &other).code(),
-        ApiGenerationErrorCode::IdentityMismatch
+        meta_value(fixture.conn(), &representation_meta_key(generation_id)),
+        before
     );
-    // Refusing it changed nothing on disk.
     assert!(fixture.open(generation_id, &original).is_ok());
 }
 
@@ -680,8 +680,7 @@ fn a_self_consistent_record_for_another_space_is_an_identity_mismatch() {
 // ---------------------------------------------------------------------------
 
 /// A generation created with one set of call settings opens unchanged under
-/// another: only the declared vector space and the pinned provider decide
-/// admission.
+/// another: API settings do not decide model admission.
 ///
 /// Every case is a real `ApiConfig` profile whose call-configuration digest
 /// differs from the base profile's. The stored representation and provenance
@@ -910,7 +909,7 @@ fn call_settings_can_change_without_rewriting_generation_identity() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn configuration_drift_is_classified_not_guessed() {
+fn configured_api_settings_do_not_gate_an_existing_generation() {
     let fixture = Fixture::new();
     let conn = fixture.conn();
     let base = profile_for("p1", ENDPOINT_A, EMBED_MODEL, EMBED_REVISION, &[]);
@@ -918,10 +917,7 @@ fn configuration_drift_is_classified_not_guessed() {
 
     // Same width, different model.
     let other_model = profile_for("p1", ENDPOINT_A, "example/other-model", EMBED_REVISION, &[]);
-    assert_eq!(
-        fixture.reopen_error(generation_id, &other_model).code(),
-        ApiGenerationErrorCode::IdentityMismatch
-    );
+    assert!(fixture.open(generation_id, &other_model).is_ok());
 
     // Same width, same model, different query prefix.
     let prefixed = profile_for(
@@ -931,17 +927,11 @@ fn configuration_drift_is_classified_not_guessed() {
         EMBED_REVISION,
         &["query_prefix = \"lookup: \""],
     );
-    assert_eq!(
-        fixture.reopen_error(generation_id, &prefixed).code(),
-        ApiGenerationErrorCode::IdentityMismatch
-    );
+    assert!(fixture.open(generation_id, &prefixed).is_ok());
 
     // Same width, same model, a different declared revision.
     let other_revision = profile_for("p1", ENDPOINT_A, EMBED_MODEL, "rev-synthetic-2", &[]);
-    assert_eq!(
-        fixture.reopen_error(generation_id, &other_revision).code(),
-        ApiGenerationErrorCode::IdentityMismatch
-    );
+    assert!(fixture.open(generation_id, &other_revision).is_ok());
 
     // Same width, same model, different document prefix.
     let document_prefixed = profile_for(
@@ -951,12 +941,7 @@ fn configuration_drift_is_classified_not_guessed() {
         EMBED_REVISION,
         &["document_prefix = \"passage: \""],
     );
-    assert_eq!(
-        fixture
-            .reopen_error(generation_id, &document_prefixed)
-            .code(),
-        ApiGenerationErrorCode::IdentityMismatch
-    );
+    assert!(fixture.open(generation_id, &document_prefixed).is_ok());
 
     // Same width, same model, a different protocol family.
     let other_protocol = parse_profile(
@@ -971,10 +956,7 @@ fn configuration_drift_is_classified_not_guessed() {
             &[r#"normalization = "l2""#],
         ),
     );
-    assert_eq!(
-        fixture.reopen_error(generation_id, &other_protocol).code(),
-        ApiGenerationErrorCode::IdentityMismatch
-    );
+    assert!(fixture.open(generation_id, &other_protocol).is_ok());
 
     // An explicit request dimension equal to the archived effective dimension:
     // the profile is legal, but the stored declaration has no request dimension.
@@ -985,8 +967,14 @@ fn configuration_drift_is_classified_not_guessed() {
         EMBED_REVISION,
         &["request_dimensions = 1024"],
     );
+    assert!(fixture.open(generation_id, &requesting).is_ok());
+
+    let wrong_width = profile_for(
+        "p1", ENDPOINT_A, EMBED_MODEL, EMBED_REVISION,
+        &["request_dimensions = 512"],
+    );
     assert_eq!(
-        fixture.reopen_error(generation_id, &requesting).code(),
+        fixture.reopen_error(generation_id, &wrong_width).code(),
         ApiGenerationErrorCode::IdentityMismatch
     );
 
@@ -1003,10 +991,7 @@ fn configuration_drift_is_classified_not_guessed() {
             &[r#"normalization = "none""#],
         ),
     );
-    assert_eq!(
-        fixture.reopen_error(generation_id, &unnormalized).code(),
-        ApiGenerationErrorCode::IdentityMismatch
-    );
+    assert!(fixture.open(generation_id, &unnormalized).is_ok());
 
     // A relocation moves only the call configuration. The declared space is
     // unchanged, so the generation opens and neither record is rewritten.
@@ -1031,10 +1016,9 @@ fn configuration_drift_is_classified_not_guessed() {
     assert_eq!(count(conn, "embedding_generations"), 1);
 }
 
-/// A pinned provider is the other call-side fact that needs re-admission, and it
-/// too leaves the record alone.
+/// Provider routing belongs to the configured endpoint, not stored admission.
 #[test]
-fn a_changed_pinned_provider_needs_re_admission() {
+fn a_changed_pinned_provider_opens_without_re_admission() {
     let fixture = Fixture::new();
     let providerless = parse_profile(
         "p1",
@@ -1063,9 +1047,7 @@ fn a_changed_pinned_provider_needs_re_admission() {
 
     let generation_id = fixture.create(&providerless, 1024, b"fp-provider");
     assert!(fixture.open(generation_id, &providerless).is_ok());
-    let error = fixture.reopen_error(generation_id, &pinned);
-    assert_eq!(error.code(), ApiGenerationErrorCode::CompatibilityRequired);
-    assert_eq!(error.field(), Some("provider_only"));
+    assert!(fixture.open(generation_id, &pinned).is_ok());
 
     // Both records are still exactly what they were.
     assert!(fixture.open(generation_id, &providerless).is_ok());
@@ -1547,11 +1529,11 @@ fn a_rejection_never_echoes_the_record_it_refused() {
     set_meta(
         fixture.conn(),
         &provenance_meta_key(generation_id),
-        &tamper_first_contributor(&provenance, "provider_only", json!(SYNTHETIC_SECRET)),
+        &tamper_first_contributor(&provenance, "model", json!(SYNTHETIC_SECRET)),
     );
     let error = fixture.reopen_error(generation_id, &profile);
-    assert_eq!(error.code(), ApiGenerationErrorCode::CompatibilityRequired);
-    assert_renders_without(&error, SYNTHETIC_SECRET, "a changed pinned provider");
+    assert_eq!(error.code(), ApiGenerationErrorCode::InvalidRecord);
+    assert_renders_without(&error, SYNTHETIC_SECRET, "an inconsistent stored model");
 }
 
 // ---------------------------------------------------------------------------

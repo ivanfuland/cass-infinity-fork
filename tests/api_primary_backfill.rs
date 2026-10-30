@@ -2980,13 +2980,15 @@ fn api_query_reopens_generation_and_uses_query_prefix() {
     let requests = stub.requests();
     assert_eq!(requests.len(), before + 1, "query sends no probe");
     assert_eq!(requests[before].inputs(), vec!["QUERY: synthetic query".to_string()]);
-    // Same width does not permit a model change against the old generation.
+    // A configured model change still queries the existing generation.
     let changed = fs::read_to_string(&config).unwrap().replace(EMBED_MODEL, "example/different-model");
     fs::write(&config, changed).unwrap();
-    let denied = cass(&["search", "synthetic query", "--mode", "semantic", "--json",
+    let renamed = cass(&["search", "synthetic query", "--mode", "semantic", "--json",
         "--data-dir", data_dir.to_str().unwrap(), "--api-config", config.to_str().unwrap()], &[]);
-    assert!(!denied.status.success());
-    assert_eq!(stub.requests().len(), before + 1, "identity refusal precedes private query HTTP");
+    assert_success(&renamed);
+    let requests = stub.requests();
+    assert_eq!(requests.len(), before + 2, "renamed model sends one query without a probe");
+    assert_eq!(requests[before + 1].body_json()["model"], "example/different-model");
 }
 
 #[test]
