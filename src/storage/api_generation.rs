@@ -20,8 +20,9 @@
 //! ## What this module does not do
 //!
 //! It never activates a generation, never touches `is_active` or `audit_status`,
-//! never edits or removes an older generation, and never accepts a caller's word
-//! that a record is compatible. The endpoint digest it stores is recomputed from
+//! never edits or removes an older generation. It checks stored records for
+//! internal consistency, not configured model admission. The endpoint digest
+//! it stores is recomputed from
 //! the profile it is handed; the digest is never taken from the caller. There is
 //! no public flag a caller can set to declare a record trustworthy.
 //!
@@ -1233,8 +1234,8 @@ impl VerifiedPrimaryGeneration {
     }
 }
 
-/// Reopen one generation through all three of its stored records and prove it is
-/// the space `profile` describes.
+/// Reopen one generation through its stored records using the configured API
+/// profile. Model selection belongs to the operator and the API gateway.
 ///
 /// The checks run in this order, and the first failure is the answer:
 ///
@@ -1245,16 +1246,9 @@ impl VerifiedPrimaryGeneration {
 ///    with the provenance digest — a disagreement here is a store that
 ///    contradicts itself;
 /// 3. the provenance admits exactly one pure-primary contributor;
-/// 4. the stored descriptor still describes the space `profile` describes — a
-///    changed model, revision, prefix, normalization, protocol, dimension or
-///    pipeline version is an [`ApiGenerationErrorCode::IdentityMismatch`];
-/// 5. the stored pinned provider still matches the profile's — a provider
-///    change is [`ApiGenerationErrorCode::CompatibilityRequired`], because the
-///    record's own bytes stay valid and only successor-side admission may clear
-///    it. The stored endpoint digest records how the generation was first
-///    called and takes no part in admission: a relocated endpoint, timeout,
-///    connect timeout, credential variable name, response ceiling or metadata
-///    endpoint still opens the same declared space.
+/// 4. configured dimensions agree with the stored vector width. Model names,
+///    revisions, providers and other API settings do not admit or refuse a
+///    stored generation. Stored metadata remains creation-time evidence.
 ///
 /// The read runs inside `tx` so a future batch or activation guard can re-check
 /// identity inside the very transaction that writes. Nothing here writes.
@@ -1328,8 +1322,7 @@ fn open_generation_checked(
     } else {
         let contributor = provenance.single_primary_contributor()?;
         check_contributor_against_descriptor(contributor, record.descriptor())?;
-        check_descriptor_against_profile(record.descriptor(), profile)?;
-        check_contributor_against_profile(contributor, profile)?;
+        check_profile_dimensions(record.descriptor(), profile)?;
     }
 
     Ok(VerifiedPrimaryGeneration {
@@ -1354,7 +1347,7 @@ fn check_provenance_with_compatibility(
         if first.compatibility_evidence_sha256.is_some() { return Err(compatibility_required()); }
         check_contributor_against_descriptor(first,record.descriptor())?;
     }
-    check_descriptor_against_profile(record.descriptor(),primary)?;
+    check_profile_dimensions(record.descriptor(),primary)?;
     let primary_sha=EndpointConfigIdentity::from_profile(primary).map_err(ApiGenerationError::from_config)?.sha256();
     let header=proof.header();
     if header.primary_descriptor_sha256!=record.descriptor_sha256()
@@ -1506,18 +1499,24 @@ fn check_contributor_against_descriptor(
     Ok(())
 }
 
-/// The stored descriptor must still describe the space the profile describes.
-fn check_descriptor_against_profile(
+/// Check vector shape without treating configured model metadata as admission.
+fn check_profile_dimensions(
     descriptor: &RepresentationDescriptor,
     profile: &ValidatedProfile,
 ) -> Result<(), ApiGenerationError> {
-    let expected = RepresentationDescriptor::from_profile(profile, descriptor.effective_dimension())
-        .map_err(ApiGenerationError::from_profile_identity)?;
-    if !descriptor.is_equivalent_to(&expected) {
-        return Err(ApiGenerationError::at(
-            ApiGenerationErrorCode::IdentityMismatch,
-            "descriptor",
-        ));
+    let embedding = profile.embedding().ok_or_else(|| {
+        ApiGenerationError::at(ApiGenerationErrorCode::WrongKind, "kind")
+    })?;
+    for (field, width) in [
+        ("effective_dimension", embedding.expected_dimension),
+        ("request_dimensions", embedding.request_dimensions),
+    ] {
+        if width.is_some_and(|width| width != descriptor.effective_dimension()) {
+            return Err(ApiGenerationError::at(
+                ApiGenerationErrorCode::IdentityMismatch,
+                field,
+            ));
+        }
     }
     Ok(())
 }
