@@ -7,14 +7,20 @@ export LC_ALL=C
 die() { printf 'FAIL[install]: %s\n' "$*" >&2; exit 1; }
 usage() { printf 'Usage: bash install.sh --prefix /absolute/version-root\n'; }
 # Full deployment (--deploy) exit codes: 0 success, 1 general failure,
-# 2 invalid argument, 3 data directory belongs to something else.
+# 2 invalid argument, 3 data or configuration directory belongs to something
+# else, 4 first round failed, 5 first round incomplete (run the same command
+# again), 6 MCP switch failed, 7 tailnet publication failed, 8 self-check failed.
 die_arg() { printf 'FAIL[install]: %s\n' "$*" >&2; exit 2; }
+die_rc() { local rc=$1; shift; printf 'FAIL[install]: %s\n' "$*" >&2; exit "$rc"; }
 deploy_usage() {
   printf '%s\n' 'Usage: bash install.sh --prefix /abs/version-root --deploy --instance NAME' \
     '         --data-dir /abs --config-dir /abs' \
     '         --embed-endpoint URL --embed-model NAME --embed-revision REV' \
     '         --rerank-endpoint URL --rerank-model NAME --rerank-revision REV' \
-    '         --key-env NAME --key-file /abs [--legacy-source /abs]'
+    '         --key-env NAME --key-file /abs [--legacy-source /abs]' \
+    '         --mcp install|none [--mcp-bind 127.0.0.1:PORT --public-origin https://HOST[:PORT]]' \
+    '         [--tailnet-serve] [--skip-first-round]' \
+    '         [--ssh-authorized-key /abs/key.pub --ssh-from ADDRESS-OR-CIDR]'
 }
 DEPLOY=0
 for arg in "$@"; do [ "$arg" != --deploy ] || DEPLOY=1; done
@@ -37,15 +43,19 @@ else
       --help|-h) deploy_usage; exit 0 ;;
       --deploy) shift ;;
       --prefix|--instance|--data-dir|--config-dir|--embed-endpoint|--embed-model|--embed-revision|\
-      --rerank-endpoint|--rerank-model|--rerank-revision|--key-env|--key-file|--legacy-source)
+      --rerank-endpoint|--rerank-model|--rerank-revision|--key-env|--key-file|--legacy-source|\
+      --mcp|--mcp-bind|--public-origin|--ssh-authorized-key|--ssh-from)
         [ "$#" -ge 2 ] || die_arg "$1 requires one value"
         [ -z "${OPT[${1#--}]+present}" ] || die_arg "$1 given more than once"
         OPT[${1#--}]=$2; shift 2 ;;
+      --tailnet-serve|--skip-first-round)
+        [ -z "${OPT[${1#--}]+present}" ] || die_arg "$1 given more than once"
+        OPT[${1#--}]=1; shift ;;
       *) deploy_usage >&2; die_arg "unknown argument: $1" ;;
     esac
   done
   for name in prefix instance data-dir config-dir embed-endpoint embed-model embed-revision \
-    rerank-endpoint rerank-model rerank-revision key-env key-file; do
+    rerank-endpoint rerank-model rerank-revision key-env key-file mcp; do
     [ -n "${OPT[$name]+present}" ] || die_arg "--$name is required with --deploy"
   done
   PREFIX=${OPT[prefix]}
@@ -94,6 +104,57 @@ read_key() {
   [ -n "$KEY_VALUE" ] || die_arg 'key file is empty'
   ! [[ $KEY_VALUE =~ $bad ]] || die_arg 'key value contains a quote, whitespace, backslash or control character'
 }
+# render_safe NAME=VALUE...: a placeholder value goes inside single quotes in
+# the ingest entry, so it must not contain a single quote, a newline, a CR or @@.
+render_safe() {
+  local pair value
+  for pair in "$@"; do
+    value=${pair#*=}
+    case "$value" in
+      *"'"*|*$'\n'*|*$'\r'*|*@@*)
+        die_arg "placeholder value for @@${pair%%=*}@@ contains a single quote, a newline, a CR or @@" ;;
+    esac
+  done
+}
+# unit_safe <purpose> NAME=VALUE...: a value written into a systemd unit line or
+# an authorized_keys command needs no quoting: no whitespace, %, $ or quotes.
+unit_safe() {
+  local purpose=$1 pair; shift
+  for pair in "$@"; do
+    [[ ${pair#*=} =~ ^[A-Za-z0-9._/:@+,=~-]+$ ]] \
+      || die_arg "value for @@${pair%%=*}@@ cannot be used in $purpose: only letters, digits and ._/:@+,=~- are allowed"
+  done
+}
+# ssh_from_ok <value>: one IPv4 address (each part 0-255) with an optional
+# prefix 0-32, or one IPv6 address (at least two colons) with a prefix 0-128.
+ssh_from_ok() {
+  local addr=${1%/*} plen="" part
+  local -a parts
+  case "$1" in */*) plen=${1##*/}; [[ $plen =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1 ;; esac
+  if [[ $addr =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    IFS=. read -r -a parts <<< "$addr"
+    for part in "${parts[@]}"; do [[ $part =~ ^(0|[1-9][0-9]*)$ ]] && [ "$part" -le 255 ] || return 1; done
+    [ -z "$plen" ] || [ "$plen" -le 32 ]
+  elif [[ $addr =~ ^[0-9A-Fa-f:.]+$ ]] && [[ $addr =~ :.*: ]]; then
+    [ -z "$plen" ] || [ "$plen" -le 128 ]
+  else
+    return 1
+  fi
+}
+# render <template> <output> NAME=VALUE...: plain text replacement of @@NAME@@.
+# Unsafe values exit 2 before the output is written. A placeholder token
+# (@@NAME@@) left in the result exits 1. Other @@ text is not a placeholder: the
+# entry template itself contains "@@...@@" in a comment and its guard "@@*@@".
+render() {
+  local tpl=$1 out=$2 pair content; shift 2
+  render_safe "$@"
+  [ -f "$tpl" ] && [ ! -L "$tpl" ] || die "missing template: $tpl"
+  content=$(cat -- "$tpl" && printf x) || die "cannot read template: $tpl"
+  content=${content%x}
+  for pair in "$@"; do content=${content//"@@${pair%%=*}@@"/"${pair#*=}"}; done
+  if [[ $content =~ @@[A-Z][A-Z0-9_]*@@ ]]; then die "rendered template still contains ${BASH_REMATCH[0]}: $tpl"; fi
+  printf '%s' "$content" > "$out" || die "cannot write $out"
+}
 if [ "$DEPLOY" -eq 1 ]; then
   abs_path --prefix "$PREFIX"
   INSTANCE=${OPT[instance]}
@@ -137,6 +198,57 @@ if [ "$DEPLOY" -eq 1 ]; then
   ! overlaps "$real_data" "$real_prefix" || die_arg '--data-dir and --prefix must not be equal or nested'
   ! overlaps "$own" "$real_prefix" || die_arg '--config-dir and --prefix must not be equal or nested'
   read_key "$KEY_FILE"
+
+  # T10 options: MCP service, first round, tailnet and the restricted ssh line.
+  MCP=${OPT[mcp]}
+  case "$MCP" in install|none) ;; *) die_arg '--mcp must be install or none' ;; esac
+  TAILNET=off; [ -z "${OPT[tailnet-serve]+present}" ] || TAILNET=on
+  FIRST_ROUND=run; [ -z "${OPT[skip-first-round]+present}" ] || FIRST_ROUND=skip
+  BIND=""; ORIGIN=""; BIND_PORT=""
+  if [ "$MCP" = install ]; then
+    [ -n "${OPT[mcp-bind]+present}" ] || die_arg '--mcp-bind is required with --mcp install'
+    [ -n "${OPT[public-origin]+present}" ] || die_arg '--public-origin is required with --mcp install'
+    BIND=${OPT[mcp-bind]}; ORIGIN=${OPT[public-origin]}
+    [[ $BIND =~ ^127\.0\.0\.1:([1-9][0-9]{0,4})$ ]] && [ "${BASH_REMATCH[1]}" -le 65535 ] \
+      || die_arg '--mcp-bind must be 127.0.0.1:<port 1-65535>'
+    BIND_PORT=${BIND#127.0.0.1:}
+    [[ $ORIGIN =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:([1-9][0-9]{0,4}))?$ ]] \
+      && { [ -z "${BASH_REMATCH[3]}" ] || [ "${BASH_REMATCH[3]}" -le 65535 ]; } \
+      || die_arg '--public-origin must be an https origin: https://host[:port 1-65535] without a path'
+  else
+    for name in mcp-bind public-origin tailnet-serve; do
+      [ -z "${OPT[$name]+present}" ] || die_arg "--$name requires --mcp install"
+    done
+  fi
+  SSH_KEY=""; SSH_FROM=""
+  if [ -n "${OPT[ssh-authorized-key]+present}" ] || [ -n "${OPT[ssh-from]+present}" ]; then
+    [ -n "${OPT[ssh-authorized-key]+present}" ] && [ -n "${OPT[ssh-from]+present}" ] \
+      || die_arg '--ssh-authorized-key and --ssh-from must be given together'
+    pub=${OPT[ssh-authorized-key]}; abs_path --ssh-authorized-key "$pub"
+    [ -f "$pub" ] && [ -r "$pub" ] || die_arg '--ssh-authorized-key is not a readable regular file'
+    line=$(head -n 1 -- "$pub") || die_arg 'cannot read --ssh-authorized-key'
+    [[ $line =~ ^(ssh-ed25519|ecdsa-sha2-[a-z0-9-]+|ssh-rsa)\ ([A-Za-z0-9+/]+={0,2})(\ [^[:cntrl:]]*)?$ ]] \
+      || die_arg 'the first line of --ssh-authorized-key must be "<type> <base64> [comment]" with type ssh-ed25519, ecdsa-sha2-* or ssh-rsa'
+    SSH_KEY="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+    SSH_FROM=${OPT[ssh-from]}
+    ssh_from_ok "$SSH_FROM" \
+      || die_arg '--ssh-from must be one IPv4 address (each part 0-255, prefix 0-32) or IPv6 address (at least two colons, prefix 0-128), optionally with /prefix'
+  fi
+  # Rendered values, from the canonical paths. All are checked before any write.
+  CUR_PATH="$real_prefix/current"
+  ENTRY="$own/cass-ingest-entry"; UNIT_FILE="$own/cass-mcp.service"
+  ENTRY_VALUES=(CASS_BIN="$CUR_PATH/cass" DATA_DIR="$real_data" API_CONFIG="$own/model-api.toml"
+    ENV_FILE="$own/model-api.env" CONFIG_HOME="$own" INSTANCE="$INSTANCE")
+  render_safe "${ENTRY_VALUES[@]}"
+  UNIT_VALUES=()
+  if [ "$MCP" = install ]; then
+    UNIT_VALUES=(CASS_MCP_BIN="$CUR_PATH/cass-mcp" CASS_BIN="$CUR_PATH/cass" DATA_DIR="$real_data"
+      API_CONFIG="$own/model-api.toml" ENV_FILE="$own/model-api.env" BIND="$BIND" PUBLIC_ORIGIN="$ORIGIN"
+      EMBED_PROFILE=embed RERANK_PROFILE=rerank)
+    render_safe "${UNIT_VALUES[@]}"
+    unit_safe 'the systemd unit' "${UNIT_VALUES[@]}"
+  fi
+  [ -z "$SSH_KEY" ] || unit_safe 'the authorized_keys command' ENTRY="$ENTRY"
 
   # Ownership of the data and configuration directories. Absent or empty: this
   # run claims it. This instance's marker: continue. Anything else is refused
@@ -297,12 +409,13 @@ mkdir -p -- "$PREFIX"
 PREFIX=$(cd -- "$PREFIX" && pwd -P)
 ID="cass-fork-${META[source_commit]}-${META[platform]}"
 DEST="$PREFIX/$ID"
-STAGE=""; CFG_STAGE=""; TMP_LINK=""; TMP_MARKER=""
+STAGE=""; CFG_STAGE=""; TMP_LINK=""; TMP_MARKER=""; CHECK_DIR=""
 on_exit() {
   local rc=$?
   if [ "$rc" -ne 0 ] && [ -n "$STAGE" ] && [ -d "$STAGE" ]; then printf 'Unpublished stage retained: %s\n' "$STAGE" >&2; fi
   # Deployment temporaries are never left behind, on success or failure.
   if [ -n "$CFG_STAGE" ]; then rm -rf -- "$CFG_STAGE"; fi
+  if [ -n "$CHECK_DIR" ]; then rm -rf -- "$CHECK_DIR"; fi
   if [ -n "$TMP_LINK" ] && [ -L "$TMP_LINK" ]; then rm -f -- "$TMP_LINK"; fi
   if [ -n "$TMP_MARKER" ] && [ -f "$TMP_MARKER" ]; then rm -f -- "$TMP_MARKER"; fi
 }
@@ -396,6 +509,13 @@ api_key_env = "$KEY_ENV"
 timeout_ms = 125000
 EOF
 printf '%s=%s\n' "$KEY_ENV" "$KEY_VALUE" > "$CFG_STAGE/model-api.env" || die 'cannot write model-api.env'
+# The ingest entry and, with --mcp install, the MCP unit, from the published templates.
+render "$DEST/templates/cass-ingest-entry.sh" "$CFG_STAGE/cass-ingest-entry" "${ENTRY_VALUES[@]}"
+INSTALL_FILES=(cass/sources.toml:600 model-api.toml:600 model-api.env:600 cass-ingest-entry:700)
+if [ "$MCP" = install ]; then
+  render "$DEST/templates/cass-mcp.service.in" "$CFG_STAGE/cass-mcp.service" "${UNIT_VALUES[@]}"
+  INSTALL_FILES+=(cass-mcp.service:644)
+fi
 
 # Both files must load in the published binary before anything is installed.
 staged_cass sources list --json > /dev/null 2> "$CFG_STAGE/check.err" \
@@ -416,13 +536,14 @@ fi
 # Install each configuration file by rename; an unchanged file is not touched.
 [ "$CONFIG_STATE" = own ] || write_marker "$CONFIG_DIR"
 mkdir -p -- "$CONFIG_DIR/cass" && chmod 700 -- "$CONFIG_DIR/cass" || die "cannot create $CONFIG_DIR/cass"
-for rel in cass/sources.toml model-api.toml model-api.env; do
+for item in "${INSTALL_FILES[@]}"; do
+  rel=${item%:*}; mode=${item##*:}
   if [ -f "$CONFIG_DIR/$rel" ] && [ ! -L "$CONFIG_DIR/$rel" ] && cmp -s -- "$CFG_STAGE/$rel" "$CONFIG_DIR/$rel" \
-    && [ "$(stat -c %a -- "$CONFIG_DIR/$rel")" = 600 ]; then
+    && [ "$(stat -c %a -- "$CONFIG_DIR/$rel")" = "$mode" ]; then
     continue
   fi
   [ ! -d "$CONFIG_DIR/$rel" ] || die "configuration path is a directory: $CONFIG_DIR/$rel"
-  chmod 600 -- "$CFG_STAGE/$rel" || die "cannot set mode of $rel"
+  chmod "$mode" -- "$CFG_STAGE/$rel" || die "cannot set mode of $rel"
   mv -T -- "$CFG_STAGE/$rel" "$CONFIG_DIR/$rel" || die "cannot install $CONFIG_DIR/$rel"
 done
 
@@ -441,3 +562,68 @@ fi
 printf 'DEPLOY_OK instance=%s current=%s data_dir=%s config_dir=%s\n' "$INSTANCE" "$CURRENT" "$DATA_DIR" "$CONFIG_DIR"
 printf 'sources_config=%s/cass/sources.toml\napi_config=%s/model-api.toml\nenv_file=%s/model-api.env\n' \
   "$CONFIG_DIR" "$CONFIG_DIR" "$CONFIG_DIR"
+printf 'ingest_entry=%s\n' "$ENTRY"
+
+# ---------------------------------------------------------------------------
+# After current: MCP, first round, tailnet, self-check, restricted ssh line.
+# ---------------------------------------------------------------------------
+if [ "$MCP" = install ]; then
+  # Without XDG_CONFIG_HOME the switch script uses ~/.config/systemd/user, the
+  # directory the systemd user manager reads. Its stderr passes through.
+  rc=0
+  backup=$(env -u XDG_CONFIG_HOME bash "$CURRENT/templates/cass-mcp-switch.sh" "$UNIT_FILE" "$real_data" "$BIND") || rc=$?
+  [ "$rc" -eq 0 ] || die_rc 6 "cass-mcp-switch.sh exited $rc; MCP service not switched (see its messages above)"
+  printf 'MCP_OK unit=%s backup=%s\n' "$UNIT_FILE" "$backup"
+else
+  printf 'MCP_NOT_MANAGED\n'
+fi
+
+FIRST=skipped
+if [ "$FIRST_ROUND" = run ]; then
+  # The entry runs in the foreground; its stderr passes through.
+  rc=0
+  out=$(env -i PATH=/usr/bin:/bin HOME="$HOME" "$ENTRY") || rc=$?
+  re='^\{"schema":"cass\.ingest-entry\.v1","instance":"'"$INSTANCE"'","classification":"(ok|skipped|warning|failed|unknown_exit)",[^'$'\n'']*\}$'
+  if ! [[ $out =~ $re ]]; then
+    # The entry never prints secrets; its stdout helps to find the cause.
+    printf 'FAIL[install]: entry stdout (first 2000 bytes):\n%s\n' "${out:0:2000}" >&2
+    die_rc 4 "first round output is not one cass.ingest-entry.v1 line (entry exit $rc)"
+  fi
+  cls=${BASH_REMATCH[1]}
+  printf 'FIRST_ROUND %s\n' "$out"
+  case "$cls:$rc" in
+    ok:0) FIRST=ok ;;
+    skipped:0|warning:0)
+      kind=unparsed
+      if [[ $out =~ \"error_kind\":null[,}] ]]; then kind=null
+      elif [[ $out =~ \"error_kind\":\"([A-Za-z0-9._-]*)\" ]]; then kind=${BASH_REMATCH[1]}; fi
+      printf 'FIRST_ROUND_INCOMPLETE classification=%s error_kind=%s\n' "$cls" "$kind"
+      die_rc 5 "first round incomplete ($cls, error_kind=$kind). Check the model endpoints and the configuration first. If an endpoint is unavailable for now and the deployment must finish, run the same command with --skip-first-round; the periodic schedule then completes the sync when the endpoint is back" ;;
+    *) die_rc 4 "first round failed (classification=$cls, entry exit $rc)" ;;
+  esac
+else
+  printf 'FIRST_ROUND_SKIPPED\n'
+fi
+
+if [ "$TAILNET" = on ]; then
+  tailscale serve --bg --https="$BIND_PORT" "http://$BIND" || die_rc 7 "tailscale serve failed for http://$BIND"
+  printf 'TAILNET_OK https_port=%s target=http://%s\n' "$BIND_PORT" "$BIND"
+fi
+
+# Self-check: neither binary carries or links ONNX Runtime.
+CHECK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cass-install-check.XXXXXX") || die_rc 8 'self-check: cannot create a temporary directory'
+for name in cass cass-mcp; do
+  bin="$CURRENT/$name"
+  strings -- "$bin" > "$CHECK_DIR/strings" 2> /dev/null || die_rc 8 "self-check: strings failed for $bin"
+  hits=$(grep -cE 'onnxruntime|ort_sys' "$CHECK_DIR/strings") || true
+  [ "$hits" = 0 ] || die_rc 8 "self-check: $bin contains $hits onnxruntime/ort_sys strings"
+  links=$(ldd -- "$bin" 2>&1) || die_rc 8 "self-check: ldd failed for $bin"
+  if printf '%s\n' "$links" | grep -qiE 'onnx|libort'; then die_rc 8 "self-check: $bin links an ONNX Runtime library"; fi
+done
+printf 'SELF_CHECK_OK\n'
+
+# The line to add to authorized_keys by hand; the installer never edits that file.
+[ -z "$SSH_KEY" ] || printf 'AUTHORIZED_KEY restrict,from="%s",command="%s" %s\n' "$SSH_FROM" "$ENTRY" "$SSH_KEY"
+# Only a run where every step succeeded and the first round was ok may enable the schedule.
+[ "$FIRST" != ok ] || printf 'SCHEDULE_READY instance=%s entry=%s\n' "$INSTANCE" "$ENTRY"
+printf 'DEPLOY_COMPLETE instance=%s mcp=%s first_round=%s tailnet=%s\n' "$INSTANCE" "$MCP" "$FIRST" "$TAILNET"

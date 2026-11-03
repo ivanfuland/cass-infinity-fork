@@ -148,17 +148,29 @@ root command so callers do not need to prepare these environment variables.
 ## Full deployment (format 2 packages)
 
 `install.sh --deploy` publishes the version and then prepares one named
-instance: the `current` pointer, the data directory and an installer-owned
-configuration directory. It does not create service units, entry scripts or
-timers, and it does not run a first sync.
+instance: the `current` pointer, the data directory, an installer-owned
+configuration directory and the rendered ingest entry. It can also install the
+MCP user service, run the first sync round, publish the MCP port on the tailnet
+and print a restricted `authorized_keys` line. It never creates timers; the
+periodic schedule runs elsewhere.
 
 ```bash
 bash install.sh --prefix /abs/version-root --deploy --instance work \
   --data-dir /abs/cass-data --config-dir /abs/cass-config \
   --embed-endpoint http://127.0.0.1:8080/v1/embeddings --embed-model MODEL --embed-revision REV \
   --rerank-endpoint https://rerank.example/v1/rerank --rerank-model MODEL --rerank-revision REV \
-  --key-env MODEL_API_KEY --key-file /abs/key-file [--legacy-source /abs/legacy-root]
+  --key-env MODEL_API_KEY --key-file /abs/key-file [--legacy-source /abs/legacy-root] \
+  --mcp install|none [--mcp-bind 127.0.0.1:PORT --public-origin https://HOST[:PORT]] \
+  [--tailnet-serve] [--skip-first-round] \
+  [--ssh-authorized-key /abs/key.pub --ssh-from ADDRESS-OR-CIDR]
 ```
+
+`--mcp` is required. `--mcp install` also requires `--mcp-bind` (only
+`127.0.0.1:<port 1-65535>`) and `--public-origin` (an https origin without a
+path; an optional port must be 1-65535).
+`--tailnet-serve`, `--mcp-bind` and `--public-origin` are refused with
+`--mcp none`. `--ssh-authorized-key` and `--ssh-from` are given together or not
+at all.
 
 Without `--deploy` the installer behaves exactly as in the previous section.
 All paths must be absolute. The instance name must match `[a-z0-9][a-z0-9-]{0,31}`.
@@ -194,23 +206,97 @@ nested.
    - `model-api.env` is exactly one line, `<KEY_ENV>=<value>` and a LF. The value
      is the key file content without one trailing newline. An empty value, or one
      with quotes, whitespace, a backslash or a control character, is refused.
-     The installer never prints the value.
+     The installer never prints the value. The ingest entry reads this file
+     literally, and systemd `EnvironmentFile=` gives the same value: it strips
+     whitespace and processes quotes and backslash escapes, and the value has none.
+   - `cass-ingest-entry` (0700) is `templates/cass-ingest-entry.sh` with its six
+     placeholders replaced: `CASS_BIN=<prefix>/current/cass`, the data
+     directory, `<config-dir>/model-api.toml`, `<config-dir>/model-api.env`,
+     the configuration directory and the instance name. All paths are the
+     canonical absolute paths (`realpath -m`).
+   - With `--mcp install`, `cass-mcp.service` (0644) is
+     `templates/cass-mcp.service.in` with `<prefix>/current/cass-mcp`,
+     `<prefix>/current/cass`, the same data and configuration paths, the bind
+     address, the public origin and the profiles `embed` and `rerank`.
+
+   Rendering is plain text replacement. A value with a single quote, a newline,
+   a CR or `@@` stops the run with exit code 2 before anything is written. For
+   the unit and for the `authorized_keys` command, a value may only contain
+   letters, digits and `._/:@+,=~-` (no whitespace, `%` or `$`), also exit 2.
+   A placeholder token `@@NAME@@` left in a rendered file stops the run with
+   exit code 1.
 
    The files are generated in a staging directory inside the configuration
    directory, loaded there by the published binary (`cass sources list` and
    `cass models list`), and then renamed into place. An unchanged file is not
    rewritten.
-4. **Pointer.** Last, after the data directory and all configuration files are
+4. **Pointer.** After the data directory and all configuration files are
    in place, `<prefix>/current` is switched atomically (a new symbolic link
    renamed over the old one) to the version directory name. A failure in any
-   earlier step leaves `current` at its previous target.
+   earlier step leaves `current` at its previous target. The installer prints
+   `DEPLOY_OK` and the paths, including `ingest_entry=`.
+5. **MCP.** With `--mcp install`, the installer runs
+   `<prefix>/current/templates/cass-mcp-switch.sh <config-dir>/cass-mcp.service
+   <data-dir> <bind>` with `XDG_CONFIG_HOME` removed from its environment, so the
+   unit goes to `~/.config/systemd/user`, which the systemd user manager reads.
+   The switch script keeps a backup, restarts, self-checks and enables the
+   service, or rolls back. Its messages pass through; a non-zero exit stops the
+   run with exit code 6. Success prints `MCP_OK unit=... backup=...`. With
+   `--mcp none` the installer prints `MCP_NOT_MANAGED` and never calls
+   `systemctl` or `tailscale`.
+6. **First round.** Unless `--skip-first-round` is given, the installer runs the
+   rendered entry in the foreground with `PATH=/usr/bin:/bin` and `HOME` only, and
+   prints its result line as `FIRST_ROUND <json>`. The entry's stderr passes
+   through.
+   - `ok`: the run continues with the next steps.
+   - `skipped` or `warning`: prints `FIRST_ROUND_INCOMPLETE classification=<...>
+     error_kind=<value or null>` and exits 5. Check the model endpoints and the
+     configuration first, then run the same command again. If an endpoint is
+     unavailable for now and the deployment must finish, run the same command
+     with `--skip-first-round`; the periodic schedule completes the sync when the
+     endpoint is back.
+   - `failed`, `unknown_exit`: exits 4. Output that is not one
+     `cass.ingest-entry.v1` line: the installer writes the first 2000 bytes of
+     the entry's stdout to stderr after `entry stdout (first 2000 bytes):`, then
+     exits 4.
+   With `--skip-first-round` it prints `FIRST_ROUND_SKIPPED`.
+7. **Tailnet.** With `--tailnet-serve` the installer runs
+   `tailscale serve --bg --https=<bind port> http://<bind>`; a failure exits 7.
+8. **Self-check.** For `<prefix>/current/cass` and `cass-mcp`, `strings` output
+   must contain no `onnxruntime` or `ort_sys`, and `ldd` must succeed without an
+   `onnx` or `libort` line; otherwise the run exits 8.
+9. **Restricted ssh line.** With `--ssh-authorized-key`, the first line of that
+   file must be `<type> <base64> [comment]` with type `ssh-ed25519`,
+   `ecdsa-sha2-*` or `ssh-rsa`. `--ssh-from` must be one IPv4 address (each
+   part 0-255, optional prefix 0-32) or one IPv6 address (at least two colons,
+   optional prefix 0-128). The entry path must contain only letters, digits and
+   `._/:@+,=~-`. Otherwise the run exits 2 before anything is written. The installer
+   prints `AUTHORIZED_KEY restrict,from="<ssh-from>",command="<entry path>"
+   <type> <base64>` (without the comment). Add that text (after the
+   `AUTHORIZED_KEY ` prefix) to `authorized_keys` yourself; the installer never
+   reads or writes that file.
+10. **Result.** When the first round was `ok` and every step succeeded, the
+    installer prints `SCHEDULE_READY instance=<name> entry=<entry path>`. The last
+    line is `DEPLOY_COMPLETE instance=<name> mcp=<install|none>
+    first_round=<ok|skipped> tailnet=<on|off>`. Enable the periodic schedule only
+    when the exit code is 0 and the output contains `SCHEDULE_READY`.
 
-A repeated run with the same arguments changes nothing. Exit codes: 0 success,
-1 general failure, 2 invalid argument or key file, 3 data or configuration
-directory belongs to something else; TERM, INT and HUP exit with 143, 130 and
-129. Every exit, including one caused by these signals, removes the staging
-directory and temporary marker files. Arguments, the key file and both
-directory states are checked before any file is written.
+A repeated run with the same arguments leaves the configuration files, the
+entry and the unit unchanged. With `--mcp install` it runs the switch script
+again, which restarts the service, re-checks it and leaves one more backup
+directory in `~/.config/systemd/user`. With `--mcp none` a unit file left by an
+earlier `--mcp install` run stays in the configuration directory unchanged.
+
+Exit codes: 0 success, 1 general failure, 2 invalid argument, key file or public
+key file, 3 data or configuration directory belongs to something else, 4 first
+round failed, 5 first round incomplete (run again), 6 MCP switch failed,
+7 tailnet publication failed, 8 self-check failed; TERM, INT and HUP exit with
+143, 130 and 129. Every exit, including one caused by these signals, removes
+the staging directory, temporary marker files and the self-check temporary
+directory. Arguments, the key file, the public key file, all rendered values and
+both directory states are checked before any file is written. Exit codes 4 to 8
+happen after `current` has switched: the new version and configuration stay in
+place.
 Development checks use `scripts/tests/test-cass-deploy.sh` with an absolute
 extracted release directory.
 
