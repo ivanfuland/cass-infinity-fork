@@ -30,9 +30,9 @@ in `dist/` is not an active production version.
 
 ## Build a package
 
-The first format supports **Linux x86-64 with GNU libc**. Build on that platform.
-The target needs Bash, GNU coreutils, `tar`, `grep`, `ldd` and the runtime libraries
-required by the programs, including zlib. The installer reports missing libraries
+The package format (`cass-fork-release/2`) supports **Linux x86-64 with GNU libc**. Build on that platform.
+The target needs Bash 4.4 or later, GNU coreutils, GNU findutils (`find`), `tar`,
+`grep`, `ldd` and the runtime libraries required by the programs, including zlib. The installer reports missing libraries
 and an insufficient glibc version. It does not install system packages.
 
 The development machine needs Git, its normal Rust toolchain, gcc, binutils
@@ -64,15 +64,28 @@ cass-fork-<full-commit>-linux-x86_64/
   install.sh
   release.env
   SHA256SUMS
+  templates/
+    README.md
 cass-fork-<full-commit>-linux-x86_64.tar.gz
 cass-fork-<full-commit>-linux-x86_64.tar.gz.sha256
 ```
 
-`release.env` records the binary source commit, both versions, platform and the
-highest GLIBC symbol version required by either ELF. `source_commit` identifies
-the Rust programs. The packaged installer comes from the setup tool being run;
-`SHA256SUMS` covers its exact bytes too. Existing outputs are never replaced.
-Failed staging files remain for inspection.
+`release.env` has six keys: `format=cass-fork-release/2`, the binary source
+commit, platform, both versions and the highest GLIBC symbol version required by
+either ELF. `source_commit` identifies the Rust programs. The packaged installer
+comes from the setup tool being run. `templates/` holds the files tracked under
+`scripts/release-templates/` in the source commit's Git tree, exported with the
+same relative paths. Untracked and ignored files are never packaged. It holds
+deployment templates for later use and may contain only regular files and
+directories. The release stops before compilation if that directory is missing,
+holds a symbolic link or submodule, or has a file name with a backslash, newline
+or carriage return.
+
+`SHA256SUMS` has one line per regular file in the package except itself:
+`<64 lowercase hex digits>`, two spaces, and the relative path. It covers `cass`,
+`cass-mcp`, the exact bytes of `install.sh`, `release.env` and every file under
+`templates/`. Lines are ordered by path with `LC_ALL=C sort`. Existing outputs
+are never replaced. Failed staging files remain for inspection.
 
 ## Install on this machine
 
@@ -105,12 +118,19 @@ tar -xzf "$release_id.tar.gz"
 bash "$release_id/install.sh" --prefix "$HOME/.local/lib/cass-mcp"
 ```
 
-Proceed only if checksum verification succeeds. The installer verifies the four
-fixed members, parses metadata as data, checks runtime compatibility and runs
-both `--version` commands. It stages and rechecks the full version before
-publishing it. **`INSTALL_OK` means installed, not active.** Save the two absolute
+Proceed only if checksum verification succeeds. The installer accepts only
+format 2. It rejects absolute paths, `..` segments and duplicate lines in
+`SHA256SUMS`. The listed paths must equal the package's regular files except
+`SHA256SUMS`: an extra, missing or changed file, or a symbolic link, stops the
+installation. It parses metadata as data, checks runtime compatibility and runs
+both `--version` commands. It stages and rechecks the full version, including
+`templates/`, before publishing it. **`INSTALL_OK` means installed, not active.** Save the two absolute
 program paths it prints. A repeated installation rejects the existing version,
 including files and dangling links. A failed stage remains unpublished.
+
+Packages built before format 2 (`cass-fork-release/1`, without `templates/`)
+carry their own older `install.sh`. `./cass install <directory>` runs that
+packaged installer, so such packages still install as before.
 
 Development checks use `scripts/tests/test-cass-workspace.sh` for the root commands
 and `scripts/tests/test-cass-release.sh` for bundle installation. Pass an absolute
