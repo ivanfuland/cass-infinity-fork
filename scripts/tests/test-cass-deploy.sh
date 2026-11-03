@@ -161,7 +161,7 @@ real_cass() { env -i HOME="$dir/home" XDG_CONFIG_HOME="$cfg" PATH=/usr/bin:/bin 
 # T10: rendered entry and unit, MCP switch, first round, tailnet, self-check.
 # ---------------------------------------------------------------------------
 TEMPLATES="$REPO/scripts/release-templates"
-BIND=127.0.0.1:18777; ORIGIN=https://alien.example.ts.net
+BIND=127.0.0.1:18777; ORIGIN=https://node.example.ts.net
 # The expected rendering: plain replacement with the canonical absolute paths.
 expected_entry() {
   local c d; c=$(realpath -m -- "$cfg"); d=$(realpath -m -- "$data")
@@ -744,8 +744,8 @@ SH
       expect_rc 2 --mcp-bind "$BIND"
       expect_rc 2 --mcp-bind 0.0.0.0:18777 --public-origin "$ORIGIN"
       expect_rc 2 --mcp-bind 127.0.0.1:99999 --public-origin "$ORIGIN"
-      expect_rc 2 --mcp-bind "$BIND" --public-origin http://alien.example.ts.net
-      expect_rc 2 --mcp-bind "$BIND" --public-origin https://alien.example.ts.net/path
+      expect_rc 2 --mcp-bind "$BIND" --public-origin http://node.example.ts.net
+      expect_rc 2 --mcp-bind "$BIND" --public-origin https://node.example.ts.net/path
       mcp=none
       expect_rc 2 --tailnet-serve
       expect_rc 2 --mcp-bind "$BIND"
@@ -826,7 +826,7 @@ SH
       done
       mcp=install
       local origin
-      for origin in https://alien.example.ts.net:65536 https://alien.example.ts.net:99999 https://alien.example.ts.net:0; do
+      for origin in https://node.example.ts.net:65536 https://node.example.ts.net:99999 https://node.example.ts.net:0; do
         expect_rc 2 --mcp-bind "$BIND" --public-origin "$origin"
         grep -q 'public-origin' "$dir/install.log"
         nothing_written
