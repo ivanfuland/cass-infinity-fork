@@ -1,38 +1,346 @@
 #!/usr/bin/env bash
-# Shipped as install.sh in a native Linux release. No build tools or network.
+# Shipped as install.sh in a native Linux release (format 2). No build tools or network.
+# Format 2 adds templates/: regular files and directories, all listed in SHA256SUMS.
 set -euo pipefail
 export LC_ALL=C
 
 die() { printf 'FAIL[install]: %s\n' "$*" >&2; exit 1; }
 usage() { printf 'Usage: bash install.sh --prefix /absolute/version-root\n'; }
+# Full deployment (--deploy) exit codes: 0 success, 1 general failure,
+# 2 invalid argument, 3 data or configuration directory belongs to something
+# else, 4 first round failed, 5 first round incomplete (run the same command
+# again), 6 MCP switch failed, 7 tailnet publication failed, 8 self-check failed.
+die_arg() { printf 'FAIL[install]: %s\n' "$*" >&2; exit 2; }
+die_rc() { local rc=$1; shift; printf 'FAIL[install]: %s\n' "$*" >&2; exit "$rc"; }
+deploy_usage() {
+  printf '%s\n' 'Usage: bash install.sh --prefix /abs/version-root --deploy --instance NAME' \
+    '         --data-dir /abs --config-dir /abs' \
+    '         --embed-endpoint URL --embed-model NAME --embed-revision REV' \
+    '         --rerank-endpoint URL --rerank-model NAME --rerank-revision REV' \
+    '         --key-env NAME --key-file /abs [--legacy-source /abs]' \
+    '         --mcp install|none [--mcp-bind 127.0.0.1:PORT --public-origin https://HOST[:PORT]]' \
+    '         [--tailnet-serve] [--skip-first-round]' \
+    '         [--ssh-authorized-key /abs/key.pub --ssh-from ADDRESS-OR-CIDR]'
+}
+DEPLOY=0
+for arg in "$@"; do [ "$arg" != --deploy ] || DEPLOY=1; done
 PREFIX=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --help|-h) usage; exit 0 ;;
-    --prefix)
-      [ "$#" -ge 2 ] && [ -z "$PREFIX" ] || die '--prefix requires one value'
-      PREFIX="$2"; shift 2 ;;
-    *) usage >&2; die "unknown argument: $1" ;;
+declare -A OPT=()
+if [ "$DEPLOY" -eq 0 ]; then
+  # Publish-only mode: unchanged interface and exit codes.
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --help|-h) usage; exit 0 ;;
+      --prefix)
+        [ "$#" -ge 2 ] && [ -z "$PREFIX" ] || die '--prefix requires one value'
+        PREFIX="$2"; shift 2 ;;
+      *) usage >&2; die "unknown argument: $1" ;;
+    esac
+  done
+else
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --help|-h) deploy_usage; exit 0 ;;
+      --deploy) shift ;;
+      --prefix|--instance|--data-dir|--config-dir|--embed-endpoint|--embed-model|--embed-revision|\
+      --rerank-endpoint|--rerank-model|--rerank-revision|--key-env|--key-file|--legacy-source|\
+      --mcp|--mcp-bind|--public-origin|--ssh-authorized-key|--ssh-from)
+        [ "$#" -ge 2 ] || die_arg "$1 requires one value"
+        [ -z "${OPT[${1#--}]+present}" ] || die_arg "$1 given more than once"
+        OPT[${1#--}]=$2; shift 2 ;;
+      --tailnet-serve|--skip-first-round)
+        [ -z "${OPT[${1#--}]+present}" ] || die_arg "$1 given more than once"
+        OPT[${1#--}]=1; shift ;;
+      *) deploy_usage >&2; die_arg "unknown argument: $1" ;;
+    esac
+  done
+  for name in prefix instance data-dir config-dir embed-endpoint embed-model embed-revision \
+    rerank-endpoint rerank-model rerank-revision key-env key-file mcp; do
+    [ -n "${OPT[$name]+present}" ] || die_arg "--$name is required with --deploy"
+  done
+  PREFIX=${OPT[prefix]}
+fi
+
+# ---------------------------------------------------------------------------
+# Full deployment: argument and key validation. Nothing is written here.
+# ---------------------------------------------------------------------------
+# A value that is written into a TOML basic string: no quote, backslash or
+# control character, so it needs no escaping.
+toml_safe() {
+  local re='[[:cntrl:]"\\]'
+  [ -n "$2" ] && ! [[ $2 =~ $re ]] || die_arg "$1 must be non-empty without quotes, backslashes or control characters"
+}
+abs_path() {
+  toml_safe "$1" "$2"
+  case "$2" in /*) ;; *) die_arg "$1 must be an absolute path" ;; esac
+}
+# endpoint_scope <flag> <url>: prints loopback or remote. Remote requires https.
+endpoint_scope() {
+  local flag=$1 url=$2 scheme rest auth host
+  toml_safe "$flag" "$url"
+  case "$url" in
+    http://*) scheme=http; rest=${url#http://} ;;
+    https://*) scheme=https; rest=${url#https://} ;;
+    *) die_arg "$flag must be an http or https URL" ;;
   esac
-done
+  auth=${rest%%[/?#]*}
+  [ -n "$auth" ] || die_arg "$flag has no host"
+  case "$auth" in *@*) die_arg "$flag must not contain user information" ;; esac
+  case "$auth" in '['*) host=${auth%%]*}] ;; *) host=${auth%%:*} ;; esac
+  host=${host,,}
+  case "$host" in
+    127.0.0.1|'[::1]'|localhost) printf loopback ;;
+    *) [ "$scheme" = https ] || die_arg "$flag: a remote endpoint must use https"
+       printf remote ;;
+  esac
+}
+# Reads --key-file into KEY_VALUE. The value itself is never printed.
+read_key() {
+  local file=$1 bad='[[:space:][:cntrl:]"'"'"'\\]'
+  [ -f "$file" ] && [ -r "$file" ] || die_arg '--key-file is not a readable regular file'
+  tr -d '\000' < "$file" | cmp -s -- - "$file" || die_arg 'key file contains a NUL byte'
+  KEY_VALUE=$(cat -- "$file" && printf x) || die_arg 'cannot read --key-file'
+  KEY_VALUE=${KEY_VALUE%x}; KEY_VALUE=${KEY_VALUE%$'\n'}
+  [ -n "$KEY_VALUE" ] || die_arg 'key file is empty'
+  ! [[ $KEY_VALUE =~ $bad ]] || die_arg 'key value contains a quote, whitespace, backslash or control character'
+}
+# render_safe NAME=VALUE...: a placeholder value goes inside single quotes in
+# the ingest entry, so it must not contain a single quote, a newline, a CR or @@.
+render_safe() {
+  local pair value
+  for pair in "$@"; do
+    value=${pair#*=}
+    case "$value" in
+      *"'"*|*$'\n'*|*$'\r'*|*@@*)
+        die_arg "placeholder value for @@${pair%%=*}@@ contains a single quote, a newline, a CR or @@" ;;
+    esac
+  done
+}
+# unit_safe <purpose> NAME=VALUE...: a value written into a systemd unit line or
+# an authorized_keys command needs no quoting: no whitespace, %, $ or quotes.
+unit_safe() {
+  local purpose=$1 pair; shift
+  for pair in "$@"; do
+    [[ ${pair#*=} =~ ^[A-Za-z0-9._/:@+,=~-]+$ ]] \
+      || die_arg "value for @@${pair%%=*}@@ cannot be used in $purpose: only letters, digits and ._/:@+,=~- are allowed"
+  done
+}
+# ssh_from_ok <value>: one IPv4 address (each part 0-255) with an optional
+# prefix 0-32, or one IPv6 address (at least two colons) with a prefix 0-128.
+ssh_from_ok() {
+  local addr=${1%/*} plen="" part
+  local -a parts
+  case "$1" in */*) plen=${1##*/}; [[ $plen =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1 ;; esac
+  if [[ $addr =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    IFS=. read -r -a parts <<< "$addr"
+    for part in "${parts[@]}"; do [[ $part =~ ^(0|[1-9][0-9]*)$ ]] && [ "$part" -le 255 ] || return 1; done
+    [ -z "$plen" ] || [ "$plen" -le 32 ]
+  elif [[ $addr =~ ^[0-9A-Fa-f:.]+$ ]] && [[ $addr =~ :.*: ]]; then
+    [ -z "$plen" ] || [ "$plen" -le 128 ]
+  else
+    return 1
+  fi
+}
+# render <template> <output> NAME=VALUE...: plain text replacement of @@NAME@@.
+# Unsafe values exit 2 before the output is written. A placeholder token
+# (@@NAME@@) left in the result exits 1. Other @@ text is not a placeholder: the
+# entry template itself contains "@@...@@" in a comment and its guard "@@*@@".
+render() {
+  local tpl=$1 out=$2 pair content; shift 2
+  render_safe "$@"
+  [ -f "$tpl" ] && [ ! -L "$tpl" ] || die "missing template: $tpl"
+  content=$(cat -- "$tpl" && printf x) || die "cannot read template: $tpl"
+  content=${content%x}
+  for pair in "$@"; do content=${content//"@@${pair%%=*}@@"/"${pair#*=}"}; done
+  if [[ $content =~ @@[A-Z][A-Z0-9_]*@@ ]]; then die "rendered template still contains ${BASH_REMATCH[0]}: $tpl"; fi
+  printf '%s' "$content" > "$out" || die "cannot write $out"
+}
+if [ "$DEPLOY" -eq 1 ]; then
+  abs_path --prefix "$PREFIX"
+  INSTANCE=${OPT[instance]}
+  [[ $INSTANCE =~ ^[a-z0-9][a-z0-9-]{0,31}$ ]] || die_arg '--instance must match [a-z0-9][a-z0-9-]{0,31}'
+  DATA_DIR=${OPT[data-dir]}; abs_path --data-dir "$DATA_DIR"
+  CONFIG_DIR=${OPT[config-dir]}; abs_path --config-dir "$CONFIG_DIR"
+  KEY_FILE=${OPT[key-file]}; abs_path --key-file "$KEY_FILE"
+  KEY_ENV=${OPT[key-env]}
+  [[ $KEY_ENV =~ ^[A-Z_][A-Z0-9_]*$ ]] || die_arg '--key-env must be an upper-case variable name'
+  # The ingest entry reserves these names and would ignore them in the env file.
+  case "$KEY_ENV" in
+    CASS_BIN|DATA_DIR|API_CONFIG|ENV_FILE|CONFIG_HOME|INSTANCE|PATH|TMPDIR|HOME|XDG_CONFIG_HOME)
+      die_arg "--key-env is a reserved name: $KEY_ENV" ;;
+  esac
+  for name in embed-model embed-revision rerank-model rerank-revision; do toml_safe "--$name" "${OPT[$name]}"; done
+  EMBED_SCOPE=$(endpoint_scope --embed-endpoint "${OPT[embed-endpoint]}")
+  RERANK_SCOPE=$(endpoint_scope --rerank-endpoint "${OPT[rerank-endpoint]}")
+  LEGACY=${OPT[legacy-source]:-}
+  if [ -n "${OPT[legacy-source]+present}" ]; then
+    abs_path --legacy-source "$LEGACY"
+    LEGACY=${LEGACY%/}; LEGACY_NAME=${LEGACY##*/}
+    [[ $LEGACY_NAME =~ ^[A-Za-z0-9._-]{1,64}$ ]] && [ "$LEGACY_NAME" != . ] && [ "$LEGACY_NAME" != .. ] \
+      && [ "${LEGACY_NAME,,}" != local ] || die_arg '--legacy-source basename must match [A-Za-z0-9._-]{1,64} and not be "local"'
+  fi
+  # The production configuration under ~/.config/cass is never read or written.
+  case "${HOME:-}" in /*) ;; *) die_arg 'HOME must be an absolute path' ;; esac
+  home_config=$(realpath -m -- "$HOME/.config") || die_arg 'cannot resolve $HOME/.config'
+  home_cass=$(realpath -m -- "$HOME/.config/cass") || die_arg 'cannot resolve $HOME/.config/cass'
+  own=$(realpath -m -- "$CONFIG_DIR") || die_arg 'cannot resolve --config-dir'
+  own_cass=$(realpath -m -- "$CONFIG_DIR/cass") || die_arg 'cannot resolve --config-dir'
+  case "$own/" in "$home_cass"/*) die_arg '--config-dir must not be inside $HOME/.config/cass' ;; esac
+  [ "$own" != "$home_config" ] && [ "$own_cass" != "$home_cass" ] \
+    || die_arg '--config-dir must not make <config-dir>/cass resolve to $HOME/.config/cass'
+  [ ! -L "$CONFIG_DIR/cass" ] || die_arg '<config-dir>/cass must not be a symbolic link'
+  # The version root, the data directory and the configuration directory are
+  # three separate trees: none equals or contains another.
+  real_prefix=$(realpath -m -- "$PREFIX") || die_arg 'cannot resolve --prefix'
+  real_data=$(realpath -m -- "$DATA_DIR") || die_arg 'cannot resolve --data-dir'
+  overlaps() { case "${1%/}/" in "${2%/}/"*) return 0 ;; esac; case "${2%/}/" in "${1%/}/"*) return 0 ;; esac; return 1; }
+  ! overlaps "$real_data" "$own" || die_arg '--data-dir and --config-dir must not be equal or nested'
+  ! overlaps "$real_data" "$real_prefix" || die_arg '--data-dir and --prefix must not be equal or nested'
+  ! overlaps "$own" "$real_prefix" || die_arg '--config-dir and --prefix must not be equal or nested'
+  read_key "$KEY_FILE"
+
+  # T10 options: MCP service, first round, tailnet and the restricted ssh line.
+  MCP=${OPT[mcp]}
+  case "$MCP" in install|none) ;; *) die_arg '--mcp must be install or none' ;; esac
+  TAILNET=off; [ -z "${OPT[tailnet-serve]+present}" ] || TAILNET=on
+  FIRST_ROUND=run; [ -z "${OPT[skip-first-round]+present}" ] || FIRST_ROUND=skip
+  BIND=""; ORIGIN=""; BIND_PORT=""
+  if [ "$MCP" = install ]; then
+    [ -n "${OPT[mcp-bind]+present}" ] || die_arg '--mcp-bind is required with --mcp install'
+    [ -n "${OPT[public-origin]+present}" ] || die_arg '--public-origin is required with --mcp install'
+    BIND=${OPT[mcp-bind]}; ORIGIN=${OPT[public-origin]}
+    [[ $BIND =~ ^127\.0\.0\.1:([1-9][0-9]{0,4})$ ]] && [ "${BASH_REMATCH[1]}" -le 65535 ] \
+      || die_arg '--mcp-bind must be 127.0.0.1:<port 1-65535>'
+    BIND_PORT=${BIND#127.0.0.1:}
+    [[ $ORIGIN =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:([1-9][0-9]{0,4}))?$ ]] \
+      && { [ -z "${BASH_REMATCH[3]}" ] || [ "${BASH_REMATCH[3]}" -le 65535 ]; } \
+      || die_arg '--public-origin must be an https origin: https://host[:port 1-65535] without a path'
+  else
+    for name in mcp-bind public-origin tailnet-serve; do
+      [ -z "${OPT[$name]+present}" ] || die_arg "--$name requires --mcp install"
+    done
+  fi
+  SSH_KEY=""; SSH_FROM=""
+  if [ -n "${OPT[ssh-authorized-key]+present}" ] || [ -n "${OPT[ssh-from]+present}" ]; then
+    [ -n "${OPT[ssh-authorized-key]+present}" ] && [ -n "${OPT[ssh-from]+present}" ] \
+      || die_arg '--ssh-authorized-key and --ssh-from must be given together'
+    pub=${OPT[ssh-authorized-key]}; abs_path --ssh-authorized-key "$pub"
+    [ -f "$pub" ] && [ -r "$pub" ] || die_arg '--ssh-authorized-key is not a readable regular file'
+    line=$(head -n 1 -- "$pub") || die_arg 'cannot read --ssh-authorized-key'
+    [[ $line =~ ^(ssh-ed25519|ecdsa-sha2-[a-z0-9-]+|ssh-rsa)\ ([A-Za-z0-9+/]+={0,2})(\ [^[:cntrl:]]*)?$ ]] \
+      || die_arg 'the first line of --ssh-authorized-key must be "<type> <base64> [comment]" with type ssh-ed25519, ecdsa-sha2-* or ssh-rsa'
+    SSH_KEY="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+    SSH_FROM=${OPT[ssh-from]}
+    ssh_from_ok "$SSH_FROM" \
+      || die_arg '--ssh-from must be one IPv4 address (each part 0-255, prefix 0-32) or IPv6 address (at least two colons, prefix 0-128), optionally with /prefix'
+  fi
+  # Rendered values, from the canonical paths. All are checked before any write.
+  CUR_PATH="$real_prefix/current"
+  ENTRY="$own/cass-ingest-entry"; UNIT_FILE="$own/cass-mcp.service"
+  ENTRY_VALUES=(CASS_BIN="$CUR_PATH/cass" DATA_DIR="$real_data" API_CONFIG="$own/model-api.toml"
+    ENV_FILE="$own/model-api.env" CONFIG_HOME="$own" INSTANCE="$INSTANCE")
+  render_safe "${ENTRY_VALUES[@]}"
+  UNIT_VALUES=()
+  if [ "$MCP" = install ]; then
+    UNIT_VALUES=(CASS_MCP_BIN="$CUR_PATH/cass-mcp" CASS_BIN="$CUR_PATH/cass" DATA_DIR="$real_data"
+      API_CONFIG="$own/model-api.toml" ENV_FILE="$own/model-api.env" BIND="$BIND" PUBLIC_ORIGIN="$ORIGIN"
+      EMBED_PROFILE=embed RERANK_PROFILE=rerank)
+    render_safe "${UNIT_VALUES[@]}"
+    unit_safe 'the systemd unit' "${UNIT_VALUES[@]}"
+  fi
+  [ -z "$SSH_KEY" ] || unit_safe 'the authorized_keys command' ENTRY="$ENTRY"
+
+  # Ownership of the data and configuration directories. Absent or empty: this
+  # run claims it. This instance's marker: continue. Anything else is refused
+  # with exit 3 before any file is written or any mode is changed.
+  MARKER=.cass-install-instance
+  dir_state() {
+    local dir=$1 first
+    if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then printf absent; return; fi
+    [ -d "$dir" ] || { printf foreign; return; }
+    first=$(find "$dir" -mindepth 1 -maxdepth 1 -print -quit) || die "cannot read directory: $dir"
+    if [ -z "$first" ]; then printf empty
+    elif [ -f "$dir/$MARKER" ] && [ ! -L "$dir/$MARKER" ] \
+      && printf '%s\n' "$INSTANCE" | cmp -s -- - "$dir/$MARKER"; then printf own
+    else printf foreign; fi
+  }
+  DATA_STATE=$(dir_state "$DATA_DIR") || exit 1
+  CONFIG_STATE=$(dir_state "$CONFIG_DIR") || exit 1
+  if [ "$DATA_STATE" = foreign ]; then
+    printf 'FAIL[install]: %s\n' "data directory is not empty and is not instance $INSTANCE; nothing changed: $DATA_DIR" >&2
+    exit 3
+  fi
+  if [ "$CONFIG_STATE" = foreign ]; then
+    printf 'FAIL[install]: %s\n' "configuration directory is not empty and is not instance $INSTANCE; nothing changed: $CONFIG_DIR" >&2
+    exit 3
+  fi
+fi
 case "$PREFIX" in /*) ;; *) die '--prefix must be an absolute directory' ;; esac
 BUNDLE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-for name in cass cass-mcp install.sh release.env SHA256SUMS; do
+FIXED=(cass cass-mcp install.sh release.env)
+for name in "${FIXED[@]}" SHA256SUMS; do
   [ -f "$BUNDLE/$name" ] && [ ! -L "$BUNDLE/$name" ] || die "not a regular bundle file: $name"
 done
+[ -d "$BUNDLE/templates" ] && [ ! -L "$BUNDLE/templates" ] || die 'missing templates directory'
+
+# list_tree <root> <array-name>: regular files below root, relative and NUL-safe.
+# Only the five members and templates/ may exist; templates/ holds only regular
+# files and directories. Every other type, including symlinks, is rejected.
+list_tree() {
+  local root=$1 entry type rel
+  local -n out=$2
+  local -a entries
+  out=()
+  mapfile -d '' -t entries < <(find "$root" -mindepth 1 -printf '%y %P\0')
+  wait "$!" || die "cannot list bundle files: $root"
+  for entry in "${entries[@]}"; do
+    type=${entry%% *}; rel=${entry#* }
+    case "$type" in
+      f) out+=("$rel") ;;
+      d) case "$rel" in templates|templates/*) ;; *) die "unexpected bundle directory: $rel" ;; esac ;;
+      *) die "not a regular bundle file: $rel" ;;
+    esac
+  done
+}
+# A listed path is one fixed member or templates/<segments>, never absolute,
+# empty, "." or ".." segments, backslashes or the checksum list itself.
+safe_path() {
+  local rel=$1 seg
+  local -a segs
+  case "$rel" in cass|cass-mcp|install.sh|release.env) return 0 ;; templates/?*) ;; *) return 1 ;; esac
+  case "$rel" in *'\'*|*//*|*/) return 1 ;; esac
+  IFS=/ read -r -a segs <<< "$rel"
+  for seg in "${segs[@]}"; do
+    case "$seg" in ''|.|..) return 1 ;; esac
+  done
+}
 
 digest() { local value; value=$(sha256sum -- "$1") || die "cannot hash $1"; printf '%s' "${value%% *}"; }
 declare -A HASHES=()
 while IFS= read -r line || [ -n "$line" ]; do
-  if [[ ! "$line" =~ ^([0-9a-f]{64})\ \ (cass|cass-mcp|install\.sh|release\.env)$ ]]; then
-    die 'SHA256SUMS must contain only the four fixed relative files'
-  fi
+  [[ "$line" =~ ^([0-9a-f]{64})\ \ (.+)$ ]] || die 'invalid SHA256SUMS line'
   hash=${BASH_REMATCH[1]}; name=${BASH_REMATCH[2]}
+  safe_path "$name" || die "unsafe checksum path: $name"
   [ -z "${HASHES[$name]+present}" ] || die "duplicate checksum: $name"
   HASHES[$name]="$hash"
 done < "$BUNDLE/SHA256SUMS"
-[ "${#HASHES[@]}" -eq 4 ] || die 'missing bundle checksum'
-for name in cass cass-mcp install.sh release.env; do
+# The listed paths must equal the bundle's regular files minus SHA256SUMS.
+check_members() {
+  local root=$1 rel
+  local -a found
+  local -A seen=()
+  list_tree "$root" found
+  for rel in "${found[@]}"; do
+    [ "$rel" = SHA256SUMS ] && continue
+    [ -n "${HASHES[$rel]+present}" ] || die "checksum list does not match bundle files: unlisted $rel"
+    seen[$rel]=1
+  done
+  for rel in "${!HASHES[@]}"; do
+    [ -n "${seen[$rel]+present}" ] || die "checksum list does not match bundle files: missing $rel"
+  done
+}
+check_members "$BUNDLE"
+for name in "${!HASHES[@]}"; do
   [ "$(digest "$BUNDLE/$name")" = "${HASHES[$name]}" ] || die "checksum mismatch: $name"
 done
 SUMS_SHA=$(digest "$BUNDLE/SHA256SUMS")
@@ -48,7 +356,7 @@ while IFS='=' read -r key value || [ -n "$key$value" ]; do
   META[$key]="$value"
 done < "$BUNDLE/release.env"
 [ "${#META[@]}" -eq 6 ] || die 'missing release metadata'
-[ "${META[format]}" = 'cass-fork-release/1' ] || die 'unsupported release format'
+[ "${META[format]}" = 'cass-fork-release/2' ] || die 'unsupported release format'
 [[ "${META[source_commit]}" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || die 'invalid source commit'
 [ "${META[platform]}" = 'linux-x86_64' ] || die 'unsupported release platform'
 for key in cass_version mcp_version; do
@@ -70,21 +378,69 @@ for name in cass cass-mcp; do
   [ "$version" = "$name ${META[$key]}" ] || die "version mismatch: $name"
 done
 
+if [ "$DEPLOY" -eq 1 ]; then
+  [ ! -e "$PREFIX/current" ] || [ -L "$PREFIX/current" ] || die "current exists and is not a symbolic link: $PREFIX/current"
+  # disabled_agents: every connector of this binary except the three kept ones.
+  # The bundle binary is verified above and is byte-identical to the published
+  # one, so this runs before anything is written. Every non-empty line of the
+  # list must be one name matching [a-z0-9_]; anything else is refused.
+  caps=$(env -i PATH=/usr/bin:/bin HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent "$BUNDLE/cass" capabilities --json 2> /dev/null) \
+    || die "cannot read the connector list of $BUNDLE/cass"
+  block=$(printf '%s\n' "$caps" | sed -n '/^  "connectors": \[/,/^  \]/{/^  "connectors": \[/d;/^  \]/d;p}')
+  lines=$(printf '%s\n' "$block" | grep -c '[^[:space:]]' || true)
+  mapfile -t CONNECTORS < <(printf '%s\n' "$block" | sed -n 's/^    "\([a-z0-9_]*\)",\{0,1\}$/\1/p')
+  [ "$lines" -eq "${#CONNECTORS[@]}" ] \
+    || die "connector list of $BUNDLE/cass has $lines entries but only ${#CONNECTORS[@]} valid names"
+  mapfile -t CONNECTORS < <(printf '%s\n' "${CONNECTORS[@]}" | LC_ALL=C sort -u)
+  declare -A KEEP=([claude_code]=0 [codex]=0 [pi_agent]=0)
+  DISABLED=()
+  for name in "${CONNECTORS[@]}"; do
+    if [ -n "${KEEP[$name]+present}" ]; then KEEP[$name]=1; else DISABLED+=("$name"); fi
+  done
+  for name in "${!KEEP[@]}"; do
+    [ "${KEEP[$name]}" -eq 1 ] || die "connector list of $BUNDLE/cass lacks $name"
+  done
+  [ "${#DISABLED[@]}" -gt 0 ] || die "connector list of $BUNDLE/cass is empty"
+fi
+
 [ ! -e "$PREFIX" ] || [ -d "$PREFIX" ] || die 'installation root is not a directory'
 [ ! -L "$PREFIX" ] || [ -d "$PREFIX" ] || die 'installation root is a dangling symlink'
 mkdir -p -- "$PREFIX"
 PREFIX=$(cd -- "$PREFIX" && pwd -P)
 ID="cass-fork-${META[source_commit]}-${META[platform]}"
 DEST="$PREFIX/$ID"
-[ ! -e "$DEST" ] && [ ! -L "$DEST" ] || die "version already exists; kept unchanged: $DEST"
-STAGE=$(mktemp -d "$PREFIX/.cass-release-stage.XXXXXX")
+STAGE=""; CFG_STAGE=""; TMP_LINK=""; TMP_MARKER=""; CHECK_DIR=""
 on_exit() {
   local rc=$?
-  if [ "$rc" -ne 0 ] && [ -d "$STAGE" ]; then printf 'Unpublished stage retained: %s\n' "$STAGE" >&2; fi
+  if [ "$rc" -ne 0 ] && [ -n "$STAGE" ] && [ -d "$STAGE" ]; then printf 'Unpublished stage retained: %s\n' "$STAGE" >&2; fi
+  # Deployment temporaries are never left behind, on success or failure.
+  if [ -n "$CFG_STAGE" ]; then rm -rf -- "$CFG_STAGE"; fi
+  if [ -n "$CHECK_DIR" ]; then rm -rf -- "$CHECK_DIR"; fi
+  if [ -n "$TMP_LINK" ] && [ -L "$TMP_LINK" ]; then rm -f -- "$TMP_LINK"; fi
+  if [ -n "$TMP_MARKER" ] && [ -f "$TMP_MARKER" ]; then rm -f -- "$TMP_MARKER"; fi
 }
 trap on_exit EXIT
-for name in cass cass-mcp install.sh release.env SHA256SUMS; do cp -p -- "$BUNDLE/$name" "$STAGE/$name"; done
-for name in cass cass-mcp install.sh release.env; do
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
+PUBLISH=1
+if [ "$DEPLOY" -eq 1 ] && { [ -e "$DEST" ] || [ -L "$DEST" ]; }; then
+  # An existing version counts as done only when it equals the bundle byte for byte.
+  [ -d "$DEST" ] && [ ! -L "$DEST" ] || die "version directory differs from bundle; kept unchanged: $DEST"
+  ( check_members "$DEST" ) > /dev/null 2>&1 || die "version directory differs from bundle; kept unchanged: $DEST"
+  for name in "${!HASHES[@]}" SHA256SUMS; do
+    cmp -s -- "$BUNDLE/$name" "$DEST/$name" || die "version directory differs from bundle; kept unchanged: $DEST"
+  done
+  PUBLISH=0
+  printf 'VERSION_OK already installed install_dir=%s\n' "$DEST"
+fi
+if [ "$PUBLISH" -eq 1 ]; then
+[ ! -e "$DEST" ] && [ ! -L "$DEST" ] || die "version already exists; kept unchanged: $DEST"
+STAGE=$(mktemp -d "$PREFIX/.cass-release-stage.XXXXXX")
+for name in "${FIXED[@]}" SHA256SUMS; do cp -p -- "$BUNDLE/$name" "$STAGE/$name"; done
+cp -pR -- "$BUNDLE/templates" "$STAGE/templates"
+check_members "$STAGE"
+for name in "${!HASHES[@]}"; do
   [ "$(digest "$STAGE/$name")" = "${HASHES[$name]}" ] || die "staged checksum mismatch: $name"
 done
 [ "$(digest "$STAGE/SHA256SUMS")" = "$SUMS_SHA" ] || die 'staged checksum list changed'
@@ -93,3 +449,181 @@ mv -Tn -- "$STAGE" "$DEST" || die 'cannot publish version directory'
 [ ! -e "$STAGE" ] && [ -d "$DEST" ] && [ ! -L "$DEST" ] || die 'version appeared concurrently; nothing overwritten'
 printf 'INSTALL_OK source_commit=%s install_dir=%s\n' "${META[source_commit]}" "$DEST"
 printf 'cass=%s/cass\ncass_mcp=%s/cass-mcp\n' "$DEST" "$DEST"
+fi
+[ "$DEPLOY" -eq 1 ] || exit 0
+
+# ---------------------------------------------------------------------------
+# Full deployment, after the version directory is complete.
+# ---------------------------------------------------------------------------
+# Run the published binary only against the staging directory: HOME and
+# XDG_CONFIG_HOME both point inside it, so no user configuration is read.
+staged_cass() { env -i PATH=/usr/bin:/bin HOME="$CFG_STAGE/home" XDG_CONFIG_HOME="$CFG_STAGE" "$DEST/cass" "$@"; }
+umask 077
+mkdir -p -- "$CONFIG_DIR" || die "cannot create configuration directory: $CONFIG_DIR"
+chmod 700 -- "$CONFIG_DIR" || die "cannot set mode of $CONFIG_DIR"
+# write_marker <dir>: the instance marker, by a temporary file and a rename.
+write_marker() {
+  TMP_MARKER=$(mktemp "$1/$MARKER.XXXXXX") || die "cannot write instance marker in $1"
+  printf '%s\n' "$INSTANCE" > "$TMP_MARKER" || die "cannot write instance marker in $1"
+  mv -T -- "$TMP_MARKER" "$1/$MARKER" || die "cannot write instance marker in $1"
+  TMP_MARKER=""
+}
+CFG_STAGE=$(mktemp -d "$CONFIG_DIR/.cass-install-stage.XXXXXX") || die 'cannot create configuration stage'
+mkdir -m 700 -- "$CFG_STAGE/cass" "$CFG_STAGE/home" || die 'cannot create configuration stage'
+
+header="# Generated by install.sh --deploy for instance $INSTANCE. Rewritten on every deploy."
+{
+  printf '%s\ndisabled_agents = [\n' "$header"
+  printf '  "%s",\n' "${DISABLED[@]}"
+  printf ']\n'
+  if [ -n "$LEGACY" ]; then
+    printf '\n[[sources]]\nname = "%s"\ntype = "local"\norigin_host = "local"\nreadonly = true\npaths = ["%s/.claude/projects"]\n' \
+      "$LEGACY_NAME" "$LEGACY"
+  fi
+} > "$CFG_STAGE/cass/sources.toml" || die 'cannot write sources.toml'
+cat > "$CFG_STAGE/model-api.toml" <<EOF || die 'cannot write model-api.toml'
+$header
+version = 1
+default_embedding = "embed"
+default_rerank = "rerank"
+
+[profiles.embed]
+kind = "embedding"
+protocol = "openai-embeddings-v1"
+endpoint = "${OPT[embed-endpoint]}"
+scope = "$EMBED_SCOPE"
+model = "${OPT[embed-model]}"
+model_revision = "${OPT[embed-revision]}"
+api_key_env = "$KEY_ENV"
+normalization = "l2"
+timeout_ms = 125000
+
+[profiles.rerank]
+kind = "rerank"
+protocol = "rerank-json-v1"
+endpoint = "${OPT[rerank-endpoint]}"
+scope = "$RERANK_SCOPE"
+model = "${OPT[rerank-model]}"
+model_revision = "${OPT[rerank-revision]}"
+api_key_env = "$KEY_ENV"
+timeout_ms = 125000
+EOF
+printf '%s=%s\n' "$KEY_ENV" "$KEY_VALUE" > "$CFG_STAGE/model-api.env" || die 'cannot write model-api.env'
+# The ingest entry and, with --mcp install, the MCP unit, from the published templates.
+render "$DEST/templates/cass-ingest-entry.sh" "$CFG_STAGE/cass-ingest-entry" "${ENTRY_VALUES[@]}"
+INSTALL_FILES=(cass/sources.toml:600 model-api.toml:600 model-api.env:600 cass-ingest-entry:700)
+if [ "$MCP" = install ]; then
+  render "$DEST/templates/cass-mcp.service.in" "$CFG_STAGE/cass-mcp.service" "${UNIT_VALUES[@]}"
+  INSTALL_FILES+=(cass-mcp.service:644)
+fi
+
+# Both files must load in the published binary before anything is installed.
+staged_cass sources list --json > /dev/null 2> "$CFG_STAGE/check.err" \
+  || die "generated sources.toml rejected by $DEST/cass: $(head -c 2000 "$CFG_STAGE/check.err")"
+staged_cass models list --api-config "$CFG_STAGE/model-api.toml" --json > /dev/null 2> "$CFG_STAGE/check.err" \
+  || die "generated model-api.toml rejected by $DEST/cass: $(head -c 2000 "$CFG_STAGE/check.err")"
+
+# Data directory: create it or claim it when empty; keep it when it is ours.
+if [ "$DATA_STATE" != own ]; then
+  if [ "$DATA_STATE" = absent ]; then
+    mkdir -p -- "$(dirname -- "$DATA_DIR")" || die "cannot create parent of $DATA_DIR"
+    mkdir -m 700 -- "$DATA_DIR" || die "cannot create data directory: $DATA_DIR"
+  fi
+  chmod 700 -- "$DATA_DIR" || die "cannot set mode of $DATA_DIR"
+  write_marker "$DATA_DIR"
+fi
+
+# Install each configuration file by rename; an unchanged file is not touched.
+[ "$CONFIG_STATE" = own ] || write_marker "$CONFIG_DIR"
+mkdir -p -- "$CONFIG_DIR/cass" && chmod 700 -- "$CONFIG_DIR/cass" || die "cannot create $CONFIG_DIR/cass"
+for item in "${INSTALL_FILES[@]}"; do
+  rel=${item%:*}; mode=${item##*:}
+  if [ -f "$CONFIG_DIR/$rel" ] && [ ! -L "$CONFIG_DIR/$rel" ] && cmp -s -- "$CFG_STAGE/$rel" "$CONFIG_DIR/$rel" \
+    && [ "$(stat -c %a -- "$CONFIG_DIR/$rel")" = "$mode" ]; then
+    continue
+  fi
+  [ ! -d "$CONFIG_DIR/$rel" ] || die "configuration path is a directory: $CONFIG_DIR/$rel"
+  chmod "$mode" -- "$CFG_STAGE/$rel" || die "cannot set mode of $rel"
+  mv -T -- "$CFG_STAGE/$rel" "$CONFIG_DIR/$rel" || die "cannot install $CONFIG_DIR/$rel"
+done
+
+# Last step: switch current atomically (a new link renamed over the old one),
+# only after the data directory and all configuration files are in place.
+CURRENT="$PREFIX/current"
+if [ -L "$CURRENT" ] && [ "$(readlink -- "$CURRENT")" = "$ID" ]; then
+  :
+else
+  [ ! -e "$CURRENT" ] || [ -L "$CURRENT" ] || die "current exists and is not a symbolic link: $CURRENT"
+  TMP_LINK="$PREFIX/.cass-current.$$.$RANDOM"
+  ln -s -- "$ID" "$TMP_LINK" || die 'cannot create current link'
+  mv -T -- "$TMP_LINK" "$CURRENT" || die "cannot switch current: $CURRENT"
+  TMP_LINK=""
+fi
+printf 'DEPLOY_OK instance=%s current=%s data_dir=%s config_dir=%s\n' "$INSTANCE" "$CURRENT" "$DATA_DIR" "$CONFIG_DIR"
+printf 'sources_config=%s/cass/sources.toml\napi_config=%s/model-api.toml\nenv_file=%s/model-api.env\n' \
+  "$CONFIG_DIR" "$CONFIG_DIR" "$CONFIG_DIR"
+printf 'ingest_entry=%s\n' "$ENTRY"
+
+# ---------------------------------------------------------------------------
+# After current: MCP, first round, tailnet, self-check, restricted ssh line.
+# ---------------------------------------------------------------------------
+if [ "$MCP" = install ]; then
+  # Without XDG_CONFIG_HOME the switch script uses ~/.config/systemd/user, the
+  # directory the systemd user manager reads. Its stderr passes through.
+  rc=0
+  backup=$(env -u XDG_CONFIG_HOME bash "$CURRENT/templates/cass-mcp-switch.sh" "$UNIT_FILE" "$real_data" "$BIND") || rc=$?
+  [ "$rc" -eq 0 ] || die_rc 6 "cass-mcp-switch.sh exited $rc; MCP service not switched (see its messages above)"
+  printf 'MCP_OK unit=%s backup=%s\n' "$UNIT_FILE" "$backup"
+else
+  printf 'MCP_NOT_MANAGED\n'
+fi
+
+FIRST=skipped
+if [ "$FIRST_ROUND" = run ]; then
+  # The entry runs in the foreground; its stderr passes through.
+  rc=0
+  out=$(env -i PATH=/usr/bin:/bin HOME="$HOME" "$ENTRY") || rc=$?
+  re='^\{"schema":"cass\.ingest-entry\.v1","instance":"'"$INSTANCE"'","classification":"(ok|skipped|warning|failed|unknown_exit)",[^'$'\n'']*\}$'
+  if ! [[ $out =~ $re ]]; then
+    # The entry never prints secrets; its stdout helps to find the cause.
+    printf 'FAIL[install]: entry stdout (first 2000 bytes):\n%s\n' "${out:0:2000}" >&2
+    die_rc 4 "first round output is not one cass.ingest-entry.v1 line (entry exit $rc)"
+  fi
+  cls=${BASH_REMATCH[1]}
+  printf 'FIRST_ROUND %s\n' "$out"
+  case "$cls:$rc" in
+    ok:0) FIRST=ok ;;
+    skipped:0|warning:0)
+      kind=unparsed
+      if [[ $out =~ \"error_kind\":null[,}] ]]; then kind=null
+      elif [[ $out =~ \"error_kind\":\"([A-Za-z0-9._-]*)\" ]]; then kind=${BASH_REMATCH[1]}; fi
+      printf 'FIRST_ROUND_INCOMPLETE classification=%s error_kind=%s\n' "$cls" "$kind"
+      die_rc 5 "first round incomplete ($cls, error_kind=$kind). Check the model endpoints and the configuration first. If an endpoint is unavailable for now and the deployment must finish, run the same command with --skip-first-round; the periodic schedule then completes the sync when the endpoint is back" ;;
+    *) die_rc 4 "first round failed (classification=$cls, entry exit $rc)" ;;
+  esac
+else
+  printf 'FIRST_ROUND_SKIPPED\n'
+fi
+
+if [ "$TAILNET" = on ]; then
+  tailscale serve --bg --https="$BIND_PORT" "http://$BIND" || die_rc 7 "tailscale serve failed for http://$BIND"
+  printf 'TAILNET_OK https_port=%s target=http://%s\n' "$BIND_PORT" "$BIND"
+fi
+
+# Self-check: neither binary carries or links ONNX Runtime.
+CHECK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cass-install-check.XXXXXX") || die_rc 8 'self-check: cannot create a temporary directory'
+for name in cass cass-mcp; do
+  bin="$CURRENT/$name"
+  strings -- "$bin" > "$CHECK_DIR/strings" 2> /dev/null || die_rc 8 "self-check: strings failed for $bin"
+  hits=$(grep -cE 'onnxruntime|ort_sys' "$CHECK_DIR/strings") || true
+  [ "$hits" = 0 ] || die_rc 8 "self-check: $bin contains $hits onnxruntime/ort_sys strings"
+  links=$(ldd -- "$bin" 2>&1) || die_rc 8 "self-check: ldd failed for $bin"
+  if printf '%s\n' "$links" | grep -qiE 'onnx|libort'; then die_rc 8 "self-check: $bin links an ONNX Runtime library"; fi
+done
+printf 'SELF_CHECK_OK\n'
+
+# The line to add to authorized_keys by hand; the installer never edits that file.
+[ -z "$SSH_KEY" ] || printf 'AUTHORIZED_KEY restrict,from="%s",command="%s" %s\n' "$SSH_FROM" "$ENTRY" "$SSH_KEY"
+# Only a run where every step succeeded and the first round was ok may enable the schedule.
+[ "$FIRST" != ok ] || printf 'SCHEDULE_READY instance=%s entry=%s\n' "$INSTANCE" "$ENTRY"
+printf 'DEPLOY_COMPLETE instance=%s mcp=%s first_round=%s tailnet=%s\n' "$INSTANCE" "$MCP" "$FIRST" "$TAILNET"

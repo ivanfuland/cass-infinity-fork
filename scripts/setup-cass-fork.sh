@@ -7,6 +7,7 @@
 #   - 配套（MCP_INSTALL_PATH 非空）：从同一冻结提交分别构建根 CLI 与 mcp/ 独立包，
 #     两件全部核验后才发布到全新的候选路径，不覆盖既有文件。
 #   - 发行（配套且 RELEASE_DIR 非空）：另产可离线安装的版本目录、tar.gz 和校验文件。
+#     包格式 cass-fork-release/2：templates/ 取自源提交的 scripts/release-templates/。
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
@@ -33,6 +34,32 @@ if [ "$PAIRED" = 1 ]; then STEPS=8; else STEPS=7; fi
 step() { printf '\n=== %s ===\n' "$1"; }
 die()  { printf 'FAIL[%s]: %s\n' "$1" "$2" >&2; exit 1; }
 is_abs() { case "$1" in /*) return 0 ;; *) return 1 ;; esac; }
+# Release templates are the files tracked under scripts/release-templates in
+# the source commit's Git tree, so `./cass release` packages the same commit's
+# templates and never untracked or ignored files of the build clone.
+RELEASE_TEMPLATES=scripts/release-templates
+declare -A TEMPLATE_BLOBS=()
+check_release_templates() {
+  local entry meta mode path
+  local -a entries
+  TEMPLATE_BLOBS=()
+  mapfile -d '' -t entries < <(git -C "$FORK_DIR" ls-tree -r -z --full-tree "$SRC_COMMIT" -- "$RELEASE_TEMPLATES")
+  wait "$!" || die release-templates 'cannot list release templates at the source commit'
+  [ "${#entries[@]}" -gt 0 ] || die release-templates "missing $RELEASE_TEMPLATES at the source commit"
+  for entry in "${entries[@]}"; do
+    meta=${entry%%$'\t'*}; path=${entry#*$'\t'}; mode=${meta%% *}
+    case "$path" in "$RELEASE_TEMPLATES"/?*) ;; *) die release-templates "missing $RELEASE_TEMPLATES at the source commit" ;; esac
+    case "$mode" in
+      100644|100755) ;;
+      *) die release-templates "release templates may hold only regular files and directories: ${path#"$RELEASE_TEMPLATES"/}" ;;
+    esac
+    case "$path" in
+      *'\'*|*$'\n'*|*$'\r'*) die release-templates "release template name contains a backslash, newline or carriage return: ${path#"$RELEASE_TEMPLATES"/}" ;;
+    esac
+    meta=${meta#* }; meta=${meta#* }
+    TEMPLATE_BLOBS["${path#"$RELEASE_TEMPLATES"/}"]=$meta
+  done
+}
 
 if [ -n "$RELEASE_DIR" ]; then
   [ "$PAIRED" = 1 ] || die release-mode 'RELEASE_DIR requires paired mode with MCP_INSTALL_PATH'
@@ -50,7 +77,7 @@ if [ -n "$RELEASE_DIR" ]; then
     esac
   done < <(env -0)
   export RUSTFLAGS=-Clinker=/usr/bin/gcc
-  for tool in readelf tar sort sha256sum; do command -v "$tool" >/dev/null || die release-tool "missing build-side tool: $tool"; done
+  for tool in readelf tar sort sha256sum find xargs; do command -v "$tool" >/dev/null || die release-tool "missing build-side tool: $tool"; done
   [ -f "$SCRIPT_DIR/install-cass-fork-release.sh" ] && [ ! -L "$SCRIPT_DIR/install-cass-fork-release.sh" ] || die release-tool 'missing regular offline installer next to setup script'
   RELEASE_DIR=$(readlink -m -- "$RELEASE_DIR")
   [ ! -e "$RELEASE_DIR" ] || [ -d "$RELEASE_DIR" ] || die release-path 'RELEASE_DIR is not a directory'
@@ -114,6 +141,7 @@ if [ "$PAIRED" = 1 ]; then
       [ ! -e "$target" ] && [ ! -L "$target" ] || die release-target "release target already exists: $target"
       [ "$target" != "$CLI_DEST" ] && [ "$target" != "$MCP_DEST" ] || die release-target 'release output conflicts with a candidate path'
     done
+    check_release_templates
   fi
 fi
 
@@ -241,6 +269,24 @@ publish_release() {
   cp -p -- "$MCP_DEST" "$stage/$RELEASE_ID/cass-mcp"
   cp -- "$SCRIPT_DIR/install-cass-fork-release.sh" "$stage/$RELEASE_ID/install.sh"
   chmod 755 "$stage/$RELEASE_ID/install.sh"
+  # Export only tracked template files from the source commit, then check each
+  # extracted file against its Git blob (no attribute or filter rewrites).
+  check_release_templates
+  mkdir -- "$stage/templates-export"
+  git -C "$FORK_DIR" archive --format=tar "$SRC_COMMIT" -- "$RELEASE_TEMPLATES" | tar -xf - -C "$stage/templates-export" \
+    || die release-templates 'cannot export release templates from the source commit'
+  mv -T -- "$stage/templates-export/$RELEASE_TEMPLATES" "$stage/$RELEASE_ID/templates" || die release-templates 'cannot stage release templates'
+  local rel blob count
+  [ -z "$(find "$stage/$RELEASE_ID/templates" -mindepth 1 ! -type f ! -type d -print -quit)" ] \
+    || die release-templates 'exported templates hold a non-regular file'
+  for rel in "${!TEMPLATE_BLOBS[@]}"; do
+    [ -f "$stage/$RELEASE_ID/templates/$rel" ] || die release-templates "exported template missing: $rel"
+    blob=$(git -C "$FORK_DIR" hash-object --no-filters -- "$stage/$RELEASE_ID/templates/$rel") \
+      || die release-templates "cannot hash exported template: $rel"
+    [ "$blob" = "${TEMPLATE_BLOBS[$rel]}" ] || die release-templates "exported template differs from the source commit: $rel"
+  done
+  count=$(find "$stage/$RELEASE_ID/templates" -type f | wc -l)
+  [ "$count" -eq "${#TEMPLATE_BLOBS[@]}" ] || die release-templates 'exported template set differs from the source commit'
   [ "$(sha256sum "$stage/$RELEASE_ID/cass" | awk '{print $1}')" = "$CLI_SHA" ] || die release-sha 'release CLI copy changed'
   [ "$(sha256sum "$stage/$RELEASE_ID/cass-mcp" | awk '{print $1}')" = "$MCP_SHA" ] || die release-sha 'release MCP copy changed'
   versions="$stage/elf-versions.txt"
@@ -254,9 +300,12 @@ publish_release() {
   done
   glibc=$(grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' "$versions" | sed 's/^GLIBC_//' | LC_ALL=C sort -Vu | tail -n 1) || die release-abi 'cannot identify required GLIBC symbols'
   [ -n "$glibc" ] || die release-abi 'GNU libc release requires versioned GLIBC symbols'
-  printf 'format=cass-fork-release/1\nsource_commit=%s\nplatform=linux-x86_64\ncass_version=%s\nmcp_version=%s\nglibc_min=%s\n' \
+  printf 'format=cass-fork-release/2\nsource_commit=%s\nplatform=linux-x86_64\ncass_version=%s\nmcp_version=%s\nglibc_min=%s\n' \
     "$SRC_COMMIT" "$EXPECTED_CASS_VERSION" "$EXPECTED_MCP_VERSION" "$glibc" > "$stage/$RELEASE_ID/release.env"
-  ( cd "$stage/$RELEASE_ID" && sha256sum cass cass-mcp install.sh release.env > SHA256SUMS )
+  # One line per regular file except SHA256SUMS, ordered by path (LC_ALL=C).
+  ( cd "$stage/$RELEASE_ID" \
+    && { printf '%s\n' cass cass-mcp install.sh release.env; find templates -type f -print; } \
+    | LC_ALL=C sort | xargs -d '\n' sha256sum -- > SHA256SUMS ) || die release-sums 'cannot write SHA256SUMS'
   archive_stage="$stage/release.tar.gz"
   tar -czf "$archive_stage" -C "$stage" "$RELEASE_ID" || die release-archive 'cannot create release archive; stage retained'
   hash=$(sha256sum "$archive_stage" | awk '{print $1}')

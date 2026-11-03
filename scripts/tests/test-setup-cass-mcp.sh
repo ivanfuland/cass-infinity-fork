@@ -2,8 +2,8 @@
 # test-setup-cass-mcp.sh — control-flow tests for the paired candidate mode of
 # scripts/setup-cass-fork.sh, plus legacy single-CLI compatibility.
 #
-# MOCK BOUNDARY: this script replaces cargo, rustup, strings, ldd, ln, sha256sum
-# and the asupersync git sibling with fakes earlier in PATH. Every case runs in
+# MOCK BOUNDARY: this script replaces cargo, rustup, strings, ldd, readelf, ln,
+# sha256sum and the asupersync git sibling with fakes earlier in PATH. Every case runs in
 # its own temp directory with an isolated HOME and a throwaway local git origin.
 # These cases prove branch and publication boundaries only. They are NOT release
 # evidence: the real paired release is produced by the shipped script against
@@ -99,6 +99,17 @@ fi
 exit 0
 FAKE_LDD
 
+# The fake binaries are shell scripts; readelf reports a native x86-64 ELF
+# that needs GLIBC_2.34 so the release packaging path can run to completion.
+cat > "$MOCKS/readelf" <<'FAKE_READELF'
+#!/usr/bin/env bash
+case "$1" in
+  -h) printf '  Class:                             ELF64\n  Machine:                           Advanced Micro Devices X86-64\n' ;;
+  --version-info) printf '  0x0010:   Name: GLIBC_2.17  Flags: none  Version: 3\n  0x0020:   Name: GLIBC_2.34  Flags: none  Version: 2\n' ;;
+  *) exit 2 ;;
+esac
+FAKE_READELF
+
 cat > "$MOCKS/rustup" <<'FAKE_RUSTUP'
 #!/usr/bin/env bash
 echo "nightly-x86_64-unknown-linux-gnu (default)"
@@ -176,10 +187,31 @@ asupersync = { version = "=0.3.5", path = "../asupersync" }
 TOML
 mkdir -p "$ORIGIN_WORK/mcp"
 printf '[package]\nname = "cass-mcp"\nversion = "0.6.17"\n\n[workspace]\n' > "$ORIGIN_WORK/mcp/Cargo.toml"
-printf 'target/\n' > "$ORIGIN_WORK/.gitignore"
-"$REAL_GIT" -C "$ORIGIN_WORK" -c user.email=t@example.invalid -c user.name=t add -A
-"$REAL_GIT" -C "$ORIGIN_WORK" -c user.email=t@example.invalid -c user.name=t commit -q -m fixture
+printf 'target/\nscripts/release-templates/*.local\n' > "$ORIGIN_WORK/.gitignore"
+# Release packages take templates/ from scripts/release-templates at the source commit.
+TEMPLATES_SRC="$HERE/../release-templates"
+mkdir -p "$ORIGIN_WORK/scripts"
+cp -R "$TEMPLATES_SRC" "$ORIGIN_WORK/scripts/release-templates"
+fixture_git() { "$REAL_GIT" -C "$ORIGIN_WORK" -c user.email=t@example.invalid -c user.name=t "$@"; }
+fixture_git add -A
+fixture_git commit -q -m fixture
 "$REAL_GIT" -C "$ORIGIN_WORK" push -q "$ORIGIN" t16-mock
+# Extra branches with invalid template trees; t16-mock stays the default.
+fixture_git checkout -q -b t16-templates-symlink
+ln -s README.md "$ORIGIN_WORK/scripts/release-templates/link.md"
+fixture_git add -A
+fixture_git commit -q -m 'symlink template'
+fixture_git checkout -q t16-mock
+fixture_git checkout -q -b t16-templates-missing
+fixture_git rm -q -r scripts/release-templates
+fixture_git commit -q -m 'no templates'
+fixture_git checkout -q t16-mock
+fixture_git checkout -q -b t16-templates-cr
+printf 'cr\n' > "$ORIGIN_WORK/scripts/release-templates/bad"$'\r'"name.txt"
+fixture_git add -A
+fixture_git commit -q -m 'carriage return in a template name'
+fixture_git checkout -q t16-mock
+"$REAL_GIT" -C "$ORIGIN_WORK" push -q "$ORIGIN" t16-templates-symlink t16-templates-missing t16-templates-cr
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -581,6 +613,73 @@ case_release_existing_output() {
   end_case
 }
 
+# Mock packaging run: proves the format 2 layout, not release evidence.
+case_release_success() {
+  begin_case release-success
+  local rc=0 commit id dest sums_paths file_paths readme_line
+  commit=$("$REAL_GIT" -C "$ORIGIN_WORK" rev-parse t16-mock)
+  id="cass-fork-$commit-linux-x86_64"
+  dest="$CASE_DIR/releases/$id"
+  run_setup "$CASE_DIR" INSTALL_PATH="$CLI_TARGET" MCP_INSTALL_PATH="$MCP_TARGET" \
+    RELEASE_DIR="$CASE_DIR/releases" || rc=$?
+  assert_rc_zero "$rc"
+  assert_contains "$CASE_DIR/setup.log" "RELEASE_OK source_commit=$commit"
+  assert_file "$dest/release.env"
+  assert_eq "$(head -n 1 "$dest/release.env" 2>/dev/null)" 'format=cass-fork-release/2' 'release format line'
+  assert_eq "$(cut -d= -f1 "$dest/release.env" 2>/dev/null | tr '\n' ' ')" \
+    'format source_commit platform cass_version mcp_version glibc_min ' 'release.env keys'
+  assert_contains "$dest/release.env" 'glibc_min=2.34'
+  assert_file "$dest/templates/README.md"
+  cmp -s "$TEMPLATES_SRC/README.md" "$dest/templates/README.md" || case_fail 'templates/README.md differs from source'
+  cmp -s "$HERE/../install-cass-fork-release.sh" "$dest/install.sh" || case_fail 'install.sh differs from source'
+  readme_line="$(sha_of "$TEMPLATES_SRC/README.md")  templates/README.md"
+  grep -qxF -- "$readme_line" "$dest/SHA256SUMS" 2>/dev/null || case_fail 'SHA256SUMS does not cover templates/README.md'
+  (cd "$dest" && sha256sum --check --quiet SHA256SUMS) >/dev/null 2>&1 || case_fail 'SHA256SUMS check failed'
+  sums_paths=$(cut -c67- "$dest/SHA256SUMS" 2>/dev/null)
+  file_paths=$(cd "$dest" 2>/dev/null && find . -type f ! -name SHA256SUMS -printf '%P\n' | LC_ALL=C sort)
+  assert_eq "$sums_paths" "$file_paths" 'SHA256SUMS paths (sorted) vs package files'
+  (cd "$CASE_DIR/releases" && sha256sum --check --quiet "$id.tar.gz.sha256") >/dev/null 2>&1 || case_fail 'archive checksum failed'
+  tar -tzf "$CASE_DIR/releases/$id.tar.gz" 2>/dev/null | grep -qxF "$id/templates/README.md" || case_fail 'archive lacks templates/README.md'
+  end_case
+}
+
+# An ignored file in the build clone's template directory is not tracked, so
+# it must not reach the package.
+case_release_ignored_template() {
+  begin_case release-ignored-template
+  local rc=0 commit id dest
+  commit=$("$REAL_GIT" -C "$ORIGIN_WORK" rev-parse t16-mock)
+  id="cass-fork-$commit-linux-x86_64"
+  dest="$CASE_DIR/releases/$id"
+  "$REAL_GIT" clone -q "$ORIGIN" "$CASE_DIR/fork"
+  printf 'local secret\n' > "$CASE_DIR/fork/scripts/release-templates/secret.local"
+  [ -z "$("$REAL_GIT" -C "$CASE_DIR/fork" status --porcelain)" ] || case_fail 'fixture file is not ignored'
+  run_setup "$CASE_DIR" INSTALL_PATH="$CLI_TARGET" MCP_INSTALL_PATH="$MCP_TARGET" \
+    RELEASE_DIR="$CASE_DIR/releases" || rc=$?
+  assert_rc_zero "$rc"
+  assert_contains "$CASE_DIR/setup.log" "RELEASE_OK source_commit=$commit"
+  assert_file "$dest/templates/README.md"
+  assert_no_path "$dest/templates/secret.local"
+  assert_not_contains "$dest/SHA256SUMS" 'secret.local'
+  if tar -tzf "$CASE_DIR/releases/$id.tar.gz" 2>/dev/null | grep -qF 'secret.local'; then
+    case_fail 'archive contains the ignored file'
+  fi
+  end_case
+}
+
+case_release_bad_templates() {
+  local kind="$1" expected="$2" rc=0
+  begin_case "release-templates-$kind"
+  run_setup "$CASE_DIR" INSTALL_PATH="$CLI_TARGET" MCP_INSTALL_PATH="$MCP_TARGET" \
+    RELEASE_DIR="$CASE_DIR/releases" FORK_REF="t16-templates-$kind" || rc=$?
+  assert_rc_nonzero "$rc"
+  assert_contains "$CASE_DIR/setup.log" "$expected"
+  assert_eq "$(log_lines "$CASE_DIR/cargo-calls.log")" 0 'cargo invocations'
+  assert_no_path "$CLI_TARGET"
+  assert_no_path "$MCP_TARGET"
+  end_case
+}
+
 # ---------------------------------------------------------------------------
 # Run all cases
 # ---------------------------------------------------------------------------
@@ -619,6 +718,11 @@ case_release_preflight target-hyphen 'unset native compiler flags: CFLAGS_x86_64
 case_release_existing_output dir
 case_release_existing_output archive
 case_release_existing_output checksum
+case_release_success
+case_release_bad_templates symlink 'release templates may hold only regular files and directories'
+case_release_bad_templates missing 'missing scripts/release-templates at the source commit'
+case_release_bad_templates cr 'release template name contains a backslash, newline or carriage return'
+case_release_ignored_template
 
 TOTAL=$((PASS + FAIL))
 printf '\nTEST_SUMMARY total=%s pass=%s fail=%s\n' "$TOTAL" "$PASS" "$FAIL"

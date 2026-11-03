@@ -1,17 +1,40 @@
 #!/usr/bin/env bash
 # Use a real, extracted release: bash scripts/tests/test-cass-release.sh /path/to/bundle
 # Each run owns its files and child environment. No shared HOME, service or database.
-# Only the two stage/race cases replace cp/mv; all binaries and other probes are real.
+# Only the stage/race cases replace cp/mv; all binaries and other probes are real.
+# Generic installer protections run twice: on the given bundle and on format 2 fixtures.
 set -euo pipefail
 BUNDLE=${1:?usage: test-cass-release.sh /absolute/extracted-bundle}
 SANDBOX=${TEST_SANDBOX:-$(mktemp -d /tmp/cc-cass-release-test.XXXXXX)}
 mkdir -p "$SANDBOX"
 BUNDLE=$(cd -- "$BUNDLE" && pwd -P)
+REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
 COMMIT=$(sed -n 's/^source_commit=//p' "$BUNDLE/release.env")
 ID="cass-fork-$COMMIT-linux-x86_64"
 PASS=0; FAIL=0
 printf 'sandbox=%s bundle=%s\n' "$SANDBOX" "$BUNDLE"
-resign() { (cd "$bundle" && sha256sum cass cass-mcp install.sh release.env > SHA256SUMS); }
+# Format 2 fixtures reuse the real version 1 binaries, the installer under test
+# (V2_INSTALL_SCRIPT overrides it, e.g. for mutation runs) and a templates/ tree.
+V2_INSTALLER=${V2_INSTALL_SCRIPT:-$REPO/scripts/install-cass-fork-release.sh}
+sign_v2() {
+  (cd "$bundle" && { printf '%s\n' cass cass-mcp install.sh release.env; find templates -type f; } \
+    | LC_ALL=C sort | xargs -d '\n' sha256sum -- > SHA256SUMS)
+}
+build_v2() {
+  cp -p -- "$BUNDLE/"{cass,cass-mcp} "$bundle/"
+  cp -- "$V2_INSTALLER" "$bundle/install.sh"; chmod 755 "$bundle/install.sh"
+  sed 's#^format=.*#format=cass-fork-release/2#' "$BUNDLE/release.env" > "$bundle/release.env"
+  mkdir -p "$bundle/templates/sub/deeper"
+  printf 'Deployment templates.\n' > "$bundle/templates/README.md"
+  printf 'name with a space\n' > "$bundle/templates/sub/a b.txt"
+  printf 'nested\n' > "$bundle/templates/sub/deeper/note.conf"
+  sign_v2
+}
+tree_list() { (cd "$1" && find . -mindepth 1 -printf '%y %m %P\n' | LC_ALL=C sort); }
+resign() {
+  if [ "${fmt:-v1}" = v2 ]; then sign_v2; return; fi
+  (cd "$bundle" && sha256sum cass cass-mcp install.sh release.env > SHA256SUMS)
+}
 run_install() {
   env -i HOME="$dir/home" PATH="$path" bash "$bundle/install.sh" --prefix "$prefix" > "$dir/install.log" 2>&1
 }
@@ -22,9 +45,8 @@ reject() {
   grep -qF -- "$1" "$dir/install.log"
   [ ! -e "$prefix/$ID" ] && [ ! -L "$prefix/$ID" ]
 }
-one_case() (
-  set -e
-  local kind=$1 dir="$SANDBOX/$1" bundle prefix path
+# Sets path, bundle and prefix of the calling case (dynamic scope).
+prepare_case() {
   mkdir -p "$dir/home" "$dir/bundle" "$dir/prefix/old-version" "$dir/tools"
   path="$dir/tools:/usr/bin:/bin"
   cat > "$dir/tools/forbidden-tool" <<'SH'
@@ -38,11 +60,23 @@ SH
     ln -s forbidden-tool "$dir/tools/$tool"
   done
   bundle="$dir/bundle"; prefix="$dir/prefix"
-  cp -p -- "$BUNDLE/"{cass,cass-mcp,install.sh,release.env,SHA256SUMS} "$bundle/"
-  # Mutation runs replace the shipped installer, then sign that test fixture.
-  if [ -n "${INSTALL_SCRIPT:-}" ]; then cp -- "$INSTALL_SCRIPT" "$bundle/install.sh"; resign; fi
   printf 'keep-config\n' > "$prefix/config"
   printf 'keep-database\n' > "$prefix/old-version/data"
+}
+# one_case <kind> [v1|v2]: v1 uses the given bundle and its own installer;
+# v2 runs the same generic protection case on a signed format 2 fixture.
+one_case() (
+  set -e
+  local kind=$1 fmt=${2:-v1} dir bundle prefix path
+  dir="$SANDBOX/$kind"; [ "$fmt" = v1 ] || dir="$SANDBOX/v2g-$kind"
+  prepare_case
+  if [ "$fmt" = v2 ]; then
+    build_v2
+  else
+    cp -p -- "$BUNDLE/"{cass,cass-mcp,install.sh,release.env,SHA256SUMS} "$bundle/"
+    # Mutation runs replace the shipped installer, then sign that test fixture.
+    if [ -n "${INSTALL_SCRIPT:-}" ]; then cp -- "$INSTALL_SCRIPT" "$bundle/install.sh"; resign; fi
+  fi
   case "$kind" in
     install)
       run_install
@@ -141,5 +175,110 @@ for kind in install tamper-cli tamper-mcp tamper-manifest missing-checksum dupli
   set -e
   if [ "$rc" -eq 0 ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); printf 'FAIL %s: %s\n' "$kind" "$SANDBOX/$kind.log"; fi
 done
+# The installer's generic protections, rerun on format 2 fixtures with the new
+# installer. Checksum-format cases are format specific and covered below.
+G_PASS=0; G_FAIL=0
+for kind in install tamper-cli tamper-mcp tamper-manifest platform glibc missing-metadata \
+  duplicate-metadata unknown-metadata unsafe-metadata invalid-version invalid-glibc \
+  second-version broken-second symlink-cli symlink-manifest symlink-sums existing-directory \
+  existing-file existing-dangling stage-second publish-race; do
+  set +e
+  one_case "$kind" v2 > "$SANDBOX/v2g-$kind.log" 2>&1
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then G_PASS=$((G_PASS+1)); else G_FAIL=$((G_FAIL+1)); printf 'FAIL v2g-%s: %s\n' "$kind" "$SANDBOX/v2g-$kind.log"; fi
+done
+# ---------------------------------------------------------------------------
+# Format 2 specific cases: templates/ and SHA256SUMS path rules.
+# v1-cass-install runs the root entry against the unchanged version 1 bundle.
+# ---------------------------------------------------------------------------
+v2_case() (
+  set -e
+  local kind=$1 dir="$SANDBOX/$1" bundle prefix path
+  prepare_case
+  case "$kind" in
+    v1-cass-install)
+      env -i HOME="$dir/home" PATH="$path" bash "$REPO/cass" install "$BUNDLE" --prefix "$prefix" > "$dir/install.log" 2>&1
+      grep -q '^INSTALL_OK ' "$dir/install.log"
+      grep -q '^Installed only\.' "$dir/install.log"
+      [ "$(tree_list "$BUNDLE")" = "$(tree_list "$prefix/$ID")" ]
+      local name
+      for name in cass cass-mcp install.sh release.env SHA256SUMS; do cmp -- "$BUNDLE/$name" "$prefix/$ID/$name"; done
+      ;;
+    v2-install)
+      build_v2; run_install
+      grep -q '^INSTALL_OK ' "$dir/install.log"
+      local name
+      for name in cass cass-mcp install.sh release.env SHA256SUMS; do cmp -- "$bundle/$name" "$prefix/$ID/$name"; done
+      diff -r -- "$bundle/templates" "$prefix/$ID/templates"
+      [ "$(tree_list "$bundle")" = "$(tree_list "$prefix/$ID")" ]
+      (cd "$prefix/$ID" && sha256sum --check --quiet SHA256SUMS)
+      [ "$("$prefix/$ID/cass" --version)" = 'cass 0.6.17' ]
+      [ "$("$prefix/$ID/cass-mcp" --version)" = 'cass-mcp 0.6.17' ]
+      [ "$(find "$prefix" -maxdepth 1 -name '.cass-release-stage.*' | wc -l)" -eq 0 ]
+      ;;
+    v2-tamper-template)
+      build_v2; printf 'tampered\n' >> "$bundle/templates/sub/deeper/note.conf"
+      reject 'checksum mismatch: templates/sub/deeper/note.conf' ;;
+    v2-missing-template)
+      build_v2; rm -- "$bundle/templates/sub/deeper/note.conf"
+      reject 'checksum list does not match bundle files' ;;
+    v2-extra-template)
+      build_v2; printf 'unsigned\n' > "$bundle/templates/extra.txt"
+      reject 'checksum list does not match bundle files' ;;
+    v2-extra-member)
+      build_v2; printf 'unsigned\n' > "$bundle/notes.txt"
+      reject 'checksum list does not match bundle files' ;;
+    v2-dotdot-checksum)
+      build_v2; printf '%s  templates/../cass\n' "$(sha256sum "$bundle/cass" | cut -d' ' -f1)" >> "$bundle/SHA256SUMS"
+      reject 'unsafe checksum path' ;;
+    v2-absolute-checksum)
+      build_v2; printf '%064d  /etc/hostname\n' 0 >> "$bundle/SHA256SUMS"
+      reject 'unsafe checksum path' ;;
+    v2-duplicate-checksum)
+      build_v2; tail -n 1 "$bundle/SHA256SUMS" >> "$bundle/SHA256SUMS"
+      reject 'duplicate checksum' ;;
+    v2-symlink-template)
+      build_v2; mv -- "$bundle/templates/README.md" "$dir/real-file"
+      ln -s "$dir/real-file" "$bundle/templates/README.md"
+      reject 'not a regular bundle file: templates/README.md' ;;
+    v2-templates-missing)
+      build_v2; rm -r -- "$bundle/templates"
+      (cd "$bundle" && sha256sum cass cass-mcp install.sh release.env > SHA256SUMS)
+      reject 'missing templates directory' ;;
+    v2-format-1)
+      build_v2; sed -i 's#^format=.*#format=cass-fork-release/1#' "$bundle/release.env"; sign_v2
+      reject 'unsupported release format' ;;
+    v2-stage-template)
+      build_v2
+      cat > "$dir/tools/cp" <<'SH'
+#!/usr/bin/env bash
+/usr/bin/cp "$@" || exit
+dest=${!#}
+case "$dest" in */.cass-release-stage.*/templates) printf 'changed\n' >> "$dest/README.md" ;; esac
+SH
+      chmod +x "$dir/tools/cp"
+      reject 'staged checksum mismatch: templates/README.md'
+      [ "$(find "$prefix" -maxdepth 1 -name '.cass-release-stage.*' -type d | wc -l)" -eq 1 ] ;;
+    *) exit 2 ;;
+  esac
+  [ "$(cat "$prefix/config")" = keep-config ]
+  [ "$(cat "$prefix/old-version/data")" = keep-database ]
+  [ ! -e "$dir/tools/unexpected-tool-calls" ]
+)
+V2_PASS=0; V2_FAIL=0
+for kind in v1-cass-install v2-install v2-tamper-template v2-missing-template v2-extra-template \
+  v2-extra-member v2-dotdot-checksum v2-absolute-checksum v2-duplicate-checksum \
+  v2-symlink-template v2-templates-missing v2-format-1 v2-stage-template; do
+  set +e
+  v2_case "$kind" > "$SANDBOX/$kind.log" 2>&1
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then V2_PASS=$((V2_PASS+1)); else V2_FAIL=$((V2_FAIL+1)); printf 'FAIL %s: %s\n' "$kind" "$SANDBOX/$kind.log"; fi
+done
+printf 'GROUP_SUMMARY group=v1-bundle total=%s pass=%s fail=%s\n' "$((PASS+FAIL))" "$PASS" "$FAIL"
+printf 'GROUP_SUMMARY group=v2-generic total=%s pass=%s fail=%s\n' "$((G_PASS+G_FAIL))" "$G_PASS" "$G_FAIL"
+printf 'GROUP_SUMMARY group=v2-format total=%s pass=%s fail=%s\n' "$((V2_PASS+V2_FAIL))" "$V2_PASS" "$V2_FAIL"
+PASS=$((PASS+G_PASS+V2_PASS)); FAIL=$((FAIL+G_FAIL+V2_FAIL))
 printf 'TEST_SUMMARY total=%s pass=%s fail=%s\n' "$((PASS+FAIL))" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
