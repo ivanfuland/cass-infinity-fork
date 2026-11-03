@@ -1,0 +1,440 @@
+#!/usr/bin/env bash
+# Full deployment mode of install.sh (--deploy): version and current pointer,
+# data directory states, and the installer-owned configuration directory.
+# Usage: bash scripts/tests/test-cass-deploy.sh /absolute/extracted-v1-bundle
+# A format 2 test bundle is built from the given real binaries and the installer
+# under test (DEPLOY_INSTALL_SCRIPT overrides it). Each case owns a temporary
+# HOME, prefix, data and configuration directory. The real cass binary only ever
+# runs against those temporary directories. The sandbox is removed when all
+# cases pass.
+set -euo pipefail
+SRC=${1:?usage: test-cass-deploy.sh /absolute/extracted-bundle}
+SRC=$(cd -- "$SRC" && pwd -P)
+REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
+INSTALLER=${DEPLOY_INSTALL_SCRIPT:-$REPO/scripts/install-cass-fork-release.sh}
+SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/cc-cass-deploy-test.XXXXXX")
+BUNDLE="$SANDBOX/bundle"
+COMMIT=$(sed -n 's/^source_commit=//p' "$SRC/release.env")
+ID="cass-fork-$COMMIT-linux-x86_64"
+KEY_VALUE='sk-SYNTHETIC-t02-0123456789abcdef=='
+KEY_ENV=CASS_TEST_API_KEY
+# The connector set of the baseline binary (src/indexer connectors, e5f0fa43).
+ALL_CONNECTORS='aider amp antigravity chatgpt claude_code clawdbot cline codex copilot copilot_cli crush cursor factory gemini hermes kimi openclaw opencode openhands pi_agent qwen vibe'
+DISABLED='aider amp antigravity chatgpt clawdbot cline copilot copilot_cli crush cursor factory gemini hermes kimi openclaw opencode openhands qwen vibe'
+PASS=0; FAIL=0
+printf 'sandbox=%s source_bundle=%s installer=%s\n' "$SANDBOX" "$SRC" "$INSTALLER"
+
+mkdir -p "$BUNDLE/templates"
+cp -p -- "$SRC/cass" "$SRC/cass-mcp" "$BUNDLE/"
+cp -- "$INSTALLER" "$BUNDLE/install.sh"; chmod 755 "$BUNDLE/install.sh"
+sed 's#^format=.*#format=cass-fork-release/2#' "$SRC/release.env" > "$BUNDLE/release.env"
+printf 'Deployment templates.\n' > "$BUNDLE/templates/README.md"
+(cd "$BUNDLE" && { printf '%s\n' cass cass-mcp install.sh release.env; find templates -type f; } \
+  | LC_ALL=C sort | xargs -d '\n' sha256sum -- > SHA256SUMS)
+
+tree_hash() {
+  [ -e "$1" ] || [ -L "$1" ] || { echo absent; return; }
+  [ -d "$1" ] || { stat -c '%F %a' -- "$1"; sha256sum -- "$1"; return; }
+  (cd "$1" && find . -printf '%y %m %P %l\n' | LC_ALL=C sort && find . -type f -exec sha256sum {} + | LC_ALL=C sort)
+}
+home_cfg_hash() { tree_hash "$dir/home/.config/cass"; }
+# Sets dir-scoped variables of the calling case (dynamic scope).
+prepare_case() {
+  mkdir -p "$dir/home/.config/cass" "$dir/prefix" "$dir/tools"
+  path="$dir/tools:/usr/bin:/bin"
+  cat > "$dir/tools/forbidden-tool" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$0" >> "${0%/*}/unexpected-tool-calls"
+exit 89
+SH
+  chmod +x "$dir/tools/forbidden-tool"
+  local tool
+  for tool in git cargo rustup rustc python python3 curl wget jq systemctl; do
+    ln -s forbidden-tool "$dir/tools/$tool"
+  done
+  # Production rollback configuration under the test HOME: never read or written.
+  printf 'disabled_agents = ["codex", "claude_code", "pi_agent"]\n' > "$dir/home/.config/cass/sources.toml"
+  printf '# production rollback copy\nversion = 1\n' > "$dir/home/.config/cass/model-api.toml"
+  printf 'PROD_KEY=production-value-not-touched\n' > "$dir/home/.config/cass/model-api.env"
+  # Agent roots that the real binary detects, for the onboarding check.
+  local h="$dir/home"
+  mkdir -p "$h/.claude/projects/p" "$h/.codex/sessions" "$h/.pi/agent/sessions" "$h/.gemini/tmp" \
+    "$h/.aider" "$h/.cursor" "$h/.local/share/opencode" "$h/.openclaw" "$h/.qwen" "$h/.factory"
+  printf '{}\n' > "$h/.claude/projects/p/s.jsonl"
+  printf '%s\n' "$KEY_VALUE" > "$dir/key"
+  prefix="$dir/prefix"; data="$dir/data"; cfg="$dir/cfg"; inst=alpha
+  embed=http://127.0.0.1:18080/v1/embeddings; rerank=https://rerank.invalid.example/v1/rerank
+  keyfile="$dir/key"; legacy=""
+}
+run_deploy() {
+  local -a args=(--prefix "$prefix" --deploy --instance "$inst" --data-dir "$data" --config-dir "$cfg"
+    --embed-endpoint "$embed" --embed-model synthetic-embed --embed-revision rev-e1
+    --rerank-endpoint "$rerank" --rerank-model synthetic-rerank --rerank-revision rev-r1
+    --key-env "$KEY_ENV" --key-file "$keyfile")
+  [ -z "$legacy" ] || args+=(--legacy-source "$legacy")
+  local rc=0
+  env -i HOME="$dir/home" PATH="$path" bash "$BUNDLE/install.sh" "${args[@]}" "$@" > "$dir/install.log" 2>&1 || rc=$?
+  cat "$dir/install.log" >> "$dir/all-output.log"
+  return "$rc"
+}
+# expect_rc <code> [extra args]: run once and require that exit status.
+expect_rc() {
+  local want=$1 rc=0; shift
+  run_deploy "$@" || rc=$?
+  [ "$rc" -eq "$want" ] || { printf 'expected rc=%s got rc=%s\n' "$want" "$rc"; cat "$dir/install.log"; return 1; }
+}
+no_secret() { if grep -rqF -- "$KEY_VALUE" "$dir/all-output.log" 2>/dev/null; then echo 'secret value in output'; return 1; fi; }
+# The complete expected configuration for the default arguments.
+expected_sources() {
+  printf '# Generated by install.sh --deploy for instance %s. Rewritten on every deploy.\n' "$inst"
+  printf 'disabled_agents = [\n'
+  local name; for name in $DISABLED; do printf '  "%s",\n' "$name"; done
+  printf ']\n'
+  if [ -n "$legacy" ]; then
+    printf '\n[[sources]]\nname = "%s"\ntype = "local"\norigin_host = "local"\nreadonly = true\npaths = ["%s/.claude/projects"]\n' \
+      "${legacy##*/}" "$legacy"
+  fi
+}
+expected_model_api() {
+  cat <<EOF
+# Generated by install.sh --deploy for instance $inst. Rewritten on every deploy.
+version = 1
+default_embedding = "embed"
+default_rerank = "rerank"
+
+[profiles.embed]
+kind = "embedding"
+protocol = "openai-embeddings-v1"
+endpoint = "$embed"
+scope = "${1:-loopback}"
+model = "synthetic-embed"
+model_revision = "rev-e1"
+api_key_env = "$KEY_ENV"
+normalization = "l2"
+timeout_ms = 125000
+
+[profiles.rerank]
+kind = "rerank"
+protocol = "rerank-json-v1"
+endpoint = "$rerank"
+scope = "${2:-remote}"
+model = "synthetic-rerank"
+model_revision = "rev-r1"
+api_key_env = "$KEY_ENV"
+timeout_ms = 125000
+EOF
+}
+check_deployed() {
+  [ -L "$prefix/current" ] && [ "$(readlink "$prefix/current")" = "$ID" ]
+  (cd "$prefix/$ID" && sha256sum --check --quiet SHA256SUMS)
+  [ "$(cat "$data/.cass-install-instance")" = "$inst" ]
+  [ "$(stat -c %a "$data")" = 700 ]
+  [ "$(cd "$cfg" && find . -mindepth 1 -printf '%y %m %P\n' | LC_ALL=C sort)" = "$(printf '%s\n' \
+    'd 700 cass' 'f 600 .cass-install-instance' 'f 600 cass/sources.toml' 'f 600 model-api.env' 'f 600 model-api.toml')" ]
+  [ "$(stat -c %a "$cfg")" = 700 ]
+  [ "$(cat "$cfg/.cass-install-instance")" = "$inst" ]
+  diff <(expected_sources) "$cfg/cass/sources.toml"
+  diff <(expected_model_api "$@") "$cfg/model-api.toml"
+  # Exactly one line KEY=VALUE, LF terminated, no CR.
+  printf '%s=%s\n' "$KEY_ENV" "$KEY_VALUE" | cmp -- - "$cfg/model-api.env"
+  grep -q '^DEPLOY_OK ' "$dir/install.log"
+}
+# The real binary, only against this case's temporary directories.
+real_cass() { env -i HOME="$dir/home" XDG_CONFIG_HOME="$cfg" PATH=/usr/bin:/bin "$prefix/current/cass" "$@"; }
+
+one_case() (
+  set -e
+  local kind=$1 dir="$SANDBOX/$1" prefix data cfg inst embed rerank keyfile legacy path before
+  prepare_case
+  before=$(home_cfg_hash)
+  case "$kind" in
+    fresh-absent)
+      expect_rc 0; check_deployed ;;
+    fresh-empty)
+      mkdir -m 755 "$data"; expect_rc 0; check_deployed ;;
+    same-instance-rerun)
+      expect_rc 0; check_deployed
+      printf 'library bytes\n' > "$data/sentinel.db"
+      local cfg1 cur1 data1
+      cfg1=$(tree_hash "$cfg"); cur1=$(readlink "$prefix/current"); data1=$(tree_hash "$data")
+      expect_rc 0; check_deployed
+      [ "$(tree_hash "$cfg")" = "$cfg1" ]
+      [ "$(readlink "$prefix/current")" = "$cur1" ]
+      [ "$(tree_hash "$data")" = "$data1" ]
+      grep -q '^VERSION_OK already installed' "$dir/install.log"
+      if grep -q '^INSTALL_OK ' "$dir/install.log"; then return 1; fi ;;
+    foreign-nonempty|foreign-other-instance|foreign-file)
+      case "$kind" in
+        foreign-nonempty) mkdir -p "$data"; printf 'someone else\n' > "$data/index.db" ;;
+        foreign-other-instance) mkdir -p "$data"; printf 'beta\n' > "$data/.cass-install-instance"; printf 'x\n' > "$data/db" ;;
+        foreign-file) printf 'plain file\n' > "$data" ;;
+      esac
+      local d1; d1=$(tree_hash "$data")
+      expect_rc 3
+      grep -q '^FAIL\[install\]: ' "$dir/install.log"
+      [ "$(tree_hash "$data")" = "$d1" ]
+      [ ! -e "$prefix/current" ] && [ ! -e "$prefix/$ID" ] && [ ! -e "$cfg" ] ;;
+    fail-key-missing)
+      mkdir "$prefix/old-version"; ln -s old-version "$prefix/current"
+      keyfile="$dir/no-such-key"; expect_rc 2
+      grep -q '^FAIL\[install\]: ' "$dir/install.log"
+      [ "$(readlink "$prefix/current")" = old-version ]
+      [ ! -e "$prefix/$ID" ] && [ ! -e "$cfg" ] && [ ! -e "$data" ] ;;
+    fail-remote-http)
+      expect_rc 0; check_deployed
+      local cfg1; cfg1=$(tree_hash "$cfg")
+      rerank=http://rerank.invalid.example/v1/rerank; expect_rc 2
+      grep -q 'https' "$dir/install.log"
+      [ "$(readlink "$prefix/current")" = "$ID" ]
+      [ "$(tree_hash "$cfg")" = "$cfg1" ] ;;
+    fail-remote-http-fresh)
+      embed=http://127.0.0.2:18080/v1/embeddings; expect_rc 2
+      [ ! -e "$prefix/current" ] && [ ! -e "$prefix/$ID" ] && [ ! -e "$cfg" ] ;;
+    fail-version-mismatch)
+      expect_rc 0; check_deployed
+      local cfg1; cfg1=$(tree_hash "$cfg")
+      printf 'changed\n' >> "$prefix/$ID/templates/README.md"
+      expect_rc 1
+      grep -q 'version directory differs' "$dir/install.log"
+      [ "$(readlink "$prefix/current")" = "$ID" ]
+      [ "$(tree_hash "$cfg")" = "$cfg1" ] ;;
+    fail-version-mismatch-fresh)
+      mkdir "$prefix/old-version"; ln -s old-version "$prefix/current"
+      mkdir -p "$prefix/$ID"; printf 'other\n' > "$prefix/$ID/cass"
+      expect_rc 1
+      grep -q 'version directory differs' "$dir/install.log"
+      [ "$(readlink "$prefix/current")" = old-version ]
+      [ "$(cat "$prefix/$ID/cass")" = other ]
+      [ -z "$(find "$cfg" -type f 2>/dev/null)" ] ;;
+    fail-config-move)
+      # The final move of one configuration file fails: no partial or staged file remains.
+      cat > "$dir/tools/mv" <<'SH'
+#!/usr/bin/env bash
+case "${!#}" in */cfg/model-api.env) exit 1 ;; esac
+exec /usr/bin/mv "$@"
+SH
+      chmod +x "$dir/tools/mv"
+      mkdir "$prefix/old-version"; ln -s old-version "$prefix/current"
+      if run_deploy; then return 1; fi
+      grep -q '^FAIL\[install\]: ' "$dir/install.log"
+      if grep -q '^DEPLOY_OK ' "$dir/install.log"; then return 1; fi
+      [ "$(readlink "$prefix/current")" = old-version ]
+      [ -z "$(find "$cfg" -name '.cass-install-stage.*')" ]
+      [ ! -e "$cfg/model-api.env" ]
+      # The run reached the final moves: the earlier files are complete.
+      [ -f "$cfg/model-api.toml" ] && [ -f "$cfg/cass/sources.toml" ]
+      local f
+      for f in $(cd "$cfg" && find . -type f -printf '%P\n'); do
+        case "$f" in cass/sources.toml) diff <(expected_sources) "$cfg/$f" ;;
+          model-api.toml) diff <(expected_model_api) "$cfg/$f" ;;
+          .cass-install-instance) [ "$(cat "$cfg/$f")" = "$inst" ] ;; *) return 1 ;; esac
+      done ;;
+    home-config-rejected)
+      local variant
+      for variant in "$dir/home/.config" "$dir/home/.config/" "$dir/home/x/../.config" "$dir/home/.config/cass" "$dir/link-to-config"; do
+        ln -sfn "$dir/home/.config" "$dir/link-to-config"
+        cfg=$variant; expect_rc 2
+        grep -q '^FAIL\[install\]: ' "$dir/install.log"
+      done
+      [ ! -e "$prefix/current" ] && [ ! -e "$prefix/$ID" ] && [ ! -e "$data" ] ;;
+    onboarding-real)
+      legacy="$dir/claude-legacy"; mkdir -p "$legacy/.claude/projects"
+      expect_rc 0; check_deployed
+      [ "$(real_cass capabilities --json | sed -n '/"connectors": \[/,/\]/p' | sed -n 's/^ *"\([a-z0-9_]*\)",\{0,1\}$/\1/p' | LC_ALL=C sort | xargs)" = "$ALL_CONNECTORS" ]
+      mkdir "$dir/obdata"
+      real_cass onboarding --json --data-dir "$dir/obdata" > "$dir/onboarding.json"
+      python3 -I - "$dir/onboarding.json" "$DISABLED" <<'PY'
+import json, sys
+report = json.load(open(sys.argv[1]))
+active = sorted(p["name"] for p in report["providers"] if p["readiness"] != "excluded")
+assert active == ["claude", "codex", "pi_agent"], active
+disabled = set(sys.argv[2].split())
+excluded = report["excluded_providers"]
+assert excluded and set(excluded) <= disabled, excluded
+assert all(p["readiness"] == "excluded" for p in report["providers"] if p["name"] in disabled)
+PY
+      real_cass models list --api-config "$cfg/model-api.toml" --json > "$dir/models.json"
+      python3 -I - "$dir/models.json" "$KEY_ENV" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+got = sorted((p["id"], p["kind"], p["scope"], p["api_key_env"], p["default"]) for p in d["profiles"])
+assert got == [("embed", "embedding", "loopback", sys.argv[2], True), ("rerank", "rerank", "remote", sys.argv[2], True)], got
+PY
+      real_cass sources list --json > "$dir/sources.json"
+      python3 -I - "$dir/sources.json" "$legacy" "$DISABLED" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert [(s["name"], s["type"], s["paths"]) for s in d["sources"]] == [("claude-legacy", "local", [sys.argv[2] + "/.claude/projects"])], d["sources"]
+assert d["disabled_agents"] == sys.argv[3].split(), d["disabled_agents"]
+PY
+      # Optional evidence copy (no env file: it holds the synthetic key).
+      if [ -n "${DEPLOY_TEST_EVIDENCE:-}" ]; then
+        mkdir -p "$DEPLOY_TEST_EVIDENCE"
+        cp -- "$dir/onboarding.json" "$dir/models.json" "$dir/sources.json" "$dir/install.log" \
+          "$cfg/cass/sources.toml" "$cfg/model-api.toml" "$DEPLOY_TEST_EVIDENCE/"
+      fi
+      ;;
+    loopback-scopes)
+      embed='http://[::1]:18080/v1/embeddings'; rerank=http://LOCALHOST:18081/v1/rerank
+      expect_rc 0; check_deployed loopback loopback ;;
+    env-format)
+      expect_rc 0; check_deployed
+      [ "$(wc -l < "$cfg/model-api.env")" -eq 1 ]
+      if grep -q $'\r' "$cfg/model-api.env"; then return 1; fi
+      [ "$(stat -c %a "$cfg/model-api.env")" = 600 ]
+      # One trailing newline is removed from the key file; a key without one is identical.
+      printf '%s' "$KEY_VALUE" > "$dir/key"; expect_rc 0; check_deployed ;;
+    bad-key-values)
+      # Each entry is a printf format for the whole key file. Every value starts
+      # with a marker that must never appear in any output.
+      local fmt
+      for fmt in 'sk-LEAK"q\n' "sk-LEAK'q\n" 'sk-LEAK q\n' 'sk-LEAK\tq\n' 'sk-LEAK\rq\n' 'sk-LEAK\nq\n' \
+        'sk-LEAK\n\n' 'sk-LEAK\\q\n' 'sk-LEAK\001q\n' 'sk-LEAK\000q\n' 'sk-LEAK\177q\n' '' '\n' '\n\n'; do
+        # shellcheck disable=SC2059 # The format is the test data.
+        printf "$fmt" > "$dir/key"
+        expect_rc 2
+        grep -q '^FAIL\[install\]: ' "$dir/install.log"
+      done
+      if grep -qF 'sk-LEAK' "$dir/all-output.log"; then return 1; fi
+      [ ! -e "$prefix/current" ] && [ ! -e "$cfg" ] ;;
+    bad-arguments)
+      inst=Bad_Name; expect_rc 2; inst=alpha
+      data=relative/data; expect_rc 2; data="$dir/data"
+      cfg=relative/cfg; expect_rc 2; cfg="$dir/cfg"
+      expect_rc 2 --unknown-flag
+      expect_rc 2 --instance beta
+      embed=ftp://127.0.0.1/x; expect_rc 2; embed=http://127.0.0.1:18080/v1/embeddings
+      embed='http://user@127.0.0.1/x'; expect_rc 2; embed=http://127.0.0.1:18080/v1/embeddings
+      local ke
+      for ke in lower_case 9START HOME PATH XDG_CONFIG_HOME 'A-B'; do
+        KEY_ENV=$ke expect_rc 2
+      done
+      legacy='/tmp/with"quote'; expect_rc 2; legacy=relative; expect_rc 2; legacy=""
+      [ ! -e "$prefix/current" ] && [ ! -e "$prefix/$ID" ] && [ ! -e "$cfg" ] && [ ! -e "$data" ] ;;
+    publish-only-unchanged)
+      # Without --deploy, deployment flags remain unknown arguments (exit 1) and
+      # a plain installation behaves as before.
+      local rc=0
+      env -i HOME="$dir/home" PATH="$path" bash "$BUNDLE/install.sh" --prefix "$prefix" --instance alpha > "$dir/install.log" 2>&1 || rc=$?
+      [ "$rc" -eq 1 ] && grep -q 'unknown argument: --instance' "$dir/install.log"
+      env -i HOME="$dir/home" PATH="$path" bash "$BUNDLE/install.sh" --prefix "$prefix" > "$dir/install.log" 2>&1
+      grep -q '^INSTALL_OK ' "$dir/install.log"
+      [ ! -e "$prefix/current" ]
+      rc=0
+      env -i HOME="$dir/home" PATH="$path" bash "$BUNDLE/install.sh" --prefix "$prefix" > "$dir/install.log" 2>&1 || rc=$?
+      [ "$rc" -eq 1 ] && grep -q 'version already exists' "$dir/install.log" ;;
+    data-parent-readonly)
+      # R1: creating the data directory fails; current keeps its old target.
+      mkdir "$prefix/old-version"; ln -s old-version "$prefix/current"
+      mkdir -m 555 "$dir/ro"; data="$dir/ro/data"
+      local rc=0; run_deploy || rc=$?
+      chmod 755 "$dir/ro"
+      [ "$rc" -eq 1 ] || { cat "$dir/install.log"; return 1; }
+      [ "$(readlink "$prefix/current")" = old-version ]
+      [ ! -e "$data" ]
+      [ -z "$(find "$cfg" -name '.cass-install-stage.*' 2>/dev/null)" ] ;;
+    connectors-forged-dash|connectors-forged-upper)
+      # R2: a capabilities list with a name outside [a-z0-9_] is refused.
+      local edit='s/^    "codex",$/    "codex",\n    "new-agent",/'
+      [ "$kind" = connectors-forged-dash ] || edit='s/^    "gemini",$/    "Gemini",/'
+      cat > "$dir/tools/env" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" capabilities --json "*) /usr/bin/env "\$@" | /usr/bin/sed '$edit'; exit "\${PIPESTATUS[0]}" ;;
+esac
+exec /usr/bin/env "\$@"
+SH
+      chmod +x "$dir/tools/env"
+      mkdir "$prefix/old-version"; ln -s old-version "$prefix/current"
+      expect_rc 1
+      grep -q 'entries but only .* valid names' "$dir/install.log"
+      [ "$(readlink "$prefix/current")" = old-version ]
+      [ ! -e "$prefix/$ID" ] && [ ! -e "$cfg" ] && [ ! -e "$data" ] ;;
+    term-at-stage|term-at-marker)
+      # R4: TERM while temporaries exist; the EXIT cleanup still runs.
+      if [ "$kind" = term-at-stage ]; then
+        cat > "$dir/tools/env" <<'SH'
+#!/usr/bin/env bash
+case " $* " in *" models list "*) kill -TERM "$PPID" ;; esac
+exec /usr/bin/env "$@"
+SH
+        chmod +x "$dir/tools/env"
+      else
+        cat > "$dir/tools/mv" <<'SH'
+#!/usr/bin/env bash
+case "${!#}" in */data/.cass-install-instance) kill -TERM "$PPID"; exit 1 ;; esac
+exec /usr/bin/mv "$@"
+SH
+        chmod +x "$dir/tools/mv"
+      fi
+      mkdir "$prefix/old-version"; ln -s old-version "$prefix/current"
+      expect_rc 143
+      [ "$(readlink "$prefix/current")" = old-version ]
+      [ -d "$cfg" ] && [ -z "$(find "$cfg" -name '.cass-install-stage.*')" ]
+      [ -z "$(find "$data" -name '.cass-install-instance.*' 2>/dev/null)" ]
+      [ "$kind" = term-at-stage ] || [ -d "$data" ] ;;
+    endpoint-bad-port)
+      # R5: accepted by the installer's own checks, refused by the binary.
+      mkdir "$prefix/old-version"; ln -s old-version "$prefix/current"
+      embed=http://127.0.0.1:99999/v1; expect_rc 1
+      grep -q 'model-api.toml rejected' "$dir/install.log"
+      [ "$(readlink "$prefix/current")" = old-version ]
+      [ -z "$(find "$cfg" -type f 2>/dev/null)" ]
+      [ ! -e "$data" ] ;;
+    overlapping-dirs)
+      # R3: data-dir, config-dir and prefix must be three separate trees.
+      local pair
+      for pair in "$dir/same $dir/same $prefix" "$dir/same $dir/same/ $prefix" "$dir/d $dir/d/cfg $prefix" \
+        "$dir/c/data $dir/c $prefix" "$prefix/data $dir/cfg $prefix" "$dir/data $dir/cfg $dir/data/prefix" \
+        "$dir/data $dir/cfg $dir/cfg/x/../prefix" "$dir/x/../data $dir/data $prefix"; do
+        read -r data cfg prefix <<< "$pair"
+        expect_rc 2
+        grep -q '^FAIL\[install\]: ' "$dir/install.log"
+      done
+      prefix="$dir/prefix"
+      [ "$(find "$dir" -mindepth 1 -maxdepth 1 -type d -printf '%P\n' | LC_ALL=C sort | xargs)" = 'home prefix tools' ]
+      [ -z "$(find "$prefix" -mindepth 1)" ] ;;
+    config-foreign-instance)
+      # R6: another instance's configuration directory is refused unchanged.
+      inst=beta; expect_rc 0
+      local c1; c1=$(tree_hash "$cfg")
+      inst=alpha; data="$dir/data2"; expect_rc 3
+      [ "$(tree_hash "$cfg")" = "$c1" ]
+      [ ! -e "$data" ] ;;
+    config-foreign-nonempty)
+      mkdir -m 755 "$cfg"; printf 'other tool\n' > "$cfg/settings.ini"
+      local c1; c1=$(tree_hash "$cfg")
+      expect_rc 3
+      [ "$(tree_hash "$cfg")" = "$c1" ] && [ "$(stat -c %a "$cfg")" = 755 ]
+      [ ! -e "$prefix/current" ] && [ ! -e "$prefix/$ID" ] && [ ! -e "$data" ] ;;
+    config-cass-symlink)
+      # R7: <config-dir>/cass must not be a symbolic link.
+      mkdir -p "$cfg" "$dir/elsewhere"; ln -s "$dir/elsewhere" "$cfg/cass"
+      expect_rc 2
+      [ -z "$(find "$dir/elsewhere" -mindepth 1)" ]
+      [ ! -e "$prefix/current" ] && [ ! -e "$data" ] ;;
+    *) exit 2 ;;
+  esac
+  [ "$(home_cfg_hash)" = "$before" ]
+  no_secret
+  [ ! -e "$dir/tools/unexpected-tool-calls" ]
+)
+
+CASES='fresh-absent fresh-empty same-instance-rerun foreign-nonempty foreign-other-instance foreign-file
+  fail-key-missing fail-remote-http fail-remote-http-fresh fail-version-mismatch fail-version-mismatch-fresh
+  fail-config-move home-config-rejected onboarding-real loopback-scopes env-format bad-key-values
+  bad-arguments publish-only-unchanged
+  data-parent-readonly connectors-forged-dash connectors-forged-upper term-at-stage term-at-marker
+  endpoint-bad-port overlapping-dirs config-foreign-instance config-foreign-nonempty config-cass-symlink'
+for kind in $CASES; do
+  set +e
+  one_case "$kind" > "$SANDBOX/$kind.log" 2>&1
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then PASS=$((PASS+1)); printf 'PASS %s\n' "$kind"
+  else FAIL=$((FAIL+1)); printf 'FAIL %s: %s\n' "$kind" "$SANDBOX/$kind.log"; fi
+done
+printf 'TEST_SUMMARY total=%s pass=%s fail=%s\n' "$((PASS+FAIL))" "$PASS" "$FAIL"
+if [ "$FAIL" -eq 0 ]; then rm -rf -- "$SANDBOX"; exit 0; fi
+printf 'sandbox kept: %s\n' "$SANDBOX"
+exit 1
