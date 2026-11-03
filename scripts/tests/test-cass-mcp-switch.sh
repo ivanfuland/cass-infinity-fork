@@ -17,7 +17,7 @@ TEMPLATE=${UNIT_TEMPLATE:-$TEMPLATES/cass-mcp.service.in}
 SANDBOX=${TEST_SANDBOX:-$(mktemp -d "${TMPDIR:-/tmp}/cc-cass-mcp-switch-test.XXXXXX")}
 mkdir -p "$SANDBOX"
 PASS=0; FAIL=0
-SECRET='sk-test-0123456789-not-a-real-key'
+FIXTURE_KEY_VALUE='synthetic-mcp-switch-fixture-value'
 DATA_DIR=/srv/cass/new-library
 BIND=127.0.0.1:8777
 printf 'sandbox=%s switch=%s template=%s\n' "$SANDBOX" "$SWITCH" "$TEMPLATE"
@@ -161,7 +161,7 @@ printf '%s' "$body" > "$out"
 exit 0
 SH
   chmod +x "$dir/bin/systemctl" "$dir/bin/curl" "$dir/fake-curl"
-  printf 'LITELLM_CASS_KEY=%s\n' "$SECRET" > "$dir/mcp.env"; chmod 600 "$dir/mcp.env"
+  printf 'LITELLM_CASS_KEY=%s\n' "$FIXTURE_KEY_VALUE" > "$dir/mcp.env"; chmod 600 "$dir/mcp.env"
   render "$dir/new.service" "$dir/mcp.env"
   proc_cmdline "$DATA_DIR"
   HOME_UNITS="$dir/home/.config/systemd/user"
@@ -266,7 +266,7 @@ one_case() (
       [ "$(grep -o '@@[A-Z_]*@@' "$TEMPLATE" | sort -u | tr '\n' ' ')" = \
         '@@API_CONFIG@@ @@BIND@@ @@CASS_BIN@@ @@CASS_MCP_BIN@@ @@DATA_DIR@@ @@EMBED_PROFILE@@ @@ENV_FILE@@ @@PUBLIC_ORIGIN@@ @@RERANK_PROFILE@@ ' ]
       absent -q '@@' "$unit"
-      absent -qF -- "$SECRET" "$unit"
+      absent -qF -- "$FIXTURE_KEY_VALUE" "$unit"
       absent -q 'LITELLM_CASS_KEY' "$unit"
       absent -Eq 'env[[:space:]]+-i' "$unit"
       grep -qx "EnvironmentFile=$dir/mcp.env" "$unit"
