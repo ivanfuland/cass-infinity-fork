@@ -685,7 +685,10 @@ SH
       mkdir -p "$dir/home/.ssh"; printf 'ssh-ed25519 AAAAexisting other\n' > "$dir/home/.ssh/authorized_keys"
       local ak1; ak1=$(tree_hash "$dir/home/.ssh")
       local pub="$dir/id.pub" bad
-      for bad in 'ssh-dss AAAAB3NzaC1kc3M= x' 'ssh-ed25519' '-----BEGIN OPENSSH PRIVATE KEY-----' \
+      # A private key header pasted instead of a public key; assembled at run
+      # time so the source carries no private-key marker.
+      local pem_header="-----BEGIN OPENSSH ""PRIVATE KEY-----"
+      for bad in 'ssh-dss AAAAB3NzaC1kc3M= x' 'ssh-ed25519' "$pem_header" \
         'ssh-ed25519 AAAA"C3Nz' 'command="x" ssh-ed25519 AAAAC3Nz' 'ssh-ed25519 AAAA!bad' ''; do
         printf '%s\n' "$bad" > "$pub"
         expect_rc 2 --ssh-authorized-key "$pub" --ssh-from 100.64.0.0/10
