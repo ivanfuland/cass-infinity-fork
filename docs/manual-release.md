@@ -28,12 +28,54 @@ stay in their existing external locations. `./cass status` shows the actual MCP
 executable running under the current user's service, when available. A package
 in `dist/` is not an active production version.
 
+For a new target machine, start with the requirements and transfer instructions
+below. Only the build machine needs the source repository.
+
+## Target machine requirements
+
+Use the prebuilt package on **Linux x86-64 with GNU libc**. Check
+`glibc_min` in the package's `release.env`; the b4ba5344 package requires
+glibc 2.34 or later. This package does not support Windows, macOS, ARM or
+musl-based Linux systems.
+
+| Operation | Target machine requirements |
+|-----------|-----------------------------|
+| Extract, install and run the programs | Bash 4.4 or later, GNU coreutils, GNU findutils (`find`), `tar`, `grep`, `ldd`, glibc, libgcc and zlib |
+| Configure an instance and ingest sessions | The preceding dependencies, Python 3 for the ingest entry's standard-library JSON parser, and binutils (`strings`) for the deployment self-check |
+| Install the MCP user service | The preceding dependencies, `sed`, `curl` and a working systemd user manager |
+| Publish MCP on a tailnet | An installed and authenticated Tailscale client, in addition to the MCP service requirements |
+
+For example, install the command-line dependencies on Debian or Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  bash coreutils findutils tar grep sed \
+  libc6 libc-bin libgcc-s1 zlib1g \
+  python3 binutils curl ca-certificates
+```
+
+The package manager command does not configure a systemd user manager or
+Tailscale. Run the installer as the normal user who owns the session logs.
+Use `sudo` only for system administration, such as installing these dependencies.
+The installer reports missing shared libraries and an insufficient glibc version;
+it does not install system packages.
+
+The target does not need a source checkout, Git, Rust, Node.js, Docker or Python
+packages from pip. This API-only package does not contain model weights or an
+ONNX runtime. With remote model APIs, the target does not need a GPU or CUDA.
+The machine hosting the model APIs has its own deployment requirements.
+
+Full deployment needs reachable embedding and rerank APIs. Prepare the complete
+URLs, both model names, both revision labels and a local API key file. Both
+profiles use the same key supplied by `--key-file`; the key file contains only
+the key, not an environment variable assignment. Non-loopback endpoints must
+use HTTPS. Agent clients are not installer dependencies, but ingestion needs
+their existing session logs. A new machine with no logs has no history to search.
+
 ## Build a package
 
-The package format (`cass-fork-release/2`) supports **Linux x86-64 with GNU libc**. Build on that platform.
-The target needs Bash 4.4 or later, GNU coreutils, GNU findutils (`find`), `tar`,
-`grep`, `ldd` and the runtime libraries required by the programs, including zlib. The installer reports missing libraries
-and an insufficient glibc version. It does not install system packages.
+Build format 2 packages on Linux x86-64 with GNU libc.
 
 The development machine needs Git, its normal Rust toolchain, gcc, binutils
 (`strings` and `readelf`) and `flock`. Commit the reviewed source changes, then run:
@@ -128,6 +170,11 @@ both `--version` commands. It stages and rechecks the full version, including
 program paths it prints. A repeated installation rejects the existing version,
 including files and dangling links. A failed stage remains unpublished.
 
+This installation mode does not create an instance, ingest sessions, start a
+service, create a `current` pointer or add the programs to `PATH`. Run a program
+through its printed absolute path. To configure an instance, continue with the
+full deployment procedure below.
+
 Packages built before format 2 (`cass-fork-release/1`, without `templates/`)
 carry their own older `install.sh`. `./cass install <directory>` runs that
 packaged installer, so such packages still install as before.
@@ -177,6 +224,96 @@ All paths must be absolute. The instance name must match `[a-z0-9][a-z0-9-]{0,31
 The prefix, the data directory and the configuration directory must be three
 separate trees: after resolving them with `realpath -m`, no two may be equal or
 nested.
+
+### New-machine example: configure first, ingest later
+
+After checksum verification and extraction, keep `release_id` set to the
+extracted directory name used in the transfer step. Replace the example API
+URLs, model names and revision labels below with the values for your model
+services. The installer does not discover those values from the API endpoint.
+
+If you do not already have a protected key file, create one interactively:
+
+```bash
+install -d -m 0700 "$HOME/.config/cass-secrets"
+(
+  umask 077
+  read -r -s -p 'Model API key: ' cass_model_key || exit 1
+  printf '\n' >&2
+  printf '%s\n' "$cass_model_key" > "$HOME/.config/cass-secrets/model-api.key"
+  chmod 0600 "$HOME/.config/cass-secrets/model-api.key"
+)
+```
+
+The prompt does not echo the key. The subshell discards the variable when it
+exits. The file must contain one non-empty key without spaces, quotes or
+backslashes. Pass its path to the installer, not the key value.
+
+Run this command from the directory containing the extracted package:
+
+```bash
+bash "$release_id/install.sh" \
+  --prefix "$HOME/.local/lib/cass-mcp" \
+  --deploy \
+  --instance main \
+  --data-dir "$HOME/.local/share/cass/main" \
+  --config-dir "$HOME/.config/cass-main" \
+  --embed-endpoint 'https://gateway.example.com/v1/embeddings' \
+  --embed-model 'YOUR_EMBED_MODEL' \
+  --embed-revision 'YOUR_EMBED_REVISION' \
+  --rerank-endpoint 'https://gateway.example.com/v1/rerank' \
+  --rerank-model 'YOUR_RERANK_MODEL' \
+  --rerank-revision 'YOUR_RERANK_REVISION' \
+  --key-env MODEL_API_KEY \
+  --key-file "$HOME/.config/cass-secrets/model-api.key" \
+  --mcp none \
+  --skip-first-round
+```
+
+This prepares the version, instance directories, configuration and ingest entry.
+It does not start ingestion or an MCP service. Check for exit code 0,
+`FIRST_ROUND_SKIPPED`, `SELF_CHECK_OK` and `DEPLOY_COMPLETE`. A skipped first
+round does not produce `SCHEDULE_READY`.
+
+When you are ready to ingest, run the same deployment command with
+`--skip-first-round` removed. The first round runs in the foreground and reads
+the executing user's supported Claude Code, Codex and Pi session logs. Its
+duration depends on the amount of history and model API throughput. Check for
+exit code 0, `FIRST_ROUND` with `"classification":"ok"`, `SCHEDULE_READY` and
+`DEPLOY_COMPLETE` before enabling periodic ingestion.
+
+### Optional MCP service and periodic ingestion
+
+For a systemd MCP service, replace `--mcp none` in the deployment command with:
+
+```bash
+--mcp install \
+--mcp-bind 127.0.0.1:18777 \
+--public-origin https://cass.example.com
+```
+
+Choose an unused loopback port and replace the example origin with the HTTPS
+origin clients will use. Configure the HTTPS route separately. For a Tailscale
+route, use that machine's actual tailnet HTTPS origin, including a non-default
+port, and add `--tailnet-serve`. The installer does not install or authenticate
+Tailscale. Without that flag, it does not create an HTTPS route.
+
+`systemctl --user` must work for the installing user. The installer enables
+`cass-mcp.service`; on a machine where it must run before login or after logout,
+an administrator must ensure that user lingering is enabled:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+Periodic ingestion is a separate setup step. This installer creates no cron job
+or systemd timer. An external scheduler, such as an Inngest app, can call the
+generated `cass-ingest-entry` every 30 minutes. A target called through SSH also
+needs a dedicated key and a restricted authorized-key entry. Installing this
+package does not deploy the scheduler, register a new target or enable periodic
+ingestion. Configure that integration only after the first round is ready.
+
+### Deployment steps and recovery
 
 1. **Version.** The version directory is published as usual. If it already
    exists, it counts as done only when every file equals the package byte for
