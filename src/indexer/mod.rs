@@ -7988,6 +7988,7 @@ fn spawn_connector_producer(
                 .local_root_plans
                 .get(name)
                 .and_then(|plans| plans.configured_for(root))
+                && (plan.meta.watermarks_enabled || plan_enforces_ownership(plan))
             {
                 let (outcome, root_succeeded, root_disconnected) = scan_one_root_for_producer(
                     conn.as_ref(),
@@ -9109,7 +9110,9 @@ fn run_batch_index_with_connector_factories(
                         // constraint 9) takes the per-root path; exempt roots
                         // (`full_scan` source) fall through to the baseline
                         // full-root scan.
-                        if let Some(plan) = plans.configured_for(root) {
+                        if let Some(plan) = plans.configured_for(root)
+                            && (plan.meta.watermarks_enabled || plan_enforces_ownership(plan))
+                        {
                             let (outcome, root_succeeded) = batch_scan_one_root(
                                 conn.as_ref(),
                                 name,
@@ -9546,6 +9549,28 @@ fn prepare_root_ownership(
             .map_err(|error| error.to_string())
     };
     PreparedRootOwnership { sources, partition }
+}
+
+/// Whether `plan` carries an ownership partition that actually observed claims
+/// or failed discovery and must therefore gate capture and scanning.
+///
+/// When `partition` succeeded with zero claims across all connectors (for
+/// example, a mock or legacy connector that does not override
+/// `discover_source_files` on a home or unregistered root), there is nothing
+/// to arbitrate, so falling back to the un-arbitrated capture/scan path avoids
+/// silently short-circuiting connectors without discovery implementations.
+fn plan_enforces_ownership(plan: &LocalRootPlan) -> bool {
+    match &plan.ownership {
+        Some(prepared) => match &prepared.partition {
+            Ok(partition) => {
+                !partition.decisions.is_empty()
+                    || !partition.outside_claims.is_empty()
+                    || prepared.sources.values().any(|sources| !sources.is_empty())
+            }
+            Err(_) => true,
+        },
+        None => false,
+    }
 }
 
 fn physical_carriers_cover_source(
@@ -10231,6 +10256,7 @@ fn run_local_root_scan_inner(
         );
     }
 
+    let ownership_enforced = plan_enforces_ownership(plan);
     let (mut ctx, scanned_files) = if plan.watermark.is_some() {
         let scanned: Vec<(String, i64, i64)> = metadata_selected
             .iter()
@@ -10253,7 +10279,7 @@ fn run_local_root_scan_inner(
             .iter()
             .map(|(relative, size, mtime, _)| (relative.clone(), *size, *mtime))
             .collect();
-        let ctx = if plan.ownership.is_some()
+        let ctx = if ownership_enforced
             && source_ownership::is_arbitrated_connector(connector_name)
         {
             let file_roots: Vec<ScanRoot> = candidates
@@ -10271,7 +10297,7 @@ fn run_local_root_scan_inner(
         (ctx, scanned)
     };
 
-    if plan.ownership.is_some() && connector_name == "gemini" && plan.watermark.is_some() {
+    if ownership_enforced && connector_name == "gemini" && plan.watermark.is_some() {
         if let Some(root) = ctx.scan_roots.first() {
             ctx.data_dir = root.path.clone();
         }
@@ -10279,7 +10305,7 @@ fn run_local_root_scan_inner(
     let selected_sources: Vec<_> = discovered.iter().filter(|source| {
         plan.watermark.is_none() || metadata_selected.iter().any(|(_, _, _, path)| path == &source.source_path)
     }).cloned().collect();
-    if plan.ownership.is_some() {
+    if ownership_enforced {
         if selected_sources.is_empty() {
             if let Some(error) = ownership_error {
                 return (
@@ -10308,7 +10334,7 @@ fn run_local_root_scan_inner(
 
     let mut fatal: Option<anyhow::Error> = None;
     let mut callback = |conversation: NormalizedConversation| {
-        if plan.ownership.is_some() && !physical_carriers_cover_source(&selected_sources, &conversation.source_path) {
+        if ownership_enforced && !physical_carriers_cover_source(&selected_sources, &conversation.source_path) {
             return Err(anyhow::anyhow!("source_ownership_unapproved_carrier"));
         }
         if should_skip_active_session_source(
@@ -16538,10 +16564,22 @@ fn route_fixed_watch(
             } else {
                 ScanRoot::local(native_root.clone())
             };
+            covered = true;
             if !seen_legacy.insert((*kind, read_root.path.clone(), false)) {
+                if let Some(existing) = route.legacy.iter_mut().find(|trigger| {
+                    trigger.kind == *kind && trigger.root.path == read_root.path && trigger.native
+                }) {
+                    existing.min_ts = match (existing.min_ts, modified_ms) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    existing.max_ts = match (existing.max_ts, modified_ms) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                }
                 continue;
             }
-            covered = true;
             route.legacy.push(LegacyWatchTrigger {
                 kind: *kind,
                 root: read_root,
