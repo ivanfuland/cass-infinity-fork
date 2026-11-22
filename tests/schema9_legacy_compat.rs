@@ -711,10 +711,47 @@ fn schema9_legacy_mirror_prune_protects_absolute_excluded_and_staged_blobs() {
 #[test]
 fn schema9_legacy_staged_source_input_is_not_skipped_by_incremental_scan() {
     let fixture = LegacyFixture::new();
-    let claude_root = fixture.home().join(".claude");
-    let session_path = claude_root.join("projects/legacy-staged/session.jsonl");
-    fs::create_dir_all(session_path.parent().unwrap()).expect("mkdir claude project");
+    let claude_projects_root = fixture.home().join(".claude/projects");
+    let seeded_path = claude_projects_root.join("seeded-baseline/seed.jsonl");
+    let session_path = claude_projects_root.join("legacy-staged/session.jsonl");
+    fs::create_dir_all(seeded_path.parent().unwrap()).expect("mkdir seeded project");
+    fs::create_dir_all(session_path.parent().unwrap()).expect("mkdir legacy-staged project");
 
+    // 1. Seed a non-empty DB via a real initial `cass index` so the subsequent run is
+    //    a genuine incremental scan backed by real `scan_watermarks` / `scan_file_state`.
+    let seeded_body = format!(
+        "{}\n{}\n",
+        json!({
+            "type": "user",
+            "timestamp": "2026-01-05T00:00:00.000Z",
+            "uuid": "seed-u0",
+            "sessionId": "seeded-baseline-session",
+            "cwd": "/synthetic/seeded",
+            "message": {"role": "user", "content": "already indexed baseline prompt"}
+        }),
+        json!({
+            "type": "assistant",
+            "timestamp": "2026-01-05T00:00:01.000Z",
+            "uuid": "seed-a1",
+            "sessionId": "seeded-baseline-session",
+            "cwd": "/synthetic/seeded",
+            "message": {"role": "assistant", "content": "already indexed baseline reply"}
+        }),
+    );
+    fs::write(&seeded_path, seeded_body.as_bytes()).expect("write seeded session");
+    let data_dir_str = fixture.data_dir().to_string_lossy().into_owned();
+    let seed_out = fixture.run_cass(&["index", "--data-dir", &data_dir_str, "--json"]);
+    assert_eq!(
+        seed_out.status.code(),
+        Some(0),
+        "seed index failed: stderr={}",
+        String::from_utf8_lossy(&seed_out.stderr)
+    );
+
+    // 2. Write the unfinished session file and simulate an interrupted Scheme B
+    //    `PostCommitPendingRecovery`: `scan_watermarks` & `scan_file_state` claim the
+    //    file is already up-to-date under the REAL `root_id` written by `cass index`,
+    //    NO conversation row exists for it yet, and `source_inputs` holds `state='staged'`.
     let session_body = format!(
         "{}\n{}\n",
         json!({
@@ -747,14 +784,19 @@ fn schema9_legacy_staged_source_input_is_not_skipped_by_incremental_scan() {
     )
     .expect("mtime i64");
 
-    let canonical_claude_root = fs::canonicalize(&claude_root).expect("canonical claude root");
-    let root_id = format!("home:claude:{}", canonical_claude_root.display());
+    let canonical_claude_projects_root =
+        fs::canonicalize(&claude_projects_root).expect("canonical claude projects root");
 
-    // Build a Schema 9 legacy DB where `scan_watermarks` & `scan_file_state` claim the
-    // file is ALREADY up-to-date, NO conversation row exists yet, and `source_inputs`
-    // records the file as `state = 'staged'` (simulating an interrupted Scheme B commit).
     let storage = FrankenStorage::open(&fixture.db_path()).expect("open storage");
     attach_legacy_source_tables(&storage);
+    let root_id: String = storage
+        .raw()
+        .query_row_map(
+            "SELECT root_id FROM scan_watermarks WHERE connector = 'claude' LIMIT 1",
+            &[],
+            |r| r.get_typed(0),
+        )
+        .expect("read real claude root_id from scan_watermarks");
     storage
         .set_scan_watermark(&root_id, "claude", mtime_ms + 60_000)
         .expect("seed future scan watermark");
@@ -762,7 +804,7 @@ fn schema9_legacy_staged_source_input_is_not_skipped_by_incremental_scan() {
         .upsert_scan_file_state(
             &root_id,
             "claude",
-            "projects/legacy-staged/session.jsonl",
+            "legacy-staged/session.jsonl",
             size,
             mtime_ms,
             mtime_ms + 60_000,
@@ -772,8 +814,8 @@ fn schema9_legacy_staged_source_input_is_not_skipped_by_incremental_scan() {
         storage.raw(),
         77,
         "claude_code",
-        canonical_claude_root.to_str().unwrap(),
-        "projects/legacy-staged/session.jsonl",
+        canonical_claude_projects_root.to_str().unwrap(),
+        "legacy-staged/session.jsonl",
         b"{}",
         "staged",
     );
@@ -781,7 +823,6 @@ fn schema9_legacy_staged_source_input_is_not_skipped_by_incremental_scan() {
 
     // Run normal incremental `cass index` (NOT `--full`). Because `source_inputs` has
     // `state = 'staged'`, Plan A must NOT skip the file on matching `(size, mtime)`.
-    let data_dir_str = fixture.data_dir().to_string_lossy().into_owned();
     let index_out = fixture.run_cass(&["index", "--data-dir", &data_dir_str, "--json"]);
     assert_eq!(
         index_out.status.code(),

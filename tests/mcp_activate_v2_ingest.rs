@@ -2615,3 +2615,165 @@ fn mcp_activate_v2_r2_round3_regressions() {
         );
     }
 }
+
+#[test]
+fn mcp_activate_v2_r2_round4_regressions() {
+    let fixture = Fixture::new();
+    let case = CaseDir::new("mcp_activate_v2_plan_a", "r2-round4-regressions");
+
+    const B1_CLAUDE_EXT_SECRET: &str = "r2_4_b1_claude_extension_recall_secret";
+    const B2_CODEX_CLI_SECRET: &str = "r2_4_b2_codex_tool_call_blocks_cli_secret";
+    const B2_CODEX_CTX_SECRET: &str = "r2_4_b2_codex_tool_call_blocks_ctx_secret";
+    const B2_CODEX_MCP_SECRET: &str = "r2_4_b2_codex_tool_call_blocks_mcp_secret";
+    const NB2_RECALL_SECRET: &str = "r2_4_nb2_image_leading_recall_secret";
+    const NB2_KEEP_IMAGE_ALT: &str = "r2_4_nb2_keep_image_alt_text";
+
+    // 1. B1: Multi-line `.claude` whole-document session where the last `messages[]`
+    //    element sits on a single trailing-comma-free line with `"type": "assistant"`.
+    //    Must parse as JSON document (not fall into JSONL line loop).
+    let last_line = json!({
+        "type": "assistant",
+        "uuid": "cl-last-1",
+        "timestamp": "2026-01-11T00:00:04.000Z",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "claude extension prose stays"}]},
+        "role": "assistant",
+        "content": "claude extension prose stays"
+    })
+    .to_string();
+    let claude_ext_doc = format!(
+        "{{\n  \"title\": \"Claude Extension Whole Doc\",\n  \"messages\": [\n    {},\n    {},\n    {},\n    {}\n  ]\n}}\n",
+        json!({"role": "user", "timestamp": "2026-01-11T00:00:00.000Z", "content": "dot claude prompt stays"}),
+        json!({
+            "role": "assistant",
+            "timestamp": "2026-01-11T00:00:01.000Z",
+            "content": [{"type": "tool_use", "id": "toolu_dot_claude", "name": "mcp__cass-mcp__cass_search", "input": {"query": "dot-claude"}}]
+        }),
+        json!({
+            "role": "tool_result",
+            "timestamp": "2026-01-11T00:00:02.000Z",
+            "tool_use_id": "toolu_dot_claude",
+            "content": wrapper(RecallTool::Search, &native_search_value(B1_CLAUDE_EXT_SECRET))
+        }),
+        last_line,
+    );
+    let claude_ext_path = fixture.home().join(".claude/projects/r2-4-b1/session.claude");
+    std::fs::create_dir_all(claude_ext_path.parent().unwrap()).unwrap();
+    std::fs::write(&claude_ext_path, claude_ext_doc).unwrap();
+
+    // 2. B2: Codex whole-document `rollout-*.json` with `role: "tool_call"` carrying
+    //    OpenAI-style `content: [{"type": "tool_use", "call_id": ..., "arguments": ...}]`.
+    let codex_tc_blocks_doc = json!({
+        "id": "codex-r2-4-b2",
+        "items": [
+            {"id": "u0", "role": "user", "content": "codex tool_call content blocks prompt stays"},
+            {
+                "id": "c1",
+                "role": "tool_call",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "call_id": "call_r2_4_cli",
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"cass search \\\"alpha\\\" --recall\"}"
+                    },
+                    {
+                        "type": "tool_use",
+                        "call_id": "call_r2_4_ctx",
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"cat /synthetic/ws/CLAUDE.local.md\"}"
+                    },
+                    {
+                        "type": "tool_use",
+                        "call_id": "call_r2_4_mcp",
+                        "name": "mcp__cass-mcp__cass_search",
+                        "arguments": "{\"query\":\"b2-mcp\"}"
+                    }
+                ]
+            },
+            {"id": "r1", "role": "tool_result", "call_id": "call_r2_4_cli", "content": wrapper(RecallTool::Search, &native_search_value(B2_CODEX_CLI_SECRET))},
+            {"id": "r2", "role": "tool_result", "call_id": "call_r2_4_ctx", "content": B2_CODEX_CTX_SECRET},
+            {"id": "r3", "role": "tool_result", "call_id": "call_r2_4_mcp", "content": wrapper(RecallTool::Search, &native_search_value(B2_CODEX_MCP_SECRET))}
+        ]
+    });
+    let codex_b2_path = fixture.home().join(".codex/sessions/2026/06/05/rollout-r2-4-b2.json");
+    std::fs::create_dir_all(codex_b2_path.parent().unwrap()).unwrap();
+    std::fs::write(&codex_b2_path, serde_json::to_string_pretty(&codex_tc_blocks_doc).unwrap() + "\n").unwrap();
+
+    // 3. NB2: Claude `.json` `tool_result` with leading `image` block + `text` block.
+    //    Must redact the text recall body while preserving the image block's `text` metadata.
+    let claude_img_doc = json!({
+        "title": "Claude Leading Image Tool Result",
+        "messages": [
+            {"role": "user", "timestamp": "2026-01-11T01:00:00.000Z", "content": "leading image prompt stays"},
+            {
+                "role": "assistant",
+                "timestamp": "2026-01-11T01:00:01.000Z",
+                "content": [{"type": "tool_use", "id": "toolu_nb2_img", "name": "mcp__cass-mcp__cass_search", "input": {"query": "img"}}]
+            },
+            {
+                "role": "tool_result",
+                "timestamp": "2026-01-11T01:00:02.000Z",
+                "tool_use_id": "toolu_nb2_img",
+                "content": [
+                    {"type": "image", "source": {"type": "base64"}, "text": NB2_KEEP_IMAGE_ALT},
+                    {"type": "text", "text": wrapper(RecallTool::Search, &native_search_value(NB2_RECALL_SECRET))}
+                ]
+            }
+        ]
+    });
+    let claude_img_path = fixture.home().join(".claude/projects/r2-4-nb2/img_tr.json");
+    std::fs::create_dir_all(claude_img_path.parent().unwrap()).unwrap();
+    std::fs::write(&claude_img_path, serde_json::to_string_pretty(&claude_img_doc).unwrap() + "\n").unwrap();
+
+    let output = fixture.index(&[], &[]);
+    write_evidence(&case, &["index", "--json"], &[], &output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "r2-round4 index failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("index json");
+    assert_eq!(report["success"], json!(true));
+    assert_eq!(report["recall_uncovered_total"], json!(0), "report={report}");
+    assert_eq!(report["indexing_stats"]["event_align_failed"], json!(0), "report={report}");
+
+    let db = fixture.open_db();
+    assert_eq!(marker_rule_versions(&db).len(), 5, "all 5 B1/B2/NB2 tool results must be excluded");
+    let secrets = [
+        B1_CLAUDE_EXT_SECRET,
+        B2_CODEX_CLI_SECRET,
+        B2_CODEX_CTX_SECRET,
+        B2_CODEX_MCP_SECRET,
+        NB2_RECALL_SECRET,
+    ];
+    assert_excluded_rows_clean(&db, &secrets, "r2-round4-regressions");
+    let bodies = message_contents(&db);
+    for secret in secrets {
+        assert!(
+            !bodies.iter().any(|b| b.contains(secret)),
+            "secret {secret:?} leaked into messages.content"
+        );
+    }
+
+    // Verify NB2 preserved the leading `image` block's `text` metadata in decoded extra.
+    let img_extra_rows: Vec<(Option<String>, Option<Vec<u8>>)> = db
+        .query_all_map(
+            "SELECT m.extra_json, m.extra_bin FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.source_path LIKE '%img_tr.json' AND m.excluded IS NOT NULL",
+            &[],
+            |r| Ok((r.get_typed(0).ok(), r.get_typed(1).ok())),
+        )
+        .expect("query img_tr excluded extra");
+    assert_eq!(img_extra_rows.len(), 1);
+    let decoded = decode_extra(img_extra_rows[0].0.clone(), img_extra_rows[0].1.clone()).to_string();
+    assert!(
+        decoded.contains(NB2_KEEP_IMAGE_ALT),
+        "leading image block metadata must survive in extra: {decoded}"
+    );
+    assert!(
+        !decoded.contains(NB2_RECALL_SECRET),
+        "recall secret must not survive in img_tr extra: {decoded}"
+    );
+}

@@ -397,7 +397,7 @@ fn is_json_document_path(blob_path: &Path) -> bool {
     blob_path
         .extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("claude"))
 }
 
 fn claude_code_document_events(doc: &serde_json::Value, blob_path: &Path) -> Vec<BlobEvent> {
@@ -472,13 +472,19 @@ fn claude_code_document_events(doc: &serde_json::Value, blob_path: &Path) -> Vec
                         parsed.push(RawBlock { index: i as u32, kind, tool_use_id, tool_name, args });
                     }
                     if role == "tool_result" && !parsed.iter().any(|b| b.kind == BlockKind::ToolResult) {
-                        // Whole-document `.json` `role: "tool_result"` items with multi-part
-                        // text/string arrays project to ONE `NormalizedMessage`. Keep ONE
-                        // `ToolResult` block so id-less R4 block location sees a single
-                        // unambiguous target (instead of N sibling candidates).
+                        // Whole-document `.json`/`.claude` `role: "tool_result"` items with
+                        // multi-part text/string arrays project to ONE `NormalizedMessage`.
+                        // Keep ONE `ToolResult` block anchored on the first rendered text
+                        // element (avoiding leading non-text blocks such as `image`) so
+                        // id-less R4 block location sees a single unambiguous target.
+                        let target_idx = parsed
+                            .iter()
+                            .find(|b| b.kind == BlockKind::Text)
+                            .map(|b| b.index)
+                            .unwrap_or(0);
                         parsed.clear();
                         parsed.push(RawBlock {
-                            index: 0,
+                            index: target_idx,
                             kind: BlockKind::ToolResult,
                             tool_use_id: item_tool_id.clone(),
                             tool_name: None,
@@ -727,20 +733,22 @@ fn codex_document_events(doc: &serde_json::Value) -> Vec<BlobEvent> {
                 .or_else(|| item.get("arguments"))
                 .map(parse_tool_args_value);
             let blocks = match role {
-                "tool_result" => vec![RawBlock {
-                    index: 0,
-                    kind: BlockKind::ToolResult,
-                    tool_use_id,
-                    tool_name: None,
-                    args: None,
-                }],
-                "tool_call" => vec![RawBlock {
-                    index: 0,
-                    kind: BlockKind::ToolUse,
-                    tool_use_id,
-                    tool_name,
-                    args,
-                }],
+                "tool_result" => {
+                    let target_idx = match content_val {
+                        Some(serde_json::Value::Array(arr)) => arr
+                            .iter()
+                            .position(|b| b.is_string() || is_joined_text_part(b))
+                            .unwrap_or(0) as u32,
+                        _ => 0,
+                    };
+                    vec![RawBlock {
+                        index: target_idx,
+                        kind: BlockKind::ToolResult,
+                        tool_use_id,
+                        tool_name: None,
+                        args: None,
+                    }]
+                }
                 _ => {
                     let mut tool_use_blocks = Vec::new();
                     if let Some(serde_json::Value::Array(arr)) = content_val {
