@@ -14,8 +14,8 @@
 use coding_agent_search::storage::api::{Conn, Profile, Value};
 use coding_agent_search::storage::legacy_messages::{
     CODE_EXTRA_DECODE_FAILED, CODE_SCHEMA_SHAPE_INVALID, CODE_SCHEMA_VERSION_MISSING,
-    CODE_SCHEMA_VERSION_UNSUPPORTED, CODE_SOURCE_FACTS_UNAVAILABLE, LEGACY_SCHEMA_MAX,
-    LEGACY_SCHEMA_MIN, LegacyIoKind, LegacyReadError, read_legacy_messages_ro,
+    CODE_SCHEMA_VERSION_UNSUPPORTED, LEGACY_SCHEMA_MAX, LEGACY_SCHEMA_MIN, LegacyIoKind,
+    LegacyReadError, read_legacy_messages_ro,
 };
 use coding_agent_search::storage::testing::open_test_writer;
 use serde_json::json;
@@ -470,20 +470,8 @@ fn l3_rejects_files_that_are_not_databases_and_absent_paths() {
 }
 
 // ---------------------------------------------------------------------------
-// L4 — source facts are never available, and reads never write
+// L4 — reads never write
 // ---------------------------------------------------------------------------
-
-#[test]
-fn l4_source_facts_unavailable_even_on_an_empty_archive() {
-    let (_dir, path) = temp_path("l4-empty");
-    build_fixture(&path, SCHEMA7_DDL, LEGACY_SCHEMA_MIN, |_| {});
-
-    let reader = read_legacy_messages_ro(&path).expect("open legacy reader");
-    assert!(reader.fetch_messages(1).expect("empty fetch").is_empty(), "fixture is empty");
-    let err = reader.read_source_facts().expect_err("source facts must be unavailable");
-    assert_eq!(err, LegacyReadError::SourceFactsUnavailable);
-    assert_eq!(err.code(), CODE_SOURCE_FACTS_UNAVAILABLE);
-}
 
 #[test]
 fn l4_reads_leave_the_archive_byte_identical() {
@@ -503,7 +491,6 @@ fn l4_reads_leave_the_archive_byte_identical() {
     let reader = read_legacy_messages_ro(&path).expect("open legacy reader");
     assert_eq!(reader.fetch_messages(1).expect("fetch").len(), 1);
     assert_eq!(reader.schema_version(), LEGACY_SCHEMA_MIN);
-    assert_eq!(reader.read_source_facts().expect_err("still unavailable").code(), CODE_SOURCE_FACTS_UNAVAILABLE);
     drop(reader);
 
     assert_eq!(sha256_of(&path), before_bytes, "the archive's bytes must not change");

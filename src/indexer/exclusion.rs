@@ -535,20 +535,18 @@ fn claude_code_blob_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<Bl
         });
     }
     let mut events = Vec::new();
-    let mut parsed_lines = 0usize;
     for (idx, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        parsed_lines += 1;
         let mut line_events = Vec::new();
         push_claude_code_events(&value, idx + 1, &mut line_events);
         for event in line_events {
             events.push(BlobEvent { event, raw_record: value.clone() });
         }
     }
-    if parsed_lines == 0
+    if events.is_empty()
         && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text)
     {
         return Ok(claude_code_document_events(&doc, blob_path));
@@ -749,20 +747,18 @@ fn codex_blob_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<BlobEven
         });
     }
     let mut events = Vec::new();
-    let mut parsed_lines = 0usize;
     for (idx, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        parsed_lines += 1;
         let mut line_events = Vec::new();
         push_codex_events(&value, idx + 1, &mut line_events);
         for event in line_events {
             events.push(BlobEvent { event, raw_record: value.clone() });
         }
     }
-    if parsed_lines == 0
+    if events.is_empty()
         && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text)
     {
         return Ok(codex_document_events(&doc));

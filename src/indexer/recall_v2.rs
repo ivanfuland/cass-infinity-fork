@@ -1,7 +1,7 @@
 //! Ticket 05 / Task10: v2 MCP recall judgment, source extraction and the
 //! source-aware apply entry.
 //!
-//! `source_ingest` applies this module as the default rule epoch (2) through
+//! The standard indexing pipeline applies this module as the default rule epoch (2) through
 //! [`decide_for_record`], [`apply_with_redaction`] and [`parse_result`]. The
 //! legacy `exclusion::decide` / `exclusion::apply_with_redaction` path, its
 //! alias table and its `rule_version = 1` markers remain unchanged for the v1

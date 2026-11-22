@@ -12,15 +12,15 @@
 //! uncovered matrix is five literal inputs (four reasons, one of them twice).
 //! No expectation is read back from the candidate's own output.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use coding_agent_search::raw_mirror::manifest_views;
 use coding_agent_search::recall_output::{self, RecallTool};
 use coding_agent_search::storage::api::{Conn, OpenOptions};
-use coding_agent_search::storage::source_facts::decode_expected_manifest_header;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -45,15 +45,23 @@ fn cass_bin() -> String {
 fn result_root() -> PathBuf {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let root = std::env::var("CASS_MCP_T10_RESULT_ROOT")
-            .expect("CASS_MCP_T10_RESULT_ROOT must be set for every Task10 run");
-        let path = PathBuf::from(root);
-        assert!(
-            !path.exists(),
-            "CASS_MCP_T10_RESULT_ROOT must not exist before the first run: {}",
-            path.display()
-        );
-        std::fs::create_dir_all(&path).expect("create the result root");
+        if let Ok(root) = std::env::var("CASS_MCP_T10_RESULT_ROOT") {
+            let path = PathBuf::from(root);
+            assert!(
+                !path.exists(),
+                "CASS_MCP_T10_RESULT_ROOT must not exist before the first run: {}",
+                path.display()
+            );
+            std::fs::create_dir_all(&path).expect("create the result root");
+            return path;
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("cass-mcp-t10-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create fallback result root");
         path
     })
     .clone()
@@ -99,11 +107,6 @@ impl Fixture {
         std::fs::create_dir_all(root.path().join("home")).expect("mkdir home");
         std::fs::create_dir_all(root.path().join("data")).expect("mkdir data");
         std::fs::create_dir_all(root.path().join("config")).expect("mkdir config");
-        std::fs::write(
-            root.path().join("fixed-safety.toml"),
-            include_bytes!("../config/excluded_context_paths.toml"),
-        )
-        .expect("write the fixed safety copy");
         Self { root }
     }
 
@@ -1023,28 +1026,59 @@ fn build_native_world(fixture: &Fixture) -> NativeWorld {
 // Readers
 // ---------------------------------------------------------------------------
 
-fn complete_input_code_versions(db: &Conn) -> Vec<String> {
-    let rows: Vec<Vec<u8>> = db
+fn decode_extra(text: Option<String>, binary: Option<Vec<u8>>) -> Value {
+    if let Some(text) = text {
+        serde_json::from_str(&text).expect("decode extra_json")
+    } else if let Some(binary) = binary {
+        rmp_serde::from_slice(&binary).expect("decode extra_bin")
+    } else {
+        Value::Null
+    }
+}
+
+/// Assert every excluded row has zero recall envelope or body residue in BOTH
+/// `content` and its decoded `extra_json` / `extra_bin`.
+fn assert_excluded_rows_clean(db: &Conn, forbidden_needles: &[&str], label: &str) {
+    let rows: Vec<(i64, String, Option<String>, Option<Vec<u8>>)> = db
         .query_all_map(
-            "SELECT expected_manifest_bin FROM source_inputs ORDER BY id",
+            "SELECT id, content, extra_json, extra_bin FROM messages WHERE excluded IS NOT NULL ORDER BY id",
             &[],
-            |row| row.get_typed::<Vec<u8>>(0),
+            |row| {
+                Ok((
+                    row.get_typed::<i64>(0)?,
+                    row.get_typed::<String>(1)?,
+                    row.get_typed::<Option<String>>(2)?,
+                    row.get_typed::<Option<Vec<u8>>>(3)?,
+                ))
+            },
         )
-        .expect("query the manifests");
-    rows.into_iter()
-        .map(|bytes| {
-            let (_manifest, safety) =
-                decode_expected_manifest_header(&bytes).expect("decode the manifest header");
-            safety.code_version().to_string()
-        })
-        .collect()
+        .expect("query excluded rows with extra");
+    assert!(
+        !rows.is_empty(),
+        "{label}: expected at least one excluded row"
+    );
+    for (id, content, extra_json, extra_bin) in rows {
+        let extra = decode_extra(extra_json, extra_bin);
+        let extra_text = extra.to_string();
+        for (surface, text) in [("content", content.as_str()), ("extra", extra_text.as_str())] {
+            assert!(
+                !text.contains("<cass_recall "),
+                "{label}: excluded message {id} retained <cass_recall envelope in {surface}: {text}"
+            );
+            for needle in forbidden_needles {
+                assert!(
+                    !text.contains(needle),
+                    "{label}: excluded message {id} retained forbidden recall body {needle:?} in {surface}: {text}"
+                );
+            }
+        }
+    }
 }
 
 /// Every exclusion marker's `rule_version`, in message order.
 ///
 /// `messages.excluded` is stored as SQLite JSONB, so the marker is read back
-/// through SQLite's own `json()` decoder (the same read
-/// `tests/mcp_restore_rule_epochs.rs` uses). The stored format is not touched.
+/// through SQLite's own `json()` decoder. The stored format is not touched.
 fn marker_rule_versions(db: &Conn) -> Vec<u64> {
     let rows: Vec<String> = db
         .query_all_map(
@@ -1141,18 +1175,7 @@ fn assert_activation_json(report: &Value, label: &str) {
 fn assert_activation_db(fixture: &Fixture, world: &World, label: &str) {
     let db = fixture.open_db();
 
-    // 10-AC1: the producer wrote epoch 2, and every marker is rule version 2.
-    let versions = complete_input_code_versions(&db);
-    assert!(
-        !versions.is_empty(),
-        "{label}: the inputs carry expected-manifest headers"
-    );
-    for version in &versions {
-        assert!(
-            version.starts_with("cass-source-exclusion/2+"),
-            "{label}: the producer's code version is epoch 2: {version}"
-        );
-    }
+    // 10-AC1: every exclusion marker is rule version 2 under Plan A.
     let markers = marker_rule_versions(&db);
     assert_eq!(
         markers.len(),
@@ -1165,6 +1188,17 @@ fn assert_activation_db(fixture: &Fixture, world: &World, label: &str) {
             "{label}: every exclusion marker is rule version 2"
         );
     }
+    assert_excluded_rows_clean(
+        &db,
+        &[
+            "task10 supported hit body",
+            "task10 before",
+            "task10 target",
+            "/synthetic/t10/list.jsonl",
+            "/synthetic/t10/t.jsonl",
+        ],
+        label,
+    );
 
     // At least two agents really produced markers (not a pure-function claim).
     let by_agent: Vec<(String, i64)> = db
@@ -1458,18 +1492,6 @@ fn assert_native_activation_json(report: &Value, label: &str) {
 fn assert_native_activation_db(fixture: &Fixture, world: &NativeWorld, label: &str) {
     let db = fixture.open_db();
 
-    let versions = complete_input_code_versions(&db);
-    assert!(
-        !versions.is_empty(),
-        "{label}: the inputs carry expected-manifest headers"
-    );
-    for version in &versions {
-        assert!(
-            version.starts_with("cass-source-exclusion/2+"),
-            "{label}: the producer's code version is epoch 2: {version}"
-        );
-    }
-
     let mut by_id = std::collections::BTreeMap::new();
     for marker in marker_json(&db) {
         let id = marker["anchor"]["tool_call_id"]
@@ -1588,6 +1610,22 @@ fn assert_native_activation_db(fixture: &Fixture, world: &NativeWorld, label: &s
             "{label}: the excluded body of {id} is not retained"
         );
     }
+    assert_excluded_rows_clean(
+        &db,
+        &[
+            NATIVE_CLAUDE_SEARCH_BODY,
+            NATIVE_CODEX_SEARCH_BODY,
+            NATIVE_CLAUDE_CONTROL_BODY,
+            NATIVE_CODEX_CONTROL_BODY,
+            NATIVE_CLAUDE_BARE_BODY,
+            NATIVE_CODEX_BARE_BODY,
+            "t18a expand before",
+            "t18a expand target",
+            "/synthetic/t18a/list.jsonl",
+            "/synthetic/t18a/t.jsonl",
+        ],
+        label,
+    );
     for text in [
         NATIVE_CLAUDE_PROSE,
         NATIVE_CODEX_PROSE,
@@ -1689,4 +1727,404 @@ fn mcp_activate_v2_native_missing_args() {
             "report": report,
         }),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Plan A E2E reinforcements:
+// 1. Claude object-form `toolUseResult.stdout` cleanup
+// 2. Multi-line `.json` whole-document session cleanup
+// 3. Resident `--watch` uncovered-recall diagnostics across Claude & Codex
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mcp_activate_v2_claude_object_tool_use_result_stdout() {
+    let fixture = Fixture::new();
+    let case = CaseDir::new("mcp_activate_v2_plan_a", "claude-object-tool-use-result");
+
+    const HIT_BODY: &str = "t10 object toolUseResult stdout secret recall body";
+    let recall_envelope = wrapper(RecallTool::Search, &native_search_value(HIT_BODY));
+    let lines = vec![
+        json!({
+            "type": "user",
+            "timestamp": "2026-01-04T00:00:00.000Z",
+            "uuid": "obj-u0",
+            "message": {"role": "user", "content": "t10 object toolUseResult user question"}
+        }),
+        json!({
+            "type": "assistant",
+            "timestamp": "2026-01-04T00:00:01.000Z",
+            "uuid": "obj-a1",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_obj_stdout", "name": "Bash",
+                 "input": {"command": "cass search \"object stdout query\" --recall"}}
+            ]}
+        }),
+        json!({
+            "type": "user",
+            "timestamp": "2026-01-04T00:00:02.000Z",
+            "uuid": "obj-u2",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_obj_stdout", "content": recall_envelope}
+            ]},
+            "toolUseResult": {
+                "stdout": recall_envelope,
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false
+            }
+        }),
+        json!({
+            "type": "assistant",
+            "timestamp": "2026-01-04T00:00:03.000Z",
+            "uuid": "obj-a3",
+            "message": {"role": "assistant", "content": "t10 object toolUseResult answer"}
+        }),
+    ];
+    let body = jsonl(&lines);
+    let path = fixture
+        .home()
+        .join(".claude/projects/t10-obj/session.jsonl");
+    std::fs::create_dir_all(path.parent().expect("claude obj parent")).expect("mkdir");
+    std::fs::write(&path, body.as_bytes()).expect("write session");
+
+    let output = fixture.index(&[], &[]);
+    write_evidence(&case, &["index", "--json"], &[], &output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "object toolUseResult index failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("index json");
+    assert_eq!(report["success"], json!(true));
+    assert_eq!(report["recall_uncovered_total"], json!(0));
+
+    let db = fixture.open_db();
+    assert_eq!(marker_rule_versions(&db), vec![2]);
+    assert_excluded_rows_clean(&db, &[HIT_BODY], "claude-object-tool-use-result");
+
+    let extra_rows: Vec<(Option<String>, Option<Vec<u8>>)> = db
+        .query_all_map(
+            "SELECT extra_json, extra_bin FROM messages WHERE excluded IS NOT NULL",
+            &[],
+            |row| {
+                Ok((
+                    row.get_typed::<Option<String>>(0)?,
+                    row.get_typed::<Option<Vec<u8>>>(1)?,
+                ))
+            },
+        )
+        .expect("query excluded extra");
+    assert_eq!(extra_rows.len(), 1);
+    let extra = decode_extra(extra_rows[0].0.clone(), extra_rows[0].1.clone());
+    let tool_use_result = extra
+        .get("toolUseResult")
+        .expect("toolUseResult object preserved with sibling metadata");
+    assert_eq!(
+        tool_use_result["stdout"]["redacted"],
+        json!(true),
+        "toolUseResult.stdout recall payload must be replaced by redacted tombstone: {tool_use_result}"
+    );
+    assert!(
+        tool_use_result["stdout"]["sha256"].is_string()
+            && tool_use_result["stdout"]["bytes"].is_u64(),
+        "toolUseResult.stdout tombstone must carry sha256 and bytes: {tool_use_result}"
+    );
+    assert_eq!(tool_use_result["interrupted"], json!(false));
+    assert_eq!(tool_use_result["isImage"], json!(false));
+    drop(db);
+
+    let blobs = mirror_blobs(&fixture);
+    assert_eq!(blobs.len(), 1);
+    assert_eq!(blobs[0].1, body.as_bytes());
+    assert_eq!(std::fs::read(&path).expect("re-read"), body.as_bytes());
+}
+
+#[test]
+fn mcp_activate_v2_multiline_json_document_session() {
+    let fixture = Fixture::new();
+    let case = CaseDir::new("mcp_activate_v2_plan_a", "multiline-json-document");
+
+    const DOC_PROSE: &str = "t10 multiline json document user prose stays";
+    const DOC_ANSWER: &str = "t10 multiline json document assistant answer stays";
+    const DOC_HIT_BODY: &str = "t10 multiline json document recall hit body must be stripped";
+    let recall_envelope = wrapper(RecallTool::Search, &native_search_value(DOC_HIT_BODY));
+    let doc = json!({
+        "title": "Multiline JSON Document Session",
+        "messages": [
+            {
+                "role": "user",
+                "timestamp": "2026-01-05T00:00:00.000Z",
+                "content": DOC_PROSE
+            },
+            {
+                "role": "assistant",
+                "timestamp": "2026-01-05T00:00:01.000Z",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_doc_search",
+                        "name": "mcp__cass-mcp__cass_search",
+                        "input": {"query": "multiline json query"}
+                    }
+                ]
+            },
+            {
+                "role": "tool_result",
+                "timestamp": "2026-01-05T00:00:02.000Z",
+                "tool_use_id": "toolu_doc_search",
+                "content": recall_envelope
+            },
+            {
+                "role": "assistant",
+                "timestamp": "2026-01-05T00:00:03.000Z",
+                "content": DOC_ANSWER
+            }
+        ]
+    });
+    let pretty = serde_json::to_string_pretty(&doc).expect("pretty json") + "\n";
+    assert!(
+        pretty.lines().count() > 10,
+        "fixture must genuinely be a multi-line whole-document JSON file"
+    );
+    let path = fixture.home().join(".claude/projects/t10-doc/session.json");
+    std::fs::create_dir_all(path.parent().expect("claude doc parent")).expect("mkdir");
+    std::fs::write(&path, pretty.as_bytes()).expect("write multiline json");
+
+    let output = fixture.index(&[], &[]);
+    write_evidence(&case, &["index", "--json"], &[], &output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "multiline json index failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("index json");
+    assert_eq!(report["success"], json!(true));
+    assert_eq!(report["recall_uncovered_total"], json!(0));
+
+    let db = fixture.open_db();
+    assert_eq!(marker_rule_versions(&db), vec![2]);
+    assert_excluded_rows_clean(&db, &[DOC_HIT_BODY], "multiline-json-document");
+    let bodies = message_contents(&db);
+    assert!(bodies.iter().any(|b| b == DOC_PROSE));
+    assert!(bodies.iter().any(|b| b == DOC_ANSWER));
+    assert!(!bodies.iter().any(|b| b.contains(DOC_HIT_BODY)));
+    drop(db);
+
+    let blobs = mirror_blobs(&fixture);
+    assert_eq!(blobs.len(), 1);
+    assert_eq!(blobs[0].1, pretty.as_bytes());
+    assert_eq!(std::fs::read(&path).expect("re-read"), pretty.as_bytes());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mcp_activate_v2_resident_watch_reports_uncovered() {
+    use std::fs::File;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Child, Stdio};
+    use std::time::Instant;
+
+    struct ResidentGuard {
+        child: Option<Child>,
+        pid: u32,
+    }
+    impl ResidentGuard {
+        fn stop_and_assert_clean(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                if child.try_wait().expect("try_wait").is_none() {
+                    let status = Command::new("/usr/bin/kill")
+                        .args(["-INT", &self.pid.to_string()])
+                        .status()
+                        .expect("send SIGINT");
+                    assert!(status.success(), "SIGINT to resident watcher failed");
+                }
+                let status = child.wait().expect("wait watcher");
+                assert_eq!(status.signal(), Some(2), "watcher should exit on SIGINT");
+                assert!(
+                    !std::path::Path::new(&format!("/proc/{}", self.pid)).exists(),
+                    "watcher process must be absent after SIGINT"
+                );
+            }
+        }
+    }
+    impl Drop for ResidentGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let fixture = Fixture::new();
+    let case = CaseDir::new("mcp_activate_v2_plan_a", "resident-watch-uncovered");
+    std::fs::create_dir_all(fixture.home().join(".claude/projects/t10")).expect("mkdir claude");
+    std::fs::create_dir_all(fixture.home().join(".codex/sessions/2026/01")).expect("mkdir codex");
+
+    let stdout_path = fixture.root.path().join("watch.stdout");
+    let stderr_path = fixture.root.path().join("watch.stderr");
+    let mut cmd = Command::new(cass_bin());
+    fixture.isolate(&mut cmd);
+    cmd.env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0")
+    .args([
+        "-v",
+        "index",
+        "--watch",
+        "--watch-interval",
+        "1",
+        "--data-dir",
+    ])
+    .arg(fixture.data_dir())
+    .args(["--json", "--robot-trace-ingest"])
+    .stdout(Stdio::from(File::create(&stdout_path).expect("stdout")))
+    .stderr(Stdio::from(File::create(&stderr_path).expect("stderr")));
+
+    let child = cmd.spawn().expect("spawn resident cass index --watch");
+    let pid = child.id();
+    let mut guard = ResidentGuard {
+        child: Some(child),
+        pid,
+    };
+
+    let read_log = || std::fs::read_to_string(&stderr_path).unwrap_or_default();
+
+    // Wait for watch loop to register filesystem watchers.
+    let start_deadline = Instant::now() + Duration::from_secs(60);
+    while !read_log().contains("watching ") {
+        assert!(
+            guard.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "resident watcher exited before ready; log={}",
+            read_log()
+        );
+        assert!(
+            Instant::now() < start_deadline,
+            "timed out waiting for resident watcher ready; log={}",
+            read_log()
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
+    // Write the full synthetic two-agent world (6 supported recalls + 5 uncovered across 4 reasons).
+    let world = build_world(&fixture);
+
+    // Wait until both agents' sessions have landed with all 6 rule_version=2 exclusion markers
+    // AND both per-session scan_session traces are emitted.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut claude_traces: Vec<String>;
+    let mut codex_traces: Vec<String>;
+    loop {
+        assert!(
+            guard.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "resident watcher exited unexpectedly; log={}",
+            read_log()
+        );
+        let db_ready = Conn::open_read_with(
+            &fixture.db(),
+            OpenOptions {
+                busy_timeout: Duration::from_secs(5),
+            },
+        )
+        .ok()
+        .and_then(|db| {
+            db.query_row_map(
+                "SELECT COUNT(*) FROM messages WHERE excluded IS NOT NULL",
+                &[],
+                |row| row.get_typed::<i64>(0),
+            )
+            .ok()
+        })
+        == Some(6);
+        let log = read_log();
+        claude_traces = log
+            .lines()
+            .filter(|l| l.contains("scan_session") && l.contains("agent=claude_code"))
+            .map(str::to_owned)
+            .collect();
+        codex_traces = log
+            .lines()
+            .filter(|l| l.contains("scan_session") && l.contains("agent=codex"))
+            .map(str::to_owned)
+            .collect();
+        if db_ready && !claude_traces.is_empty() && !codex_traces.is_empty() {
+            // Also wait briefly for the trailing idle progress line (phase_code=0).
+            let has_idle_with_uncovered = log
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|ev| {
+                    ev["phase_code"] == 0
+                        && ev["recall_uncovered_total"].as_u64().unwrap_or(0) > 0
+                });
+            if has_idle_with_uncovered {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for resident watch ingest + traces; claude={claude_traces:?} codex={codex_traces:?}\nlog={log}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let log = read_log();
+    case.write("watch.stderr", log.as_bytes());
+    guard.stop_and_assert_clean();
+
+    // Verify DB + decoded extra + raw mirror integrity.
+    assert_activation_db(&fixture, &world, "resident-watch-uncovered");
+
+    // Verify per-agent scan_session trace lines report exact Plan A uncovered counts
+    // totaling 5 across all 4 fixed reasons.
+    let last_claude = claude_traces.last().expect("claude scan_session trace");
+    let last_codex = codex_traces.last().expect("codex scan_session trace");
+    assert!(
+        last_claude.contains("recall_uncovered_total=1")
+            && last_claude.contains(r#"recall_uncovered_by_reason={"unsupported_shell":1}"#),
+        "claude resident trace mismatch: {last_claude}"
+    );
+    assert!(
+        last_codex.contains("recall_uncovered_total=4")
+            && last_codex.contains(
+                r#"recall_uncovered_by_reason={"ambiguous_tool_identity":1,"invalid_recall_format":1,"unpaired_result":1,"unsupported_shell":1}"#
+            ),
+        "codex resident trace mismatch: {last_codex}"
+    );
+
+    // Verify live JSON progress idle events carry the uncovered reasons (across 1 or 2 cycles).
+    let mut observed_reasons: BTreeMap<String, u64> = BTreeMap::new();
+    let mut last_cycle_map: Option<Value> = None;
+    for ev in log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|ev| ev["phase_code"] == 0)
+    {
+        let total = ev["recall_uncovered_total"].as_u64().unwrap_or(0);
+        if total == 0 {
+            continue;
+        }
+        let by_reason = &ev["recall_uncovered_by_reason"];
+        if last_cycle_map.as_ref() == Some(by_reason) {
+            continue;
+        }
+        last_cycle_map = Some(by_reason.clone());
+        if let Some(obj) = by_reason.as_object() {
+            for (k, v) in obj {
+                *observed_reasons.entry(k.clone()).or_default() += v.as_u64().unwrap_or(0);
+            }
+        }
+    }
+    assert_eq!(
+        serde_json::to_value(&observed_reasons).unwrap(),
+        expected_reasons(),
+        "resident idle progress events must report all 5 uncovered inputs across the 4 fixed reasons; log={log}"
+    );
+
+    // Privacy check: no source prose or query text leaks into watch logs.
+    for forbidden in [SUPPORTED_QUERY, ORDINARY_PROSE, CODEX_PROSE] {
+        assert!(
+            !log.contains(forbidden),
+            "resident watch log must not leak source text {forbidden:?}"
+        );
+    }
 }
