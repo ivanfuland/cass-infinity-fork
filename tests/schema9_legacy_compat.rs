@@ -1103,3 +1103,258 @@ fn schema9_legacy_claude_provider_mirror_restore_hold_replace_and_backlink() {
         "brand-new legacy provider=claude manifest must carry non-null conversation_id backlink: {manifest_json}"
     );
 }
+
+#[test]
+fn schema9_mixed_claude_and_claude_code_manifests_unify_identity_and_relink() {
+    use coding_agent_search::raw_mirror::RawMirrorDbLink;
+
+    let line = |role: &str, uuid: &str, sid: &str, ts: &str, text: &str| -> String {
+        json!({
+            "type": role,
+            "uuid": uuid,
+            "sessionId": sid,
+            "timestamp": ts,
+            "message": {"role": role, "content": [{"type": "text", "text": text}]}
+        })
+        .to_string()
+    };
+
+    // ------------------------------------------------------------------
+    // B1-A: Candidate DB has 2-msg prefix [m0, m1]. Archive has BOTH a
+    // legacy `provider = "claude"` manifest (4 msgs) and a new
+    // `provider = "claude_code"` manifest (3 diverged msgs) for the same
+    // session. Both MUST merge into ONE RestoreIdentity group and trigger
+    // `VersionDiverged` HOLD instead of planning 2 conflicting Replaces.
+    // ------------------------------------------------------------------
+    let fixture_a = LegacyFixture::new();
+    let proj_a = fixture_a.home().join(".claude/projects/r2-b1a");
+    fs::create_dir_all(&proj_a).expect("mkdir proj_a");
+    let sess_a = proj_a.join("sess_a.jsonl");
+    let prefix_a = format!(
+        "{}\n{}\n",
+        line("user", "a-u0", "sid-b1a", "2026-01-08T00:00:00.000Z", "msg 0"),
+        line("assistant", "a-a1", "sid-b1a", "2026-01-08T00:00:01.000Z", "msg 1"),
+    );
+    fs::write(&sess_a, prefix_a.as_bytes()).expect("write prefix_a");
+    let idx_a = fixture_a.run_cass(&["index", "--json"]);
+    assert_eq!(idx_a.status.code(), Some(0), "seed A failed");
+
+    let mirror_a = fixture_a.root.path().join("mirror-b1a");
+    fs::create_dir_all(&mirror_a).expect("mkdir mirror_a");
+    let legacy_4 = format!(
+        "{}{}\n{}\n",
+        prefix_a,
+        line("user", "a-u2", "sid-b1a", "2026-01-08T00:00:02.000Z", "msg 2"),
+        line("assistant", "a-a3", "sid-b1a", "2026-01-08T00:00:03.000Z", "KEEP_ME_M3_FROM_LEGACY_CLAUDE"),
+    );
+    fs::write(&sess_a, legacy_4.as_bytes()).expect("write legacy_4");
+    capture_source_file(RawMirrorCaptureInput {
+        data_dir: &mirror_a,
+        provider: "claude",
+        source_id: "local",
+        origin_kind: "local",
+        origin_host: Some("local"),
+        source_path: &sess_a,
+        db_links: &[],
+    })
+    .expect("capture legacy provider=claude");
+
+    let diverged_3 = format!(
+        "{}{}\n",
+        prefix_a,
+        line("user", "a-u2-div", "sid-b1a", "2026-01-08T00:00:02.000Z", "DIVERGED_M2_FROM_CLAUDE_CODE"),
+    );
+    fs::write(&sess_a, diverged_3.as_bytes()).expect("write diverged_3");
+    capture_source_file(RawMirrorCaptureInput {
+        data_dir: &mirror_a,
+        provider: "claude_code",
+        source_id: "local",
+        origin_kind: "local",
+        origin_host: Some("local"),
+        source_path: &sess_a,
+        db_links: &[],
+    })
+    .expect("capture new provider=claude_code");
+
+    let scratch_a = fixture_a.root.path().join("scratch-b1a");
+    fs::create_dir_all(&scratch_a).expect("mkdir scratch_a");
+    let dry_a = fixture_a.run_cass(&[
+        "mirror-restore",
+        "--data-dir",
+        mirror_a.to_str().unwrap(),
+        "--candidate-db",
+        fixture_a.db_path().to_str().unwrap(),
+        "--scratch",
+        scratch_a.to_str().unwrap(),
+        "--snapshot-root",
+        "snap-b1a",
+        "--json",
+    ]);
+    assert_eq!(
+        dry_a.status.code(),
+        Some(0),
+        "b1a dry-run failed: {}",
+        String::from_utf8_lossy(&dry_a.stderr)
+    );
+    let dry_a_json: Value = serde_json::from_slice(&dry_a.stdout).expect("dry_a json");
+    assert_eq!(dry_a_json["manifests_seen"], json!(2), "dry_a={dry_a_json}");
+    assert_eq!(
+        dry_a_json["identities_considered"],
+        json!(1),
+        "claude and claude_code manifests for same session must unify into 1 identity: {dry_a_json}"
+    );
+    assert_eq!(dry_a_json["replace"], json!(0), "must not plan conflicting replaces: {dry_a_json}");
+    assert_eq!(dry_a_json["holds"], json!(1), "diverged mixed-provider versions must HOLD: {dry_a_json}");
+    assert_eq!(dry_a_json["planned_actions"], json!(0), "dry_a={dry_a_json}");
+
+    // ------------------------------------------------------------------
+    // B1-B: Empty candidate DB + diverged "claude" & "claude_code"
+    // manifests must likewise unify into 1 identity and HOLD instead of
+    // planning 2 RestoreNew actions.
+    // ------------------------------------------------------------------
+    let fixture_b = LegacyFixture::new();
+    let idx_b = fixture_b.run_cass(&["index", "--json"]);
+    assert_eq!(idx_b.status.code(), Some(0), "init empty DB failed");
+    let proj_b = fixture_b.home().join(".claude/projects/r2-b1b");
+    fs::create_dir_all(&proj_b).expect("mkdir proj_b");
+    let sess_b = proj_b.join("sess_b.jsonl");
+    let mirror_b = fixture_b.root.path().join("mirror-b1b");
+    fs::create_dir_all(&mirror_b).expect("mkdir mirror_b");
+    fs::write(
+        &sess_b,
+        format!(
+            "{}\n{}\n",
+            line("user", "b-u0", "sid-b1b", "2026-01-08T01:00:00.000Z", "new question"),
+            line("assistant", "b-a1", "sid-b1b", "2026-01-08T01:00:01.000Z", "LEGACY_ANSWER_A1"),
+        ),
+    )
+    .expect("write sess_b v1");
+    capture_source_file(RawMirrorCaptureInput {
+        data_dir: &mirror_b,
+        provider: "claude",
+        source_id: "local",
+        origin_kind: "local",
+        origin_host: Some("local"),
+        source_path: &sess_b,
+        db_links: &[],
+    })
+    .expect("capture sess_b claude");
+    fs::write(
+        &sess_b,
+        format!(
+            "{}\n{}\n",
+            line("user", "b-u0", "sid-b1b", "2026-01-08T01:00:00.000Z", "new question"),
+            line("assistant", "b-a1-div", "sid-b1b", "2026-01-08T01:00:01.000Z", "NEW_CONFLICT_ANSWER_B1"),
+        ),
+    )
+    .expect("write sess_b v2");
+    capture_source_file(RawMirrorCaptureInput {
+        data_dir: &mirror_b,
+        provider: "claude_code",
+        source_id: "local",
+        origin_kind: "local",
+        origin_host: Some("local"),
+        source_path: &sess_b,
+        db_links: &[],
+    })
+    .expect("capture sess_b claude_code");
+    let scratch_b = fixture_b.root.path().join("scratch-b1b");
+    fs::create_dir_all(&scratch_b).expect("mkdir scratch_b");
+    let dry_b = fixture_b.run_cass(&[
+        "mirror-restore",
+        "--data-dir",
+        mirror_b.to_str().unwrap(),
+        "--candidate-db",
+        fixture_b.db_path().to_str().unwrap(),
+        "--scratch",
+        scratch_b.to_str().unwrap(),
+        "--snapshot-root",
+        "snap-b1b",
+        "--json",
+    ]);
+    assert_eq!(dry_b.status.code(), Some(0));
+    let dry_b_json: Value = serde_json::from_slice(&dry_b.stdout).expect("dry_b json");
+    assert_eq!(dry_b_json["identities_considered"], json!(1), "dry_b={dry_b_json}");
+    assert_eq!(dry_b_json["restore"], json!(0), "dry_b={dry_b_json}");
+    assert_eq!(dry_b_json["holds"], json!(1), "dry_b={dry_b_json}");
+    assert_eq!(dry_b_json["planned_actions"], json!(0), "dry_b={dry_b_json}");
+
+    // ------------------------------------------------------------------
+    // B1-C: `cass mirror-relink --apply` on a legacy `provider = "claude"`
+    // manifest whose `db_links` already points at the `claude_code` DB row
+    // MUST preserve `db_links` intact (0 changes, 0 findings).
+    // ------------------------------------------------------------------
+    let fixture_c = LegacyFixture::new();
+    let proj_c = fixture_c.home().join(".claude/projects/r2-b1c");
+    fs::create_dir_all(&proj_c).expect("mkdir proj_c");
+    let sess_c = proj_c.join("relink.jsonl");
+    let body_c = format!(
+        "{}\n{}\n",
+        line("user", "c-u0", "sid-b1c", "2026-01-08T02:00:00.000Z", "relink prompt"),
+        line("assistant", "c-a1", "sid-b1c", "2026-01-08T02:00:01.000Z", "relink reply"),
+    );
+    fs::write(&sess_c, body_c.as_bytes()).expect("write sess_c");
+    let idx_c = fixture_c.run_cass(&["index", "--json"]);
+    assert_eq!(idx_c.status.code(), Some(0));
+
+    // Remove auto-captured manifests so only our legacy `provider = "claude"` manifest is present.
+    let data_dir_c = fixture_c.data_dir();
+    let raw_mirror_dir = data_dir_c.join("raw-mirror");
+    if raw_mirror_dir.exists() {
+        fs::remove_dir_all(&raw_mirror_dir).expect("clear auto mirror");
+    }
+
+    let conn_c = Conn::open_read(&fixture_c.db_path()).expect("open db c");
+    let (conv_id_c, started_at_c): (i64, Option<i64>) = conn_c
+        .query_row_map(
+            "SELECT id, started_at FROM conversations WHERE source_path = ?1",
+            &[SqlValue::Text(sess_c.to_string_lossy().into_owned())],
+            |r| Ok((r.get_typed(0)?, r.get_typed(1).ok())),
+        )
+        .expect("query conv c");
+    drop(conn_c);
+
+    let cap_c = capture_source_file(RawMirrorCaptureInput {
+        data_dir: &data_dir_c,
+        provider: "claude",
+        source_id: "local",
+        origin_kind: "local",
+        origin_host: None,
+        source_path: &sess_c,
+        db_links: &[RawMirrorDbLink {
+            conversation_id: Some(conv_id_c),
+            message_count: Some(2),
+            source_path: Some(sess_c.to_string_lossy().into_owned()),
+            started_at_ms: started_at_c,
+        }],
+    })
+    .expect("capture legacy claude manifest for relink");
+
+    let relink_out = fixture_c.run_cass(&[
+        "mirror-relink",
+        "--data-dir",
+        data_dir_c.to_str().unwrap(),
+        "--apply",
+        "--json",
+    ]);
+    assert_eq!(
+        relink_out.status.code(),
+        Some(0),
+        "mirror-relink failed: {}",
+        String::from_utf8_lossy(&relink_out.stderr)
+    );
+    let relink_json: Value = serde_json::from_slice(&relink_out.stdout).expect("relink json");
+    assert_eq!(relink_json["changes"], json!(0), "must not wipe valid legacy claude db_links: {relink_json}");
+    assert_eq!(relink_json["findings"], json!(0), "relink={relink_json}");
+    let relink_manifest_disk = data_dir_c
+        .join("raw-mirror/v1")
+        .join(&cap_c.manifest_relative_path);
+    let relink_manifest: Value =
+        serde_json::from_slice(&fs::read(&relink_manifest_disk).expect("read relink manifest"))
+            .expect("parse relink manifest");
+    assert_eq!(
+        relink_manifest["db_links"][0]["conversation_id"],
+        json!(conv_id_c),
+        "legacy provider=claude manifest db_links must remain intact after mirror-relink --apply: {relink_manifest}"
+    );
+}

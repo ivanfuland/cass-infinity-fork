@@ -9402,6 +9402,18 @@ fn conversation_ids_for_identity(
 }
 
 /// Legacy Schema 9 manifests captured before Plan-A unification wrote
+/// `provider = "claude"`, while Plan-A manifests and `ClaudeCodeConnector` DB
+/// rows use `"claude_code"`. Map `"claude"` onto `"claude_code"` so legacy and
+/// current manifests for the same session share one [`RestoreIdentity`] (and
+/// one `mirror-relink` lookup key) without folding `openclaw/<instance>` slugs.
+pub(crate) fn canonical_restore_agent_slug(provider: &str) -> &str {
+    match provider {
+        "claude" => "claude_code",
+        other => other,
+    }
+}
+
+/// Legacy Schema 9 manifests captured before Plan-A unification wrote
 /// `provider = "claude"`, while `ClaudeCodeConnector` persists rows under
 /// `agents.slug = "claude_code"`. Match both spellings when querying the
 /// candidate DB so legacy manifests resolve their existing `claude_code`
@@ -9536,12 +9548,13 @@ pub(crate) fn restore_identity_from_view(
     view: &crate::raw_mirror::RawMirrorManifestView,
 ) -> anyhow::Result<RestoreIdentity> {
     // 仍然要求 provider 能归一 —— 那是**分类可判**的前提（未知 slug 具名 HOLD，R-E-67）。
-    // 但身份里存的是**原始串**，不是归一结果（R-E-103）。
+    // 保留 `openclaw/<inst>` 实例 slug（R-E-103），仅将历史同义拼写 `"claude"` 归一到
+    // `"claude_code"`，确保新旧两批 manifest 落在同一恢复身份与版本组内。
     normalize_provider_to_origin(&view.provider)
         .ok_or_else(|| anyhow::anyhow!("unknown provider in manifest: {}", view.provider))?;
     Ok(RestoreIdentity {
         origin: OriginNamespace {
-            agent_slug: view.provider.clone(),
+            agent_slug: canonical_restore_agent_slug(&view.provider).to_string(),
             source_id: view.source_id.clone(),
             origin_host: view
                 .origin_host

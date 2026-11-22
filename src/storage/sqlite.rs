@@ -10813,61 +10813,6 @@ fn franken_last_rowid(tx: &FrankenTransaction<'_>) -> Result<i64> {
 /// `ensure_agent` outside the transaction, but those autocommit writes may
 /// not be visible inside a legacy embedded engine transaction snapshot.  This function
 /// checks each unique agent_id and creates a stub row if it's missing.
-/// Resolve one conversation's parent rows inside the caller's transaction.
-///
-/// SRC05B-07: the source-aware input resolves its parents *here*, in the same
-/// transaction as its projections. The caching [`FrankenStorage::ensure_agent`]
-/// and [`FrankenStorage::ensure_workspace`] write on the connection outside any
-/// transaction and publish their ids to the connection cache; a failed input
-/// that rolls back must leave neither a parent row nor a cached id behind, so
-/// this entry does neither. The SQL is the same upsert-then-select the caching
-/// pair runs, so the two agree on the row they land on.
-///
-/// Returns `(agent_id, workspace_id)`.
-pub(crate) fn ensure_parent_rows_in_tx(
-    tx: &FrankenTransaction<'_>,
-    conv: &Conversation,
-) -> Result<(i64, Option<i64>), StorageError> {
-    let now = FrankenStorage::now_millis();
-    tx.execute(
-        "INSERT INTO agents(slug, name, version, kind, created_at, updated_at)
-         VALUES(?1, ?2, NULL, 'cli', ?3, ?4)
-         ON CONFLICT(slug) DO UPDATE SET
-             name = excluded.name,
-             kind = excluded.kind,
-             updated_at = excluded.updated_at
-         WHERE NOT (agents.name IS excluded.name AND agents.kind IS excluded.kind)",
-        fparams![conv.agent_slug.as_str(), conv.agent_slug.as_str(), now, now],
-    )?;
-    let agent_id: i64 = tx.query_row_map(
-        "SELECT id FROM agents WHERE slug = ?1 LIMIT 1",
-        fparams![conv.agent_slug.as_str()],
-        |row| row.get_typed(0),
-    )?;
-
-    let workspace_id = match &conv.workspace {
-        None => None,
-        Some(path) => {
-            let path_str = path.to_string_lossy().to_string();
-            tx.execute(
-                "INSERT OR IGNORE INTO workspaces(path, display_name) VALUES(?1, NULL)",
-                fparams![path_str.as_str()],
-            )?;
-            Some(tx.query_row_map(
-                "SELECT id FROM workspaces WHERE path = ?1 LIMIT 1",
-                fparams![path_str.as_str()],
-                |row| row.get_typed(0),
-            )?)
-        }
-    };
-
-    // The conversation's own source row, through the shared in-transaction
-    // guard (it caches nothing either).
-    ensure_sources_in_tx(tx, &[(agent_id, workspace_id, conv)])
-        .map_err(anyhow_error_into_storage_error)?;
-    Ok((agent_id, workspace_id))
-}
-
 fn ensure_agents_in_tx(
     tx: &FrankenTransaction<'_>,
     conversations: &[(i64, Option<i64>, &Conversation)],

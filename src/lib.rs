@@ -105890,7 +105890,7 @@ fn relink_identity_key(
     source_path: &str,
 ) -> (String, String, String, String) {
     (
-        agent_slug.to_string(),
+        crate::phase3_restore::canonical_restore_agent_slug(agent_slug).to_string(),
         source_id.to_string(),
         origin_host.unwrap_or_default().to_string(),
         source_path.to_string(),

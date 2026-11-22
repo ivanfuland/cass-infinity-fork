@@ -7890,7 +7890,7 @@ fn spawn_connector_producer(
                 config.active_source_filter.as_ref(),
             );
             record_scan_invocation();
-            match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+            match conn.scan_with_callback(&ctx, &mut |conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
                     name,
@@ -8050,7 +8050,7 @@ fn spawn_connector_producer(
                 config.active_source_filter.as_ref(),
             );
             record_scan_invocation();
-            match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+            match conn.scan_with_callback(&ctx, &mut |conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
                     name,
@@ -19143,75 +19143,167 @@ mod capture_source_kind_for_tests {
 pub(crate) fn build_pairing_candidates(
     conv: &NormalizedConversation,
 ) -> Vec<crate::indexer::exclusion::PairingCandidate> {
-    use crate::indexer::exclusion::{PairedTool, PairingCandidate};
+    build_pairing_candidates_with_events(conv, None)
+}
+
+fn build_pairing_candidates_with_events(
+    conv: &NormalizedConversation,
+    events: Option<&[crate::indexer::exclusion::BlobEvent]>,
+) -> Vec<crate::indexer::exclusion::PairingCandidate> {
+    use crate::indexer::exclusion::{
+        BlobEvent, BlockKind, PairedTool, PairingCandidate, parse_tool_args_value,
+    };
+
+    let paired_to_candidate = |mut paired: Vec<PairedTool>| match paired.len() {
+        0 => PairingCandidate::ToolCall(PairedTool {
+            tool_call_id: None,
+            tool_name: String::new(),
+            args: None,
+        }),
+        1 => PairingCandidate::ToolCall(paired.remove(0)),
+        _ => PairingCandidate::ToolCalls(paired),
+    };
 
     let invocations_to_candidate = |invocations: &[franken_agent_detection::NormalizedInvocation]| {
-        let mut paired: Vec<PairedTool> = invocations
+        let paired: Vec<PairedTool> = invocations
             .iter()
             .map(|inv| PairedTool {
                 tool_call_id: inv.call_id.clone(),
                 tool_name: inv.name.clone(),
-                args: inv.arguments.clone(),
+                args: inv.arguments.as_ref().map(parse_tool_args_value),
             })
             .collect();
-        match paired.len() {
-            0 => PairingCandidate::ToolCall(PairedTool {
-                tool_call_id: None,
-                tool_name: String::new(),
-                args: None,
-            }),
-            1 => PairingCandidate::ToolCall(paired.remove(0)),
-            _ => PairingCandidate::ToolCalls(paired),
+        paired_to_candidate(paired)
+    };
+
+    let event_tool_calls = |blob_event: &BlobEvent| -> Vec<PairedTool> {
+        let from_blocks: Vec<PairedTool> = blob_event
+            .event
+            .blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::ToolUse)
+            .filter_map(|b| {
+                let name = b.tool_name.as_deref().filter(|n| !n.is_empty())?;
+                Some(PairedTool {
+                    tool_call_id: b.tool_use_id.clone(),
+                    tool_name: name.to_string(),
+                    args: b.args.as_ref().map(parse_tool_args_value),
+                })
+            })
+            .collect();
+        if !from_blocks.is_empty() {
+            return from_blocks;
         }
+        let rec = &blob_event.raw_record;
+        if let Some(name) = rec.get("name").and_then(|v| v.as_str()).filter(|n| !n.is_empty()) {
+            return vec![PairedTool {
+                tool_call_id: rec
+                    .get("tool_call_id")
+                    .or_else(|| rec.get("call_id"))
+                    .or_else(|| rec.get("tool_use_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                tool_name: name.to_string(),
+                args: rec
+                    .get("arguments")
+                    .or_else(|| rec.get("input"))
+                    .map(parse_tool_args_value),
+            }];
+        }
+        Vec::new()
+    };
+
+    let event_tool_result_id = |blob_event: &BlobEvent| -> Option<String> {
+        let mut unique_id: Option<&str> = None;
+        for b in &blob_event.event.blocks {
+            if b.kind != BlockKind::ToolResult {
+                continue;
+            }
+            if let Some(id) = b.tool_use_id.as_deref() {
+                match unique_id {
+                    None => unique_id = Some(id),
+                    Some(prev) if prev == id => {}
+                    Some(_) => return None,
+                }
+            }
+        }
+        if let Some(id) = unique_id {
+            return Some(id.to_string());
+        }
+        blob_event
+            .raw_record
+            .get("tool_call_id")
+            .or_else(|| blob_event.raw_record.get("tool_use_id"))
+            .or_else(|| blob_event.raw_record.get("call_id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
     };
 
     conv.messages
         .iter()
         .enumerate()
-        .map(|(idx, m)| match m.role.as_str() {
-            "user" => PairingCandidate::TurnBoundary,
-            "tool_call" => {
-                if !m.invocations.is_empty() {
-                    invocations_to_candidate(&m.invocations)
-                } else {
-                    // Whole-document Codex `.json` `items[]` entries with
-                    // top-level `role: "tool_call"` carry their metadata
-                    // directly on `extra` (`name`, `call_id`, `arguments`/`input`).
-                    PairingCandidate::ToolCall(PairedTool {
-                        tool_call_id: m
-                            .extra
-                            .get("tool_call_id")
-                            .or_else(|| m.extra.get("call_id"))
-                            .or_else(|| m.extra.get("tool_use_id"))
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string),
-                        tool_name: m
-                            .extra
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        args: m
-                            .extra
-                            .get("arguments")
-                            .or_else(|| m.extra.get("input"))
-                            .cloned(),
-                    })
+        .map(|(idx, m)| {
+            let blob_event = events.and_then(|ev| ev.get(idx));
+            match m.role.as_str() {
+                "user" => PairingCandidate::TurnBoundary,
+                "tool_call" => {
+                    if !m.invocations.is_empty() {
+                        invocations_to_candidate(&m.invocations)
+                    } else {
+                        // Whole-document Codex `.json` `items[]` entries with
+                        // top-level `role: "tool_call"` carry their metadata on
+                        // `extra` (`name`, `call_id`, `arguments`/`input`). On
+                        // >= 32 MiB sessions `compact_message_extra` strips
+                        // `m.extra` before `recall_v2`, so fall back to the
+                        // uncompacted raw-mirror `BlobEvent`.
+                        let from_extra = PairedTool {
+                            tool_call_id: m
+                                .extra
+                                .get("tool_call_id")
+                                .or_else(|| m.extra.get("call_id"))
+                                .or_else(|| m.extra.get("tool_use_id"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                            tool_name: m
+                                .extra
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            args: m
+                                .extra
+                                .get("arguments")
+                                .or_else(|| m.extra.get("input"))
+                                .map(parse_tool_args_value),
+                        };
+                        if !from_extra.tool_name.is_empty() || from_extra.args.is_some() {
+                            PairingCandidate::ToolCall(from_extra)
+                        } else if let Some(ev_calls) =
+                            blob_event.map(event_tool_calls).filter(|c| !c.is_empty())
+                        {
+                            paired_to_candidate(ev_calls)
+                        } else {
+                            PairingCandidate::ToolCall(from_extra)
+                        }
+                    }
                 }
+                "assistant" | "agent" if !m.invocations.is_empty() => {
+                    invocations_to_candidate(&m.invocations)
+                }
+                "tool_result" => PairingCandidate::ToolResult {
+                    tool_call_id: m
+                        .extra
+                        .get("tool_call_id")
+                        .or_else(|| m.extra.get("tool_use_id"))
+                        .or_else(|| m.extra.get("call_id"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .or_else(|| blob_event.and_then(event_tool_result_id)),
+                },
+                _ => PairingCandidate::ToolResult {
+                    tool_call_id: Some(format!("__cass_pairing_neutral_{idx}__")),
+                },
             }
-            "assistant" | "agent" if !m.invocations.is_empty() => {
-                invocations_to_candidate(&m.invocations)
-            }
-            "tool_result" => PairingCandidate::ToolResult {
-                tool_call_id: m
-                    .extra
-                    .get("tool_call_id")
-                    .or_else(|| m.extra.get("tool_use_id"))
-                    .or_else(|| m.extra.get("call_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-            },
-            _ => PairingCandidate::ToolResult { tool_call_id: Some(format!("__cass_pairing_neutral_{idx}__")) },
         })
         .collect()
 }
@@ -19232,7 +19324,7 @@ fn judge_and_redact_reparsed(
     use crate::indexer::exclusion::{PairingContext, apply_sibling, field_map_for};
     use crate::indexer::recall_v2::{Outcome, apply_with_redaction, decide_for_record};
 
-    let candidates = build_pairing_candidates(conv);
+    let candidates = build_pairing_candidates_with_events(conv, Some(events));
     let pairing_ctx = PairingContext::build(&candidates);
     let field_map = field_map_for(&conv.agent_slug);
     let mut redactor = crate::indexer::redact_secrets::MemoizingRedactor::new();

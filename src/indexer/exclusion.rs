@@ -464,28 +464,25 @@ fn claude_code_document_events(doc: &serde_json::Value, blob_path: &Path) -> Vec
                             .or_else(|| block.get("tool_use_id").and_then(|v| v.as_str()))
                             .map(str::to_string);
                         let tool_name = block.get("name").and_then(|v| v.as_str()).map(str::to_string);
-                        let args = block.get("input").cloned();
+                        let args = block
+                            .get("input")
+                            .or_else(|| block.get("arguments"))
+                            .map(parse_tool_args_value);
                         parsed.push(RawBlock { index: i as u32, kind, tool_use_id, tool_name, args });
                     }
                     if role == "tool_result" && !parsed.iter().any(|b| b.kind == BlockKind::ToolResult) {
-                        if parsed.is_empty() {
-                            parsed.push(RawBlock {
-                                index: 0,
-                                kind: BlockKind::ToolResult,
-                                tool_use_id: item_tool_id.clone(),
-                                tool_name: None,
-                                args: None,
-                            });
-                        } else {
-                            for b in &mut parsed {
-                                if b.kind == BlockKind::Text {
-                                    b.kind = BlockKind::ToolResult;
-                                    if b.tool_use_id.is_none() {
-                                        b.tool_use_id = item_tool_id.clone();
-                                    }
-                                }
-                            }
-                        }
+                        // Whole-document `.json` `role: "tool_result"` items with multi-part
+                        // text/string arrays project to ONE `NormalizedMessage`. Keep ONE
+                        // `ToolResult` block so id-less R4 block location sees a single
+                        // unambiguous target (instead of N sibling candidates).
+                        parsed.clear();
+                        parsed.push(RawBlock {
+                            index: 0,
+                            kind: BlockKind::ToolResult,
+                            tool_use_id: item_tool_id.clone(),
+                            tool_name: None,
+                            args: None,
+                        });
                     }
                     parsed
                 }
@@ -500,7 +497,10 @@ fn claude_code_document_events(doc: &serde_json::Value, blob_path: &Path) -> Vec
                         kind,
                         tool_use_id: item_tool_id,
                         tool_name: item.get("name").and_then(serde_json::Value::as_str).map(str::to_string),
-                        args: item.get("input").or_else(|| item.get("arguments")).cloned(),
+                        args: item
+                            .get("input")
+                            .or_else(|| item.get("arguments"))
+                            .map(parse_tool_args_value),
                     }]
                 }
             };
@@ -511,8 +511,13 @@ fn claude_code_document_events(doc: &serde_json::Value, blob_path: &Path) -> Vec
         }
     }
     if events.is_empty()
-        && blob_path.components().any(|c| c.as_os_str() == "local-agent-mode-sessions")
-        && ["title", "sessionId", "cliSessionId", "cwd"].iter().any(|key| {
+        && blob_path.components().any(|c| {
+            matches!(
+                c.as_os_str().to_str(),
+                Some("local-agent-mode-sessions" | "claude-code-sessions")
+            )
+        })
+        && ["title", "cwd", "model", "cliSessionId", "sessionId"].iter().any(|key| {
             doc.get(*key)
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|s| !s.trim().is_empty())
@@ -716,18 +721,56 @@ fn codex_document_events(doc: &serde_json::Value) -> Vec<BlobEvent> {
                 _ => BlockKind::Text,
             };
             let tool_name = item.get("name").and_then(serde_json::Value::as_str).map(str::to_string);
-            let args = item.get("input").or_else(|| item.get("arguments")).cloned();
-            let blocks = match content_val {
-                Some(serde_json::Value::Array(arr)) if !arr.is_empty() => (0..arr.len())
-                    .map(|i| RawBlock {
-                        index: i as u32,
-                        kind,
-                        tool_use_id: tool_use_id.clone(),
-                        tool_name: tool_name.clone(),
-                        args: args.clone(),
-                    })
-                    .collect(),
-                _ => vec![RawBlock { index: 0, kind, tool_use_id, tool_name, args }],
+            let args = item
+                .get("input")
+                .or_else(|| item.get("arguments"))
+                .map(parse_tool_args_value);
+            let blocks = match role {
+                "tool_result" => vec![RawBlock {
+                    index: 0,
+                    kind: BlockKind::ToolResult,
+                    tool_use_id,
+                    tool_name: None,
+                    args: None,
+                }],
+                "tool_call" => vec![RawBlock {
+                    index: 0,
+                    kind: BlockKind::ToolUse,
+                    tool_use_id,
+                    tool_name,
+                    args,
+                }],
+                _ => {
+                    let mut tool_use_blocks = Vec::new();
+                    if let Some(serde_json::Value::Array(arr)) = content_val {
+                        for (i, block) in arr.iter().enumerate() {
+                            if block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+                                && let Some(name) = block.get("name").and_then(serde_json::Value::as_str)
+                            {
+                                tool_use_blocks.push(RawBlock {
+                                    index: i as u32,
+                                    kind: BlockKind::ToolUse,
+                                    tool_use_id: block
+                                        .get("id")
+                                        .or_else(|| block.get("call_id"))
+                                        .or_else(|| block.get("tool_use_id"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_string),
+                                    tool_name: Some(name.to_string()),
+                                    args: block
+                                        .get("input")
+                                        .or_else(|| block.get("arguments"))
+                                        .map(parse_tool_args_value),
+                                });
+                            }
+                        }
+                    }
+                    if tool_use_blocks.is_empty() {
+                        vec![RawBlock { index: 0, kind, tool_use_id, tool_name, args }]
+                    } else {
+                        tool_use_blocks
+                    }
+                }
             };
             events.push(BlobEvent {
                 event: RawEvent { event_key, blocks },
@@ -1648,6 +1691,63 @@ fn strip_claude_object_tool_use_result(
     strip_owned_values_in_object(obj, None, owned_bodies, placeholder);
 }
 
+/// Parse OpenAI/Codex stringified JSON tool arguments (`"{\"cmd\":\"...\"}"`)
+/// into their underlying JSON value when possible, mirroring FAD's JSONL
+/// `parse_tool_call_arguments` path.
+pub(crate) fn parse_tool_args_value(raw: &serde_json::Value) -> serde_json::Value {
+    if let Some(s) = raw.as_str()
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+    {
+        return parsed;
+    }
+    raw.clone()
+}
+
+/// Whether a `toolUseResult` payload string (`stdout`/`stderr`/`output`/
+/// `content`/`text`) is proven to belong to an excluded body:
+/// - exact or prefix/suffix component (e.g. `body = stdout + "\n" + stderr`,
+///   regardless of `stderr` length),
+/// - substring with bounded slack, >= 16 bytes, or carrying `<cass_recall`,
+/// - or an untruncated source whose truncated prefix became `body` (e.g. 35 KB
+///   `toolUseResult.stdout` while `message.content` was truncated at 30 KB).
+fn is_object_payload_copy(recorded: &str, body: &str) -> bool {
+    let st = recorded.trim();
+    let bt = body.trim();
+    if st.is_empty() || bt.is_empty() {
+        return false;
+    }
+    if st == bt || bt.starts_with(st) || bt.ends_with(st) {
+        return true;
+    }
+    if bt.contains(st)
+        && (recorded.len().saturating_add(TOOL_USE_RESULT_WRAPPER_SLACK) >= body.len()
+            || st.len() >= 16
+            || st.contains("<cass_recall"))
+    {
+        return true;
+    }
+    if st.len() > bt.len() {
+        let common_prefix = st
+            .bytes()
+            .zip(bt.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common_prefix >= 64 || (bt.len() >= 16 && common_prefix.saturating_mul(2) >= bt.len()) {
+            return true;
+        }
+        if st.len() >= 64 {
+            let mut boundary = 64;
+            while boundary > 0 && !st.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            if boundary >= 32 && bt.contains(&st[..boundary]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn strip_owned_values_in_object(
     node: &mut serde_json::Value,
     key_hint: Option<&str>,
@@ -1658,14 +1758,7 @@ fn strip_owned_values_in_object(
         serde_json::Value::String(recorded) => {
             let exact_or_superset = owned_bodies.iter().any(|body| is_owned_body_copy(recorded, body));
             let payload_key_copy = matches!(key_hint, Some("stdout" | "stderr" | "output" | "content" | "text"))
-                && !recorded.trim().is_empty()
-                && owned_bodies.iter().any(|body| {
-                    let st = recorded.trim();
-                    let bt = body.trim();
-                    st == bt
-                        || (bt.contains(st)
-                            && recorded.len().saturating_add(TOOL_USE_RESULT_WRAPPER_SLACK) >= body.len())
-                });
+                && owned_bodies.iter().any(|body| is_object_payload_copy(recorded, body));
             if exact_or_superset || payload_key_copy {
                 *node = placeholder.clone();
             }
@@ -1909,6 +2002,7 @@ fn apply_extra(
         let raw = extra[HISTORICAL_RAW_JSON_SENTINEL_KEY].as_str().unwrap_or_default().to_string();
         if let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(&raw) {
             let bodies = owned_bodies(&inner, target_blocks, own_body);
+            strip_top_level_document_body(&mut inner, &bodies, placeholder);
             for path in field_map {
                 let segments: Vec<&str> = path.split('.').collect();
                 apply_path(&mut inner, &segments, target_blocks, placeholder);
@@ -1916,13 +2010,13 @@ fn apply_extra(
             strip_claude_string_tool_use_result(&mut inner, &bodies, placeholder);
             strip_claude_array_tool_use_result(&mut inner, &bodies, placeholder);
             strip_claude_object_tool_use_result(&mut inner, &bodies, placeholder);
-            strip_top_level_document_body(&mut inner, &bodies, placeholder);
             let rewritten = serde_json::to_string(&inner).unwrap_or(raw);
             extra[HISTORICAL_RAW_JSON_SENTINEL_KEY] = serde_json::Value::String(rewritten);
         }
         return;
     }
     let bodies = owned_bodies(extra, target_blocks, own_body);
+    strip_top_level_document_body(extra, &bodies, placeholder);
     for path in field_map {
         let segments: Vec<&str> = path.split('.').collect();
         apply_path(extra, &segments, target_blocks, placeholder);
@@ -1930,7 +2024,6 @@ fn apply_extra(
     strip_claude_string_tool_use_result(extra, &bodies, placeholder);
     strip_claude_array_tool_use_result(extra, &bodies, placeholder);
     strip_claude_object_tool_use_result(extra, &bodies, placeholder);
-    strip_top_level_document_body(extra, &bodies, placeholder);
 }
 
 fn sha256_hex(text: &str) -> String {

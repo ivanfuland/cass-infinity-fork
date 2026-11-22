@@ -2236,3 +2236,265 @@ fn mcp_activate_v2_multiline_json_multi_tool_string_array_and_codex_doc() {
         );
     }
 }
+
+#[test]
+fn mcp_activate_v2_r2_round2_regressions() {
+    let fixture = Fixture::new();
+    let case = CaseDir::new("mcp_activate_v2_plan_a", "r2-round2-regressions");
+
+    const B2_CLI_SECRET: &str = "r2_2_b2_codex_json_stringified_cli_secret";
+    const B2_AGENTS_SECRET: &str = "r2_2_b2_codex_json_stringified_agents_md_secret";
+    const B3_CODEX_33M_SECRET: &str = "r2_2_b3_codex_33mb_mcp_secret";
+    const B3_CLAUDE_33M_SECRET: &str = "r2_2_b3_claude_33mb_mcp_secret";
+    const B4A_STDERR_STDOUT_SECRET: &str = "r2_2_b4a_bash_stdout_with_long_stderr_secret";
+    const B4A_TRUNC_HEAD_SECRET: &str = "r2_2_b4a_bash_truncated_stdout_head_secret";
+    const B4A_TRUNC_TAIL_SECRET: &str = "r2_2_b4a_bash_truncated_stdout_tail_secret";
+    const B4B_CLAUDE_PART1_SECRET: &str = "r2_2_b4b_claude_idless_multipart_part1_secret";
+    const B4B_CLAUDE_PART2_SECRET: &str = "r2_2_b4b_claude_idless_multipart_part2_secret";
+    const B4B_CODEX_PART1_SECRET: &str = "r2_2_b4b_codex_idless_multipart_part1_secret";
+    const B4B_CODEX_PART2_SECRET: &str = "r2_2_b4b_codex_idless_multipart_part2_secret";
+
+    // 1. B2: Codex whole-document .json with JSON-stringified `arguments` (direct CLI recall + R2 AGENTS.md).
+    let codex_str_args = json!({
+        "id": "codex-b2-str-args",
+        "items": [
+            {"id": "u0", "role": "user", "content": "find prior recall and read AGENTS.md"},
+            {
+                "id": "c1",
+                "role": "tool_call",
+                "call_id": "call_b2_cli",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"cass search \\\"alpha\\\" --recall\"}",
+                "content": "exec_command"
+            },
+            {
+                "id": "r1",
+                "role": "tool_result",
+                "call_id": "call_b2_cli",
+                "content": wrapper(RecallTool::Search, &native_search_value(B2_CLI_SECRET))
+            },
+            {
+                "id": "c2",
+                "role": "tool_call",
+                "call_id": "call_b2_read",
+                "name": "project_read",
+                "arguments": "{\"document\":\"memory\"}",
+                "content": "project_read"
+            },
+            {
+                "id": "r2",
+                "role": "tool_result",
+                "call_id": "call_b2_read",
+                "content": B2_AGENTS_SECRET
+            }
+        ]
+    });
+    let codex_b2_path = fixture.home().join(".codex/sessions/2026/06/01/rollout-b2-str-args.json");
+    std::fs::create_dir_all(codex_b2_path.parent().unwrap()).unwrap();
+    std::fs::write(&codex_b2_path, serde_json::to_string_pretty(&codex_str_args).unwrap() + "\n").unwrap();
+
+    // 2. B3: >= 32 MiB whole-document Codex & Claude .json triggering `compact_message_extra`.
+    let big_padding = "P".repeat(33 * 1024 * 1024);
+    let codex_big = json!({
+        "id": "codex-b3-33mb",
+        "items": [
+            {"id": "u0", "role": "user", "content": big_padding},
+            {
+                "id": "c1",
+                "role": "tool_call",
+                "call_id": "call_b3_codex_mcp",
+                "name": "mcp__cass-mcp__cass_search",
+                "input": {"query": "big-codex"},
+                "content": "mcp__cass-mcp__cass_search"
+            },
+            {
+                "id": "r1",
+                "role": "tool_result",
+                "call_id": "call_b3_codex_mcp",
+                "content": wrapper(RecallTool::Search, &native_search_value(B3_CODEX_33M_SECRET))
+            }
+        ]
+    });
+    let codex_b3_path = fixture.home().join(".codex/sessions/2026/06/02/rollout-b3-big.json");
+    std::fs::create_dir_all(codex_b3_path.parent().unwrap()).unwrap();
+    std::fs::write(&codex_b3_path, serde_json::to_string(&codex_big).unwrap()).unwrap();
+
+    let claude_big = json!({
+        "title": "Claude 33 MiB Whole Doc",
+        "messages": [
+            {"role": "user", "timestamp": "2026-01-06T00:00:00.000Z", "content": big_padding},
+            {
+                "role": "assistant",
+                "timestamp": "2026-01-06T00:00:01.000Z",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_b3_read", "name": "Read", "input": {"file_path": "/synthetic/a.txt"}},
+                    {"type": "tool_use", "id": "toolu_b3_mcp", "name": "mcp__cass-mcp__cass_search", "input": {"query": "big-claude"}}
+                ]
+            },
+            {"role": "tool_result", "timestamp": "2026-01-06T00:00:02.000Z", "tool_use_id": "toolu_b3_read", "content": "normal file body stays"},
+            {"role": "tool_result", "timestamp": "2026-01-06T00:00:03.000Z", "tool_use_id": "toolu_b3_mcp", "content": wrapper(RecallTool::Search, &native_search_value(B3_CLAUDE_33M_SECRET))}
+        ]
+    });
+    let claude_b3_path = fixture.home().join(".claude/projects/r2-b3/big-claude.json");
+    std::fs::create_dir_all(claude_b3_path.parent().unwrap()).unwrap();
+    std::fs::write(&claude_b3_path, serde_json::to_string(&claude_big).unwrap()).unwrap();
+
+    // 3. B4a: Claude Bash object `toolUseResult.stdout` with (i) >1024B stderr, and (ii) 35 KB truncated stdout.
+    let short_stdout = wrapper(RecallTool::Search, &native_search_value(B4A_STDERR_STDOUT_SECRET));
+    let long_stderr = format!("WARN_LONG_STDERR_{}", "E".repeat(2500));
+    let combined_content = format!("{short_stdout}\n{long_stderr}");
+    let bash_stderr_jsonl = [
+        json!({
+            "type": "user", "uuid": "b4a1-u0", "sessionId": "sid-b4a1", "timestamp": "2026-01-06T01:00:00.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": "run cass search with noisy stderr"}]}
+        }),
+        json!({
+            "type": "assistant", "uuid": "b4a1-a1", "sessionId": "sid-b4a1", "timestamp": "2026-01-06T01:00:01.000Z",
+            "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_b4a1", "name": "Bash", "input": {"command": "cass search \"alpha\" --recall"}}]}
+        }),
+        json!({
+            "type": "user", "uuid": "b4a1-r2", "sessionId": "sid-b4a1", "timestamp": "2026-01-06T01:00:02.000Z",
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_b4a1", "content": combined_content}]},
+            "toolUseResult": {"stdout": short_stdout, "stderr": long_stderr, "interrupted": false, "isImage": false}
+        }),
+    ]
+    .iter()
+    .map(Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let b4a1_path = fixture.home().join(".claude/projects/r2-b4a/bash-long-stderr.jsonl");
+    std::fs::create_dir_all(b4a1_path.parent().unwrap()).unwrap();
+    std::fs::write(&b4a1_path, bash_stderr_jsonl).unwrap();
+
+    let huge_stdout = format!(
+        "<cass_recall version=\"1\" tool=\"cass_search\">{{\"hits\":[{{\"snippet\":\"{B4A_TRUNC_HEAD_SECRET}_{}_{B4A_TRUNC_TAIL_SECRET}\"}}]}}</cass_recall>",
+        "Z".repeat(34_000)
+    );
+    let truncated_content = format!("{}... [34500 chars total, truncated]", &huge_stdout[..30_000]);
+    let bash_trunc_jsonl = [
+        json!({
+            "type": "user", "uuid": "b4a2-u0", "sessionId": "sid-b4a2", "timestamp": "2026-01-06T01:01:00.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": "run cass search with truncated stdout"}]}
+        }),
+        json!({
+            "type": "assistant", "uuid": "b4a2-a1", "sessionId": "sid-b4a2", "timestamp": "2026-01-06T01:01:01.000Z",
+            "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_b4a2", "name": "Bash", "input": {"command": "cass search \"beta\" --recall"}}]}
+        }),
+        json!({
+            "type": "user", "uuid": "b4a2-r2", "sessionId": "sid-b4a2", "timestamp": "2026-01-06T01:01:02.000Z",
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_b4a2", "content": truncated_content}]},
+            "toolUseResult": {"stdout": huge_stdout, "stderr": "", "interrupted": false, "isImage": false}
+        }),
+    ]
+    .iter()
+    .map(Value::to_string)
+    .collect::<Vec<_>>()
+    .join("\n")
+        + "\n";
+    let b4a2_path = fixture.home().join(".claude/projects/r2-b4a/bash-truncated-stdout.jsonl");
+    std::fs::write(&b4a2_path, bash_trunc_jsonl).unwrap();
+
+    // 4. B4b: Whole-document .json ID-less multi-part array tool_result (Claude + Codex).
+    let claude_idless_multi = json!({
+        "title": "Claude ID-less Multipart Result",
+        "messages": [
+            {"role": "user", "timestamp": "2026-01-06T02:00:00.000Z", "content": "idless claude prompt stays"},
+            {
+                "role": "assistant",
+                "timestamp": "2026-01-06T02:00:01.000Z",
+                "content": [{"type": "tool_use", "name": "mcp__cass-mcp__cass_search", "input": {"query": "idless-claude"}}]
+            },
+            {
+                "role": "tool_result",
+                "timestamp": "2026-01-06T02:00:02.000Z",
+                "content": [
+                    {"type": "text", "text": wrapper(RecallTool::Search, &native_search_value(B4B_CLAUDE_PART1_SECRET))},
+                    {"type": "text", "text": format!("summary tail {B4B_CLAUDE_PART2_SECRET}")}
+                ]
+            }
+        ]
+    });
+    let claude_b4b_path = fixture.home().join(".claude/projects/r2-b4b/idless-multipart.json");
+    std::fs::create_dir_all(claude_b4b_path.parent().unwrap()).unwrap();
+    std::fs::write(&claude_b4b_path, serde_json::to_string_pretty(&claude_idless_multi).unwrap() + "\n").unwrap();
+
+    let codex_idless_multi = json!({
+        "id": "codex-b4b-idless-multi",
+        "items": [
+            {"id": "u0", "role": "user", "content": "idless codex prompt stays"},
+            {
+                "id": "c1",
+                "role": "tool_call",
+                "name": "mcp__cass-mcp__cass_search",
+                "arguments": "{\"query\":\"idless-codex\"}",
+                "content": "mcp__cass-mcp__cass_search"
+            },
+            {
+                "id": "r1",
+                "role": "tool_result",
+                "content": [
+                    {"type": "text", "text": wrapper(RecallTool::Search, &native_search_value(B4B_CODEX_PART1_SECRET))},
+                    {"type": "text", "text": format!("summary tail {B4B_CODEX_PART2_SECRET}")}
+                ]
+            }
+        ]
+    });
+    let codex_b4b_path = fixture.home().join(".codex/sessions/2026/06/03/rollout-b4b-idless-multi.json");
+    std::fs::create_dir_all(codex_b4b_path.parent().unwrap()).unwrap();
+    std::fs::write(&codex_b4b_path, serde_json::to_string_pretty(&codex_idless_multi).unwrap() + "\n").unwrap();
+
+    // 5. NB1: Claude Desktop sidecars under claude-code-sessions & local-agent-mode-sessions (model-only).
+    let sidecar1 = fixture.home().join("Library/Application Support/Claude/claude-code-sessions/s1.json");
+    std::fs::create_dir_all(sidecar1.parent().unwrap()).unwrap();
+    std::fs::write(&sidecar1, json!({"title": "Desktop Sidecar 1", "cwd": "/synthetic/ws"}).to_string()).unwrap();
+    let sidecar2 = fixture.home().join("Library/Application Support/Claude/local-agent-mode-sessions/s2.json");
+    std::fs::create_dir_all(sidecar2.parent().unwrap()).unwrap();
+    std::fs::write(&sidecar2, json!({"model": "claude-sonnet-4-5"}).to_string()).unwrap();
+
+    let output = fixture.index(&[], &[]);
+    write_evidence(&case, &["index", "--json"], &[], &output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "r2-round2 index failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("index json");
+    assert_eq!(report["success"], json!(true));
+    assert_eq!(report["recall_uncovered_total"], json!(0), "report={report}");
+    assert_eq!(
+        report["indexing_stats"]["event_align_failed"],
+        json!(0),
+        "desktop sidecars and whole-doc json must align with 0 failures: {report}"
+    );
+
+    let db = fixture.open_db();
+    // 8 excluded messages total: B2(2) + B3(2) + B4a(2) + B4b(2).
+    assert_eq!(marker_rule_versions(&db).len(), 8, "expected all 8 excluded rows");
+    let all_secrets = [
+        B2_CLI_SECRET,
+        B2_AGENTS_SECRET,
+        B3_CODEX_33M_SECRET,
+        B3_CLAUDE_33M_SECRET,
+        B4A_STDERR_STDOUT_SECRET,
+        B4A_TRUNC_HEAD_SECRET,
+        B4A_TRUNC_TAIL_SECRET,
+        B4B_CLAUDE_PART1_SECRET,
+        B4B_CLAUDE_PART2_SECRET,
+        B4B_CODEX_PART1_SECRET,
+        B4B_CODEX_PART2_SECRET,
+    ];
+    assert_excluded_rows_clean(&db, &all_secrets, "r2-round2-regressions");
+    let bodies = message_contents(&db);
+    for secret in all_secrets {
+        assert!(
+            !bodies.iter().any(|b| b.contains(secret)),
+            "secret {secret:?} leaked into messages.content"
+        );
+    }
+    assert!(
+        bodies.iter().any(|b| b == "normal file body stays"),
+        "non-recall sibling Read tool_result in 33 MiB Claude doc must remain preserved"
+    );
+}
