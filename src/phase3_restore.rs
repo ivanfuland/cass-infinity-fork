@@ -15217,14 +15217,6 @@ pub(crate) fn plan_mirror_restore(
             agent: family,
             sealed_source_size_bytes: head.source_size_bytes,
         };
-        // winner 选择仍按投影侧全字段口径（mirror 两侧都有源字节，没有理由降口径）。
-        // **与候选比时**才切到 candidate-comparable scope —— 两侧同 scope 才可比。
-        let comparable = CandidateComparableProjector(SealedMessageProjector {
-            scratch_root: &options.scratch_dir,
-            canonical_original_path: &identity.canonical_path,
-            agent: family,
-            sealed_source_size_bytes: head.source_size_bytes,
-        });
 
         // ── mirror 侧的版本集合 ────────────────────────────────────────
         let mut versions = Vec::with_capacity(indices.len());
@@ -15300,8 +15292,33 @@ pub(crate) fn plan_mirror_restore(
         };
 
         // ── candidate 侧 ──────────────────────────────────────────────
+        let winner_view = &views[indices[winner_index]];
+        // Prefer the winning manifest's session key; if a legacy manifest won
+        // while a sibling in the same identity group carries a consistent
+        // session key, recover that key so relocated candidates are still found.
+        let session_key = manifest_session_key_from_view(winner_view).or_else(|| {
+            let mut unique: Option<MirrorSessionKey> = None;
+            for &idx in indices {
+                if let Some(key) = manifest_session_key_from_view(&views[idx]) {
+                    match &unique {
+                        None => unique = Some(key),
+                        Some(prev) if prev == &key => {}
+                        Some(_) => return None,
+                    }
+                }
+            }
+            unique
+        });
+        // winner 选择仍按投影侧全字段口径（mirror 两侧都有源字节，没有理由降口径）。
+        // **与候选比时**才切到 candidate-comparable scope，并绑定 winner 自身的源大小。
+        let comparable = CandidateComparableProjector(SealedMessageProjector {
+            scratch_root: &options.scratch_dir,
+            canonical_original_path: &identity.canonical_path,
+            agent: family,
+            sealed_source_size_bytes: winner_view.source_size_bytes,
+        });
         let candidates =
-            candidate_versions_from_db(&storage, &identity, manifest_session_key_from_view(head).as_ref())?;
+            candidate_versions_from_db(&storage, &identity, session_key.as_ref())?;
         report.candidate_versions_seen += candidates.len();
         // R-E-68：**零会话投影**降为具名 HOLD，不再打死整轮。判据读的是 `ProjectionFault`
         // 这个具名类别，**不是** `detail` 的错误文案——文案是给人看的、随时会改，拿它做

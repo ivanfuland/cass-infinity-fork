@@ -19164,16 +19164,22 @@ fn build_pairing_candidates_with_events(
         _ => PairingCandidate::ToolCalls(paired),
     };
 
-    let invocations_to_candidate = |invocations: &[franken_agent_detection::NormalizedInvocation]| {
-        let paired: Vec<PairedTool> = invocations
-            .iter()
-            .map(|inv| PairedTool {
-                tool_call_id: inv.call_id.clone(),
-                tool_name: inv.name.clone(),
-                args: inv.arguments.as_ref().map(parse_tool_args_value),
-            })
-            .collect();
-        paired_to_candidate(paired)
+    let top_level_record_tool_call = |blob_event: &BlobEvent| -> Option<PairedTool> {
+        let rec = &blob_event.raw_record;
+        let name = rec.get("name").and_then(|v| v.as_str()).filter(|n| !n.is_empty())?;
+        Some(PairedTool {
+            tool_call_id: rec
+                .get("tool_call_id")
+                .or_else(|| rec.get("call_id"))
+                .or_else(|| rec.get("tool_use_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            tool_name: name.to_string(),
+            args: rec
+                .get("arguments")
+                .or_else(|| rec.get("input"))
+                .map(parse_tool_args_value),
+        })
     };
 
     let event_tool_calls = |blob_event: &BlobEvent| -> Vec<PairedTool> {
@@ -19194,24 +19200,59 @@ fn build_pairing_candidates_with_events(
         if !from_blocks.is_empty() {
             return from_blocks;
         }
-        let rec = &blob_event.raw_record;
-        if let Some(name) = rec.get("name").and_then(|v| v.as_str()).filter(|n| !n.is_empty()) {
-            return vec![PairedTool {
-                tool_call_id: rec
-                    .get("tool_call_id")
-                    .or_else(|| rec.get("call_id"))
-                    .or_else(|| rec.get("tool_use_id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                tool_name: name.to_string(),
-                args: rec
-                    .get("arguments")
-                    .or_else(|| rec.get("input"))
-                    .map(parse_tool_args_value),
-            }];
-        }
-        Vec::new()
+        top_level_record_tool_call(blob_event).into_iter().collect()
     };
+
+    let merge_invocations_with_event =
+        |invocations: &[franken_agent_detection::NormalizedInvocation],
+         blob_event: Option<&BlobEvent>| {
+            let mut paired: Vec<PairedTool> = invocations
+                .iter()
+                .map(|inv| PairedTool {
+                    tool_call_id: inv.call_id.clone(),
+                    tool_name: inv.name.clone(),
+                    args: inv.arguments.as_ref().map(parse_tool_args_value),
+                })
+                .collect();
+            if let Some(ev) = blob_event {
+                let ev_calls = event_tool_calls(ev);
+                if ev_calls.len() == paired.len()
+                    && ev_calls
+                        .iter()
+                        .zip(paired.iter())
+                        .all(|(ec, pc)| ec.tool_name == pc.tool_name)
+                {
+                    for (pc, ec) in paired.iter_mut().zip(ev_calls.into_iter()) {
+                        if pc.tool_call_id.is_none() {
+                            pc.tool_call_id = ec.tool_call_id;
+                        }
+                        if pc.args.is_none() {
+                            pc.args = ec.args;
+                        }
+                    }
+                } else {
+                    for pc in &mut paired {
+                        if pc.tool_call_id.is_some() && pc.args.is_some() {
+                            continue;
+                        }
+                        let mut matches = ev_calls.iter().filter(|ec| {
+                            ec.tool_name == pc.tool_name
+                                && (pc.tool_call_id.is_none()
+                                    || ec.tool_call_id == pc.tool_call_id)
+                        });
+                        if let (Some(only), None) = (matches.next(), matches.next()) {
+                            if pc.tool_call_id.is_none() {
+                                pc.tool_call_id = only.tool_call_id.clone();
+                            }
+                            if pc.args.is_none() {
+                                pc.args = only.args.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            paired_to_candidate(paired)
+        };
 
     let event_tool_result_id = |blob_event: &BlobEvent| -> Option<String> {
         let mut unique_id: Option<&str> = None;
@@ -19248,7 +19289,7 @@ fn build_pairing_candidates_with_events(
                 "user" => PairingCandidate::TurnBoundary,
                 "tool_call" => {
                     if !m.invocations.is_empty() {
-                        invocations_to_candidate(&m.invocations)
+                        merge_invocations_with_event(&m.invocations, blob_event)
                     } else {
                         // Whole-document Codex `.json` `items[]` entries with
                         // top-level `role: "tool_call"` carry their metadata on
@@ -19287,8 +19328,16 @@ fn build_pairing_candidates_with_events(
                         }
                     }
                 }
-                "assistant" | "agent" if !m.invocations.is_empty() => {
-                    invocations_to_candidate(&m.invocations)
+                "assistant" | "agent" => {
+                    if !m.invocations.is_empty() {
+                        merge_invocations_with_event(&m.invocations, blob_event)
+                    } else if let Some(top_call) = blob_event.and_then(top_level_record_tool_call) {
+                        PairingCandidate::ToolCall(top_call)
+                    } else {
+                        PairingCandidate::ToolResult {
+                            tool_call_id: Some(format!("__cass_pairing_neutral_{idx}__")),
+                        }
+                    }
                 }
                 "tool_result" => PairingCandidate::ToolResult {
                     tool_call_id: m

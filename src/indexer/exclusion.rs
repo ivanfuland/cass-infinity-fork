@@ -461,6 +461,7 @@ fn claude_code_document_events(doc: &serde_json::Value, blob_path: &Path) -> Vec
                         let tool_use_id = block
                             .get("id")
                             .and_then(|v| v.as_str())
+                            .or_else(|| block.get("call_id").and_then(|v| v.as_str()))
                             .or_else(|| block.get("tool_use_id").and_then(|v| v.as_str()))
                             .map(str::to_string);
                         let tool_name = block.get("name").and_then(|v| v.as_str()).map(str::to_string);
@@ -1791,18 +1792,15 @@ fn strip_owned_values_in_object(
 }
 
 /// Whole-document `.json` items carry their body directly on top-level
-/// `content`/`text`/`output` (no outer `message` or `payload` envelope), either
-/// as a bare string or as an array of bare strings / text blocks. Replace only
-/// values proven to copy an owned excluded body without disturbing unrelated
-/// fields or elements.
+/// `content`/`text`/`output` (either as a bare string or as an array of bare
+/// strings / text blocks), and may also carry unrelated sibling fields such as
+/// `"message": "ok"` or `"payload": null`. Replace only values proven to copy
+/// an owned excluded body without disturbing unrelated fields or elements.
 fn strip_top_level_document_body(
     value: &mut serde_json::Value,
     owned_bodies: &[String],
     placeholder: &serde_json::Value,
 ) {
-    if value.get("message").is_some() || value.get("payload").is_some() {
-        return;
-    }
     for key in ["content", "text", "output"] {
         match value.get_mut(key) {
             Some(slot @ serde_json::Value::String(_)) => {

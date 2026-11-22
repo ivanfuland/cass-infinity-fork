@@ -1358,3 +1358,136 @@ fn schema9_mixed_claude_and_claude_code_manifests_unify_identity_and_relink() {
         "legacy provider=claude manifest db_links must remain intact after mirror-relink --apply: {relink_manifest}"
     );
 }
+
+#[test]
+fn schema9_mixed_claude_group_uses_winner_session_key_across_relocated_path() {
+    use coding_agent_search::raw_mirror::{
+        RAW_MIRROR_LOCAL_IDENTITY_HOST, RawMirrorSessionIdentity, capture_source_file_with_identity,
+    };
+
+    let line = |role: &str, uuid: &str, sid: &str, ts: &str, text: &str| -> String {
+        json!({
+            "type": role,
+            "uuid": uuid,
+            "sessionId": sid,
+            "timestamp": ts,
+            "message": {"role": role, "content": [{"type": "text", "text": text}]}
+        })
+        .to_string()
+    };
+
+    // Seed DB at relocated path `new-home/.claude/projects/repro-b3/session.jsonl`
+    // with diverged assistant answer at idx=1.
+    let fixture = LegacyFixture::new();
+    let new_proj = fixture.home().join(".claude/projects/repro-b3");
+    fs::create_dir_all(&new_proj).expect("mkdir new_proj");
+    let new_sess = new_proj.join("session.jsonl");
+    let old_proj = fixture.root.path().join("old-home/.claude/projects/repro-b3");
+    fs::create_dir_all(&old_proj).expect("mkdir old_proj");
+    let old_sess = old_proj.join("session.jsonl");
+
+    // Pick a deterministic user prompt suffix such that the legacy `provider="claude"`
+    // manifest_id sorts strictly BEFORE the Plan-A `provider="claude_code"` winner's
+    // manifest_id (`head = M_legacy`, `winner = M_winner`).
+    let mut chosen_prompt = String::new();
+    let mut mirror_dir = fixture.root.path().join("mirror-b3-init");
+    let mut seeded_db_done = false;
+    for attempt in 0..64u32 {
+        let prompt = format!("initial question {attempt}");
+        let cand_mirror = fixture.root.path().join(format!("mirror-b3-try-{attempt}"));
+        fs::create_dir_all(&cand_mirror).expect("mkdir cand_mirror");
+
+        let legacy_body = format!(
+            "{}\n",
+            line("user", "b3-u0", "sid-b3", "2026-01-10T00:00:00.000Z", &prompt),
+        );
+        fs::write(&old_sess, legacy_body.as_bytes()).expect("write legacy old_sess");
+        let cap_legacy = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &cand_mirror,
+            provider: "claude",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: Some("local"),
+            source_path: &old_sess,
+            db_links: &[],
+        })
+        .expect("capture legacy claude manifest");
+
+        let winner_body = format!(
+            "{}\n{}\n{}\n",
+            line("user", "b3-u0", "sid-b3", "2026-01-10T00:00:00.000Z", &prompt),
+            line("assistant", "b3-a1-mir", "sid-b3", "2026-01-10T00:00:01.000Z", "MIRROR_CONFLICTING_ANSWER"),
+            line("user", "b3-u2-mir", "sid-b3", "2026-01-10T00:00:02.000Z", "MIRROR_DIVERGED_TAIL_APPENDED"),
+        );
+        fs::write(&old_sess, winner_body.as_bytes()).expect("write winner old_sess");
+        let cap_winner = capture_source_file_with_identity(
+            RawMirrorCaptureInput {
+                data_dir: &cand_mirror,
+                provider: "claude_code",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: Some("local"),
+                source_path: &old_sess,
+                db_links: &[],
+            },
+            RawMirrorSessionIdentity {
+                identity_host: RAW_MIRROR_LOCAL_IDENTITY_HOST,
+                external_id: Some("repro-b3/session.jsonl"),
+            },
+        )
+        .expect("capture Plan-A claude_code winner manifest");
+
+        if cap_legacy.manifest_id < cap_winner.manifest_id {
+            chosen_prompt = prompt;
+            mirror_dir = cand_mirror;
+            seeded_db_done = true;
+            break;
+        }
+        let _ = fs::remove_dir_all(&cand_mirror);
+    }
+    assert!(
+        seeded_db_done,
+        "failed to find manifest ordering with legacy_id < winner_id"
+    );
+
+    let db_body = format!(
+        "{}\n{}\n",
+        line("user", "b3-u0", "sid-b3", "2026-01-10T00:00:00.000Z", &chosen_prompt),
+        line("assistant", "b3-a1-db", "sid-b3", "2026-01-10T00:00:01.000Z", "DB_DIVERGED_ANSWER_KEEP_SAFE"),
+    );
+    fs::write(&new_sess, db_body.as_bytes()).expect("write relocated new_sess");
+    let idx_out = fixture.run_cass(&["index", "--json"]);
+    assert_eq!(idx_out.status.code(), Some(0), "seed relocated DB failed");
+
+    let scratch = fixture.root.path().join("scratch-b3");
+    fs::create_dir_all(&scratch).expect("mkdir scratch-b3");
+    let dry = fixture.run_cass(&[
+        "mirror-restore",
+        "--data-dir",
+        mirror_dir.to_str().unwrap(),
+        "--candidate-db",
+        fixture.db_path().to_str().unwrap(),
+        "--scratch",
+        scratch.to_str().unwrap(),
+        "--snapshot-root",
+        "snap-b3-reloc",
+        "--json",
+    ]);
+    assert_eq!(
+        dry.status.code(),
+        Some(0),
+        "mirror-restore dry-run failed: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let dry_json: Value = serde_json::from_slice(&dry.stdout).expect("dry json");
+    assert_eq!(dry_json["manifests_seen"], json!(2), "dry={dry_json}");
+    assert_eq!(dry_json["identities_considered"], json!(1), "dry={dry_json}");
+    assert_eq!(
+        dry_json["candidate_versions_seen"],
+        json!(1),
+        "must resolve relocated DB candidate via winner's MirrorSessionKey even when head is legacy claude manifest: {dry_json}"
+    );
+    assert_eq!(dry_json["hold_diverged"], json!(1), "must HOLD diverged candidate: {dry_json}");
+    assert_eq!(dry_json["restore"], json!(0), "must not plan RestoreNew: {dry_json}");
+    assert_eq!(dry_json["planned_actions"], json!(0), "dry={dry_json}");
+}

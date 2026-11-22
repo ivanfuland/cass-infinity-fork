@@ -795,19 +795,12 @@ fn relative_and_symlinked_data_dirs_keep_the_incremental_state() {
 }
 
 /// Registered paths must survive both ordinary write paths and replay. Each
-/// cell owns its HOME, XDG directories, database and source-safety policy.
+/// cell owns its HOME, XDG directories and database.
 #[test]
 fn a4_registered_fallback_replay_preserves_source() {
     for streaming in [false, true] {
         for concurrent in [false, true] {
             let env = Env::new(streaming);
-            let policy = env.root().join("source-safety.toml");
-            std::fs::copy(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("config/excluded_context_paths.toml"),
-                &policy,
-            )
-            .expect("copy private safety policy");
             let storage = FrankenStorage::open(&env.db_path()).unwrap();
             let mut source = Source::remote(FALLBACK_SOURCE_ID, "registered-host");
             source.machine_id = Some("registered-machine".into());
@@ -841,8 +834,6 @@ fn a4_registered_fallback_replay_preserves_source() {
                     .args([
                         "--verbose",
                         "index",
-                        "--source-safety-config",
-                        policy.to_str().unwrap(),
                         "--json",
                         "--data-dir",
                     ])

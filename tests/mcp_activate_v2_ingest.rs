@@ -2498,3 +2498,120 @@ fn mcp_activate_v2_r2_round2_regressions() {
         "non-recall sibling Read tool_result in 33 MiB Claude doc must remain preserved"
     );
 }
+
+#[test]
+fn mcp_activate_v2_r2_round3_regressions() {
+    let fixture = Fixture::new();
+    let case = CaseDir::new("mcp_activate_v2_plan_a", "r2-round3-regressions");
+
+    const B1_RECALL_SECRET: &str = "r2_3_b1_assistant_call_id_recall_secret";
+    const B1_AGENTS_SECRET: &str = "r2_3_b1_assistant_string_arguments_agents_secret";
+    const B2_MSG_SIBLING_SECRET: &str = "r2_3_b2_sibling_message_key_extra_bin_secret";
+    const B2_PAYLOAD_NULL_SECRET: &str = "r2_3_b2_sibling_payload_null_extra_bin_secret";
+
+    // 1. B1: Whole-document Codex .json `assistant` turn carrying OpenAI-style
+    //    `call_id` + `arguments` inside `tool_use` content blocks.
+    let codex_assistant_doc = json!({
+        "id": "codex-r2-3-b1",
+        "items": [
+            {"id": "u0", "role": "user", "content": "check previous fixes and read AGENTS.md"},
+            {
+                "id": "a1",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "call_id": "call_r2_3_recall_1",
+                        "name": "mcp__cass-mcp__cass_search",
+                        "arguments": "{\"query\":\"r2-3\"}"
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "call_r2_3_agents_2",
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"cat /synthetic/ws/CLAUDE.local.md\"}"
+                    }
+                ]
+            },
+            {
+                "id": "r1",
+                "role": "tool_result",
+                "call_id": "call_r2_3_recall_1",
+                "content": wrapper(RecallTool::Search, &native_search_value(B1_RECALL_SECRET))
+            },
+            {
+                "id": "r2",
+                "role": "tool_result",
+                "call_id": "call_r2_3_agents_2",
+                "content": B1_AGENTS_SECRET
+            }
+        ]
+    });
+    let codex_b1_path = fixture.home().join(".codex/sessions/2026/06/04/rollout-r2-3-b1.json");
+    std::fs::create_dir_all(codex_b1_path.parent().unwrap()).unwrap();
+    std::fs::write(&codex_b1_path, serde_json::to_string_pretty(&codex_assistant_doc).unwrap() + "\n").unwrap();
+
+    // 2. B2: Whole-document Claude .json `tool_result` carrying sibling `"message": "ok"`
+    //    or `"payload": null` alongside top-level `"content": "<cass_recall ...>"`.
+    let claude_sibling_keys_doc = json!({
+        "title": "Claude Sibling Message And Payload Keys Doc",
+        "messages": [
+            {"role": "user", "timestamp": "2026-01-09T00:00:00.000Z", "content": "search recall twice"},
+            {
+                "role": "assistant",
+                "timestamp": "2026-01-09T00:00:01.000Z",
+                "content": [
+                    {"type": "tool_use", "call_id": "tc_b2_msg", "name": "mcp__cass-mcp__cass_search", "input": {"query": "msg"}},
+                    {"type": "tool_use", "call_id": "tc_b2_pay", "name": "mcp__cass-mcp__cass_search", "input": {"query": "pay"}}
+                ]
+            },
+            {
+                "role": "tool_result",
+                "timestamp": "2026-01-09T00:00:02.000Z",
+                "tool_call_id": "tc_b2_msg",
+                "message": "ok",
+                "content": wrapper(RecallTool::Search, &native_search_value(B2_MSG_SIBLING_SECRET))
+            },
+            {
+                "role": "tool_result",
+                "timestamp": "2026-01-09T00:00:03.000Z",
+                "tool_call_id": "tc_b2_pay",
+                "payload": null,
+                "content": wrapper(RecallTool::Search, &native_search_value(B2_PAYLOAD_NULL_SECRET))
+            }
+        ]
+    });
+    let claude_b2_path = fixture.home().join(".claude/projects/r2-3-b2/sibling-keys.json");
+    std::fs::create_dir_all(claude_b2_path.parent().unwrap()).unwrap();
+    std::fs::write(&claude_b2_path, serde_json::to_string_pretty(&claude_sibling_keys_doc).unwrap() + "\n").unwrap();
+
+    let output = fixture.index(&[], &[]);
+    write_evidence(&case, &["index", "--json"], &[], &output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "r2-round3 index failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("index json");
+    assert_eq!(report["success"], json!(true));
+    assert_eq!(report["recall_uncovered_total"], json!(0), "report={report}");
+    assert_eq!(report["indexing_stats"]["event_align_failed"], json!(0), "report={report}");
+
+    let db = fixture.open_db();
+    assert_eq!(marker_rule_versions(&db).len(), 4, "all 4 B1/B2 tool results must be excluded");
+    let secrets = [
+        B1_RECALL_SECRET,
+        B1_AGENTS_SECRET,
+        B2_MSG_SIBLING_SECRET,
+        B2_PAYLOAD_NULL_SECRET,
+    ];
+    assert_excluded_rows_clean(&db, &secrets, "r2-round3-regressions");
+    let bodies = message_contents(&db);
+    for secret in secrets {
+        assert!(
+            !bodies.iter().any(|b| b.contains(secret)),
+            "secret {secret:?} leaked into messages.content"
+        );
+    }
+}
