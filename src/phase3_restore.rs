@@ -9401,6 +9401,18 @@ fn conversation_ids_for_identity(
     Ok(conversation_ids_for_identity_in_tx(&tx, identity)?)
 }
 
+/// Legacy Schema 9 manifests captured before Plan-A unification wrote
+/// `provider = "claude"`, while `ClaudeCodeConnector` persists rows under
+/// `agents.slug = "claude_code"`. Match both spellings when querying the
+/// candidate DB so legacy manifests resolve their existing `claude_code`
+/// conversations during both planning and publish backlinking.
+fn db_agent_slug_aliases(agent_slug: &str) -> &'static [&'static str] {
+    match agent_slug {
+        "claude" | "claude_code" => &["claude", "claude_code"],
+        _ => &[],
+    }
+}
+
 fn conversation_ids_for_identity_in_tx(
     tx: &crate::storage::api::Tx<'_>,
     identity: &RestoreIdentity,
@@ -9420,20 +9432,31 @@ fn conversation_ids_for_identity_in_tx(
         raw_host,
     );
 
+    let aliases = db_agent_slug_aliases(identity.origin.agent_slug.as_str());
+    let (slug_clause, host_param_idx) = if aliases.len() == 2 {
+        ("a.slug IN (?3, ?4)", 5)
+    } else {
+        ("a.slug = ?3", 4)
+    };
     let host_clause = match stored_host {
-        Some(_) => "AND TRIM(COALESCE(c.origin_host, '')) = ?4",
-        None => "AND TRIM(COALESCE(c.origin_host, '')) = ''",
+        Some(_) => format!("AND TRIM(COALESCE(c.origin_host, '')) = ?{host_param_idx}"),
+        None => "AND TRIM(COALESCE(c.origin_host, '')) = ''".to_string(),
     };
     let sql = format!(
         "SELECT c.id FROM conversations c JOIN agents a ON a.id = c.agent_id \
-         WHERE c.source_path = ?1 AND c.source_id = ?2 AND a.slug = ?3 {host_clause} \
+         WHERE c.source_path = ?1 AND c.source_id = ?2 AND {slug_clause} {host_clause} \
          ORDER BY c.id"
     );
     let mut params = vec![
         ParamValue::from(identity.canonical_path.as_str()),
         ParamValue::from(identity.origin.source_id.as_str()),
-        ParamValue::from(identity.origin.agent_slug.as_str()),
     ];
+    if aliases.len() == 2 {
+        params.push(ParamValue::from(aliases[0]));
+        params.push(ParamValue::from(aliases[1]));
+    } else {
+        params.push(ParamValue::from(identity.origin.agent_slug.as_str()));
+    }
     if let Some(host) = stored_host.as_deref() {
         params.push(ParamValue::from(host));
     }
@@ -9467,13 +9490,29 @@ fn conversation_ids_for_session_key_in_tx(
     use crate::storage::api::Value as ParamValue;
 
     // PR8 C1 introduced `conversations.identity_host`; the session key binds all three dimensions.
-    let sql = "SELECT c.id FROM conversations c JOIN agents a ON a.id = c.agent_id \
-               WHERE a.slug = ?1 AND c.external_id = ?2 AND c.identity_host = ?3 ORDER BY c.id";
-    let params = vec![
-        ParamValue::from(agent),
-        ParamValue::from(external_id),
-        ParamValue::from(identity_host),
-    ];
+    let aliases = db_agent_slug_aliases(agent);
+    let (sql, params) = if aliases.len() == 2 {
+        (
+            "SELECT c.id FROM conversations c JOIN agents a ON a.id = c.agent_id \
+             WHERE a.slug IN (?1, ?2) AND c.external_id = ?3 AND c.identity_host = ?4 ORDER BY c.id",
+            vec![
+                ParamValue::from(aliases[0]),
+                ParamValue::from(aliases[1]),
+                ParamValue::from(external_id),
+                ParamValue::from(identity_host),
+            ],
+        )
+    } else {
+        (
+            "SELECT c.id FROM conversations c JOIN agents a ON a.id = c.agent_id \
+             WHERE a.slug = ?1 AND c.external_id = ?2 AND c.identity_host = ?3 ORDER BY c.id",
+            vec![
+                ParamValue::from(agent),
+                ParamValue::from(external_id),
+                ParamValue::from(identity_host),
+            ],
+        )
+    };
     let ids: Vec<i64> = tx.query_all_map(sql, &params, |row| row.get_typed(0))?;
     Ok(ids)
 }
@@ -10118,12 +10157,6 @@ fn restore_publish_manifests(
                 // 绑**整条身份**，与候选侧同一处定义（R2 第 4 条 / 第 5 条互为镜像）。
                 // 修前这里只绑 `source_path`：库里另一条同路径、异来源的会话会先被选中，
                 // 于是 manifest 的 backlink 指向一条根本不是它的会话，且指错了不报错。
-                //
-                // Task15 R3: a source New input is installed under the connector's
-                // agent slug (`claude_code`), while the raw manifest keeps its
-                // original provider (`claude`). Only this publication lookup uses
-                // the validated declaration's connector; the raw provider, the
-                // restore identity/key and the legacy path stay unchanged.
                 let identity = restore_identity_from_view(view)?;
                 conversation_ids_for_manifest(
                     &storage,
@@ -14979,10 +15012,6 @@ fn candidate_versions_from_db(
     candidate_versions_for_ids(storage, &ids)
 }
 
-/// The source planning bridge: query the raw manifest provider's agent slug and
-/// the validated declaration's connector as two exact aliases, take the union
-/// of conversation ids, and sort/dedup before the existing candidate rules run.
-///
 fn candidate_versions_for_ids(
     storage: &crate::storage::sqlite::FrankenStorage,
     ids: &[i64],

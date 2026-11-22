@@ -823,6 +823,11 @@ pub struct PairedTool {
 pub enum PairingCandidate {
     TurnBoundary,
     ToolCall(PairedTool),
+    /// Whole-document `.json` messages can carry multiple parallel tool
+    /// invocations on one assistant message without splitting blocks into
+    /// separate `tool_call` rows. Every invocation registers at the same
+    /// message index `idx`.
+    ToolCalls(Vec<PairedTool>),
     ToolResult { tool_call_id: Option<String> },
 }
 
@@ -863,7 +868,12 @@ impl PairingContext {
         let mut by_id: HashMap<&str, (usize, &PairedTool)> = HashMap::new();
         let mut ambiguous_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (idx, c) in candidates.iter().enumerate() {
-            if let PairingCandidate::ToolCall(pt) = c {
+            let calls: &[PairedTool] = match c {
+                PairingCandidate::ToolCall(pt) => std::slice::from_ref(pt),
+                PairingCandidate::ToolCalls(pts) => pts.as_slice(),
+                _ => &[],
+            };
+            for pt in calls {
                 if let Some(id) = pt.tool_call_id.as_deref() {
                     if ambiguous_ids.contains(id) {
                         continue;
@@ -878,11 +888,16 @@ impl PairingContext {
 
         let mut resolved: HashMap<usize, PairedTool> = HashMap::new();
         let mut resolved_call_indices: HashMap<usize, usize> = HashMap::new();
-        let mut unpaired: Vec<usize> = Vec::new();
+        let mut unpaired: Vec<(usize, usize)> = Vec::new();
         for (idx, c) in candidates.iter().enumerate() {
             match c {
                 PairingCandidate::TurnBoundary => unpaired.clear(),
-                PairingCandidate::ToolCall(_) => unpaired.push(idx),
+                PairingCandidate::ToolCall(_) => unpaired.push((idx, 0)),
+                PairingCandidate::ToolCalls(pts) => {
+                    for sub_idx in 0..pts.len() {
+                        unpaired.push((idx, sub_idx));
+                    }
+                }
                 PairingCandidate::ToolResult { tool_call_id } => {
                     if let Some(id) = tool_call_id {
                         // B03: `call_idx < idx` -- see the `by_id` construction
@@ -891,8 +906,12 @@ impl PairingContext {
                         if let Some((call_idx, pt)) = by_id.get(id.as_str()).filter(|(call_idx, _)| *call_idx < idx) {
                             resolved.insert(idx, (*pt).clone());
                             resolved_call_indices.insert(idx, *call_idx);
-                            if let Some(pos) = unpaired.iter().position(|&i| {
-                                matches!(&candidates[i], PairingCandidate::ToolCall(p) if p.tool_call_id.as_deref() == Some(id.as_str()))
+                            if let Some(pos) = unpaired.iter().position(|&(i, sub_idx)| match &candidates[i] {
+                                PairingCandidate::ToolCall(p) => sub_idx == 0 && p.tool_call_id.as_deref() == Some(id.as_str()),
+                                PairingCandidate::ToolCalls(pts) => pts
+                                    .get(sub_idx)
+                                    .is_some_and(|p| p.tool_call_id.as_deref() == Some(id.as_str())),
+                                _ => false,
                             }) {
                                 unpaired.remove(pos);
                             }
@@ -900,8 +919,13 @@ impl PairingContext {
                         // id given but no EARLIER call carries it -> R4: not
                         // excluded (no entry in `resolved`).
                     } else if unpaired.len() == 1 {
-                        let call_idx = unpaired.remove(0);
-                        if let PairingCandidate::ToolCall(pt) = &candidates[call_idx] {
+                        let (call_idx, sub_idx) = unpaired.remove(0);
+                        let paired = match &candidates[call_idx] {
+                            PairingCandidate::ToolCall(pt) if sub_idx == 0 => Some(pt),
+                            PairingCandidate::ToolCalls(pts) => pts.get(sub_idx),
+                            _ => None,
+                        };
+                        if let Some(pt) = paired {
                             resolved.insert(idx, pt.clone());
                             resolved_call_indices.insert(idx, call_idx);
                         }
@@ -1674,9 +1698,10 @@ fn strip_owned_values_in_object(
 }
 
 /// Whole-document `.json` items carry their body directly on top-level
-/// `content`/`text` (no outer `message` or `payload` envelope). Replace bare
-/// string copies proven to match an owned excluded body without disturbing
-/// structured arrays (which `EXTRA_FIELD_MAP`'s `content[*].*` entries handle).
+/// `content`/`text`/`output` (no outer `message` or `payload` envelope), either
+/// as a bare string or as an array of bare strings / text blocks. Replace only
+/// values proven to copy an owned excluded body without disturbing unrelated
+/// fields or elements.
 fn strip_top_level_document_body(
     value: &mut serde_json::Value,
     owned_bodies: &[String],
@@ -1685,13 +1710,40 @@ fn strip_top_level_document_body(
     if value.get("message").is_some() || value.get("payload").is_some() {
         return;
     }
-    for key in ["content", "text"] {
-        let is_owned = value
-            .get(key)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|recorded| owned_bodies.iter().any(|body| is_owned_body_copy(recorded, body)));
-        if is_owned && let Some(slot) = value.get_mut(key) {
-            *slot = placeholder.clone();
+    for key in ["content", "text", "output"] {
+        match value.get_mut(key) {
+            Some(slot @ serde_json::Value::String(_)) => {
+                if let Some(recorded) = slot.as_str()
+                    && owned_bodies.iter().any(|body| is_owned_body_copy(recorded, body))
+                {
+                    *slot = placeholder.clone();
+                }
+            }
+            Some(serde_json::Value::Array(items)) => {
+                let joined = project_parts(items);
+                if !joined.is_empty()
+                    && owned_bodies.iter().any(|body| is_owned_body_copy(&joined, body))
+                {
+                    for item in items.iter_mut() {
+                        if item.as_str().is_some_and(|text| !text.is_empty()) {
+                            *item = placeholder.clone();
+                        } else if is_joined_text_part(item)
+                            && let Some(slot) = item.get_mut("text")
+                        {
+                            *slot = placeholder.clone();
+                        }
+                    }
+                } else {
+                    for item in items.iter_mut() {
+                        if let Some(recorded) = item.as_str()
+                            && owned_bodies.iter().any(|body| is_owned_body_copy(recorded, body))
+                        {
+                            *item = placeholder.clone();
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }

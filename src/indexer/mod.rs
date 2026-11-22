@@ -16530,14 +16530,31 @@ fn route_fixed_watch(
                 plan.meta.canonical_path.clone(),
                 explicit_watch_once.then(|| selected.clone()),
             );
-            if !seen_units.insert(unit_key) {
-                continue;
-            }
             let read_root = if explicit_watch_once {
                 plan.root.with_path(selected.clone())
             } else {
                 plan.root.clone()
             };
+            if !seen_units.insert(unit_key) {
+                if let Some(existing) = route.legacy.iter_mut().find(|trigger| {
+                    trigger.kind == kind
+                        && !trigger.native
+                        && trigger.root.path == read_root.path
+                        && trigger.root.origin.source_id == plan.root.origin.source_id
+                        && trigger.meta.as_ref().map(|m| m.root_id.as_str())
+                            == Some(plan.meta.root_id.as_str())
+                }) {
+                    existing.min_ts = match (existing.min_ts, modified_ms) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    existing.max_ts = match (existing.max_ts, modified_ms) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                }
+                continue;
+            }
             route.legacy.push(LegacyWatchTrigger {
                 kind,
                 root: read_root,
@@ -19128,26 +19145,62 @@ pub(crate) fn build_pairing_candidates(
 ) -> Vec<crate::indexer::exclusion::PairingCandidate> {
     use crate::indexer::exclusion::{PairedTool, PairingCandidate};
 
+    let invocations_to_candidate = |invocations: &[franken_agent_detection::NormalizedInvocation]| {
+        let mut paired: Vec<PairedTool> = invocations
+            .iter()
+            .map(|inv| PairedTool {
+                tool_call_id: inv.call_id.clone(),
+                tool_name: inv.name.clone(),
+                args: inv.arguments.clone(),
+            })
+            .collect();
+        match paired.len() {
+            0 => PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: None,
+                tool_name: String::new(),
+                args: None,
+            }),
+            1 => PairingCandidate::ToolCall(paired.remove(0)),
+            _ => PairingCandidate::ToolCalls(paired),
+        }
+    };
+
     conv.messages
         .iter()
         .enumerate()
         .map(|(idx, m)| match m.role.as_str() {
             "user" => PairingCandidate::TurnBoundary,
             "tool_call" => {
-                let inv = m.invocations.first();
-                PairingCandidate::ToolCall(PairedTool {
-                    tool_call_id: inv.and_then(|i| i.call_id.clone()),
-                    tool_name: inv.map(|i| i.name.clone()).unwrap_or_default(),
-                    args: inv.and_then(|i| i.arguments.clone()),
-                })
+                if !m.invocations.is_empty() {
+                    invocations_to_candidate(&m.invocations)
+                } else {
+                    // Whole-document Codex `.json` `items[]` entries with
+                    // top-level `role: "tool_call"` carry their metadata
+                    // directly on `extra` (`name`, `call_id`, `arguments`/`input`).
+                    PairingCandidate::ToolCall(PairedTool {
+                        tool_call_id: m
+                            .extra
+                            .get("tool_call_id")
+                            .or_else(|| m.extra.get("call_id"))
+                            .or_else(|| m.extra.get("tool_use_id"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        tool_name: m
+                            .extra
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        args: m
+                            .extra
+                            .get("arguments")
+                            .or_else(|| m.extra.get("input"))
+                            .cloned(),
+                    })
+                }
             }
             "assistant" | "agent" if !m.invocations.is_empty() => {
-                let inv = m.invocations.first();
-                PairingCandidate::ToolCall(PairedTool {
-                    tool_call_id: inv.and_then(|i| i.call_id.clone()),
-                    tool_name: inv.map(|i| i.name.clone()).unwrap_or_default(),
-                    args: inv.and_then(|i| i.arguments.clone()),
-                })
+                invocations_to_candidate(&m.invocations)
             }
             "tool_result" => PairingCandidate::ToolResult {
                 tool_call_id: m
@@ -43223,5 +43276,48 @@ mod task35_watch_routing_tests {
             0,
             "no writer ran for the refused declaration"
         );
+    }
+
+    /// R2-B4: when multiple files under the same declared root arrive in one
+    /// resident watch debounce batch, `route_fixed_watch` must merge `min_ts`
+    /// and `max_ts` across every file regardless of input order so older-mtime
+    /// files are never skipped by `since_ts` and watermarks advance to the max.
+    #[test]
+    fn task35_declared_root_multi_file_merges_min_and_max_ts() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let root_path = temp.path().join("declared-multi");
+        let newer = root_path.join("projects/p/a_newer.jsonl");
+        let older = root_path.join("projects/p/z_older.jsonl");
+        write_fixture(&newer, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"new\"}}\n");
+        write_fixture(&older, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"old\"}}\n");
+
+        let now = std::time::SystemTime::now();
+        let older_time = now - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .expect("open older")
+            .set_modified(older_time)
+            .expect("backdate older");
+        let newer_ms = path_modified_ms(&newer).expect("newer mtime");
+        let older_ms = path_modified_ms(&older).expect("older mtime");
+        assert!(older_ms < newer_ms, "older mtime must strictly precede newer");
+
+        let plan = declared_plan(&data_dir, &root_path, "r2-b4-src", "r2-b4-decl");
+        let mut plans = std::collections::HashMap::new();
+        insert_plan(&mut plans, "claude", &plan);
+
+        for batch in [
+            vec![newer.clone(), older.clone()],
+            vec![older.clone(), newer.clone()],
+        ] {
+            let route = route_fixed_watch(batch, &plans, false);
+            assert!(route.rejections.is_empty(), "clean claude batch must not reject");
+            assert_eq!(route.legacy.len(), 1, "same declared root collapses into 1 trigger");
+            assert_eq!(route.legacy[0].min_ts, Some(older_ms), "min_ts must track oldest file in batch");
+            assert_eq!(route.legacy[0].max_ts, Some(newer_ms), "max_ts must track newest file in batch");
+        }
     }
 }

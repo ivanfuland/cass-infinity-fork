@@ -2128,3 +2128,111 @@ fn mcp_activate_v2_resident_watch_reports_uncovered() {
         );
     }
 }
+
+#[test]
+fn mcp_activate_v2_multiline_json_multi_tool_string_array_and_codex_doc() {
+    let fixture = Fixture::new();
+    let case = CaseDir::new("mcp_activate_v2_plan_a", "multiline-json-r2-regressions");
+
+    const ALPHA_SECRET: &str = "r2_b2_multi_tool_second_call_secret_alpha";
+    const BETA_SECRET: &str = "r2_b1_string_array_extra_secret_beta";
+    const GAMMA_SECRET: &str = "r2_b2_codex_top_level_tool_call_secret_gamma";
+
+    // 1. Claude multi-line .json with parallel [Read, mcp__cass-mcp__cass_search] in one assistant turn (R2-B2A).
+    let multi_doc = json!({
+        "title": "Claude Parallel Tool Calls Doc",
+        "messages": [
+            {"role": "user", "timestamp": "2026-01-05T00:00:00.000Z", "content": "multi tool user prompt stays"},
+            {
+                "role": "assistant",
+                "timestamp": "2026-01-05T00:00:01.000Z",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_r2_first_read", "name": "Read", "input": {"file_path": "foo.rs"}},
+                    {"type": "tool_use", "id": "toolu_r2_second_cass", "name": "mcp__cass-mcp__cass_search", "input": {"query": "alpha"}}
+                ]
+            },
+            {"role": "tool_result", "timestamp": "2026-01-05T00:00:02.000Z", "tool_use_id": "toolu_r2_first_read", "content": "fn main() {}"},
+            {"role": "tool_result", "timestamp": "2026-01-05T00:00:03.000Z", "tool_use_id": "toolu_r2_second_cass", "content": wrapper(RecallTool::Search, &native_search_value(ALPHA_SECRET))},
+            {"role": "assistant", "timestamp": "2026-01-05T00:00:04.000Z", "content": "multi tool assistant answer stays"}
+        ]
+    });
+    let multi_path = fixture.home().join(".claude/projects/r2-multi/multi_tool.json");
+    std::fs::create_dir_all(multi_path.parent().unwrap()).unwrap();
+    std::fs::write(&multi_path, serde_json::to_string_pretty(&multi_doc).unwrap() + "\n").unwrap();
+
+    // 2. Claude multi-line .json with string-array tool_result `content: ["<cass_recall ...>"]` (R2-B1).
+    let arr_doc = json!({
+        "title": "Claude String Array Result Doc",
+        "messages": [
+            {"role": "user", "timestamp": "2026-01-05T00:01:00.000Z", "content": "array result user prompt stays"},
+            {
+                "role": "assistant",
+                "timestamp": "2026-01-05T00:01:01.000Z",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_r2_arr_cass", "name": "mcp__cass-mcp__cass_search", "input": {"query": "beta"}}
+                ]
+            },
+            {"role": "tool_result", "timestamp": "2026-01-05T00:01:02.000Z", "tool_use_id": "toolu_r2_arr_cass", "content": [wrapper(RecallTool::Search, &native_search_value(BETA_SECRET))]},
+            {"role": "assistant", "timestamp": "2026-01-05T00:01:03.000Z", "content": "array result assistant answer stays"}
+        ]
+    });
+    let arr_path = fixture.home().join(".claude/projects/r2-arr/str_array.json");
+    std::fs::create_dir_all(arr_path.parent().unwrap()).unwrap();
+    std::fs::write(&arr_path, serde_json::to_string_pretty(&arr_doc).unwrap() + "\n").unwrap();
+
+    // 3. Codex multi-line rollout-*.json with top-level `items[]` `role: "tool_call"` + `tool_result` (R2-B2B).
+    let codex_doc = json!({
+        "id": "codex-doc-r2",
+        "items": [
+            {"id": "u1", "role": "user", "content": "codex doc user prompt stays"},
+            {"id": "c1", "role": "tool_call", "call_id": "call_r2_codex_doc_1", "name": "mcp__cass-mcp__cass_search", "arguments": {"query": "gamma"}, "content": "[Tool: mcp__cass-mcp__cass_search]"},
+            {"id": "r1", "role": "tool_result", "call_id": "call_r2_codex_doc_1", "content": wrapper(RecallTool::Search, &native_search_value(GAMMA_SECRET))},
+            {"id": "a1", "role": "assistant", "content": "codex doc assistant answer stays"}
+        ]
+    });
+    let codex_path = fixture.home().join(".codex/sessions/2026/01/rollout-doc-r2.json");
+    std::fs::create_dir_all(codex_path.parent().unwrap()).unwrap();
+    std::fs::write(&codex_path, serde_json::to_string_pretty(&codex_doc).unwrap() + "\n").unwrap();
+
+    let output = fixture.index(&[], &[]);
+    write_evidence(&case, &["index", "--json"], &[], &output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "r2 json regressions index failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("index json");
+    assert_eq!(report["success"], json!(true));
+    assert_eq!(
+        report["recall_uncovered_total"],
+        json!(0),
+        "all 3 whole-document recall cases must be covered: {report}"
+    );
+
+    let db = fixture.open_db();
+    assert_eq!(marker_rule_versions(&db), vec![2, 2, 2]);
+    assert_excluded_rows_clean(
+        &db,
+        &[ALPHA_SECRET, BETA_SECRET, GAMMA_SECRET],
+        "multiline-json-r2-regressions",
+    );
+    let bodies = message_contents(&db);
+    for prose in [
+        "multi tool user prompt stays",
+        "multi tool assistant answer stays",
+        "fn main() {}",
+        "array result user prompt stays",
+        "array result assistant answer stays",
+        "codex doc user prompt stays",
+        "codex doc assistant answer stays",
+    ] {
+        assert!(bodies.iter().any(|b| b == prose), "missing preserved prose {prose:?}");
+    }
+    for secret in [ALPHA_SECRET, BETA_SECRET, GAMMA_SECRET] {
+        assert!(
+            !bodies.iter().any(|b| b.contains(secret)),
+            "secret {secret:?} leaked into messages.content"
+        );
+    }
+}

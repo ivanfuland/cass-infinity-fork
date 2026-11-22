@@ -18,7 +18,7 @@
 //!
 //! * the captured raw-mirror blob (the original JSONL bytes), and
 //! * a `NormalizedConversation` re-projected from those bytes by the pinned
-//!   `PiAgentConnector` (FAD rev `61f975f3…`, `src/connectors/pi_agent.rs`).
+//!   `PiAgentConnector` (FAD rev `d630c819…`, `src/connectors/pi_agent.rs`).
 //!
 //! The live `conversation.source_path` is never read: only the captured blob
 //! is opened here.
@@ -349,7 +349,7 @@ fn projected_raw_messages(blob_path: &Path) -> Vec<RawMessage> {
 }
 
 /// The connector's projection eligibility, mirrored from the pinned
-/// `PiAgentConnector::flatten_message_content` (FAD `61f975f3…`,
+/// `PiAgentConnector::flatten_message_content` (FAD `d630c819…`,
 /// `src/connectors/pi_agent.rs`): a message whose flattened content is empty
 /// (for example image-only) is not projected, so it must not break the
 /// one-to-one alignment.

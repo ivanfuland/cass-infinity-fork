@@ -830,3 +830,276 @@ fn schema9_legacy_staged_source_input_is_not_skipped_by_incremental_scan() {
         "rescued legacy staged session must be searchable: {search_json}"
     );
 }
+
+/// R2-B3 + N2: historical Schema 9 raw-mirror manifests written before Plan-A
+/// unification carry `provider = "claude"` while `ClaudeCodeConnector` writes
+/// `agents.slug = "claude_code"`. Verify all three `cass mirror-restore` paths:
+/// 1. Diverged candidate triggers `hold_diverged = 1` (never misclassified as
+///    `RestoreNew` to corrupt the session).
+/// 2. Strict superset triggers `Replace` (`franken_replace_conversation_messages_in_tx`),
+///    demoting legacy `source_message_links` canonical rows without `CHECK` failure.
+/// 3. Brand-new session restores with a non-null manifest `db_links.conversation_id`
+///    (`published_without_backlink = 0`).
+#[test]
+fn schema9_legacy_claude_provider_mirror_restore_hold_replace_and_backlink() {
+    let fixture = LegacyFixture::new();
+    let claude_dir = fixture.home().join(".claude/projects/r2-b3-restore");
+    fs::create_dir_all(&claude_dir).expect("mkdir claude dir");
+
+    let diverged_path = claude_dir.join("diverged.jsonl");
+    let superset_path = claude_dir.join("superset.jsonl");
+    let brand_new_path = claude_dir.join("brand-new.jsonl");
+
+    let line = |role: &str, uuid: &str, sid: &str, ts: &str, text: &str| -> String {
+        json!({
+            "type": role,
+            "timestamp": ts,
+            "uuid": uuid,
+            "sessionId": sid,
+            "cwd": "/synthetic/r2-b3",
+            "message": {"role": role, "content": text}
+        })
+        .to_string()
+    };
+
+    // Seed initial 2-message sessions for diverged & superset via real `cass index`
+    // so DB rows carry real `claude_code` digests & canonical agent slug.
+    let diverged_db_body = format!(
+        "{}\n{}\n",
+        line("user", "d-u0", "sid-diverged", "2026-01-07T00:00:00.000Z", "initial question"),
+        line("assistant", "d-a1", "sid-diverged", "2026-01-07T00:00:01.000Z", "DB_DIVERGED_ANSWER_KEEP_SAFE"),
+    );
+    let superset_db_body = format!(
+        "{}\n{}\n",
+        line("user", "s-u0", "sid-superset", "2026-01-07T00:01:00.000Z", "superset question"),
+        line("assistant", "s-a1", "sid-superset", "2026-01-07T00:01:01.000Z", "superset answer one"),
+    );
+    fs::write(&diverged_path, diverged_db_body.as_bytes()).expect("write diverged db seed");
+    fs::write(&superset_path, superset_db_body.as_bytes()).expect("write superset db seed");
+
+    let data_dir_str = fixture.data_dir().to_string_lossy().into_owned();
+    let seed_out = fixture.run_cass(&["index", "--data-dir", &data_dir_str, "--json"]);
+    assert_eq!(
+        seed_out.status.code(),
+        Some(0),
+        "seed index failed: stderr={}",
+        String::from_utf8_lossy(&seed_out.stderr)
+    );
+
+    // Attach Schema 9 legacy source tables and canonical `source_message_links`
+    // on the superset conversation's messages to verify Replace demotes them safely.
+    let storage = FrankenStorage::open(&fixture.db_path()).expect("open seeded db");
+    attach_legacy_source_tables(&storage);
+    let superset_msg_ids: Vec<i64> = storage
+        .raw()
+        .query_all_map(
+            "SELECT m.id FROM messages m JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.source_path = ?1 ORDER BY m.idx",
+            &[SqlValue::Text(superset_path.to_string_lossy().into_owned())],
+            |r| r.get_typed(0),
+        )
+        .expect("query superset messages");
+    assert_eq!(superset_msg_ids.len(), 2);
+    let superset_input_id = insert_legacy_source_input(
+        storage.raw(),
+        91,
+        "claude_code",
+        "/legacy/restore-root",
+        "projects/r2-b3-restore/superset.jsonl",
+        b"{}",
+        "complete",
+    );
+    let superset_link_ids: Vec<i64> = superset_msg_ids
+        .iter()
+        .enumerate()
+        .map(|(i, &mid)| {
+            insert_legacy_canonical_link(storage.raw(), superset_input_id, 210 + i as u8, mid)
+        })
+        .collect();
+    drop(storage);
+
+    // Build a separate mirror data_dir populated with legacy `provider = "claude"` manifests:
+    // (a) diverged (conflicting idx=1 + extra idx=2)
+    // (b) strict superset (same idx=0,1 + new idx=2)
+    // (c) brand-new (absent from candidate DB)
+    let mirror_dir = fixture.root.path().join("legacy-mirror-data");
+    fs::create_dir_all(&mirror_dir).expect("mkdir mirror_dir");
+
+    let diverged_mirror_body = format!(
+        "{}\n{}\n{}\n",
+        line("user", "d-u0", "sid-diverged", "2026-01-07T00:00:00.000Z", "initial question"),
+        line("assistant", "d-a1", "sid-diverged", "2026-01-07T00:00:01.000Z", "MIRROR_CONFLICTING_ANSWER"),
+        line("user", "d-u2", "sid-diverged", "2026-01-07T00:00:02.000Z", "MIRROR_DIVERGED_TAIL_APPENDED"),
+    );
+    let superset_mirror_body = format!(
+        "{}\n{}\n{}\n",
+        line("user", "s-u0", "sid-superset", "2026-01-07T00:01:00.000Z", "superset question"),
+        line("assistant", "s-a1", "sid-superset", "2026-01-07T00:01:01.000Z", "superset answer one"),
+        line("user", "s-u2", "sid-superset", "2026-01-07T00:01:02.000Z", "SUPERSET_NEW_TAIL_MESSAGE"),
+    );
+    let brand_new_mirror_body = format!(
+        "{}\n{}\n",
+        line("user", "n-u0", "sid-brand-new", "2026-01-07T00:02:00.000Z", "brand new legacy claude question"),
+        line("assistant", "n-a1", "sid-brand-new", "2026-01-07T00:02:01.000Z", "brand new legacy claude answer"),
+    );
+    fs::write(&diverged_path, diverged_mirror_body.as_bytes()).expect("write diverged mirror src");
+    fs::write(&superset_path, superset_mirror_body.as_bytes()).expect("write superset mirror src");
+    fs::write(&brand_new_path, brand_new_mirror_body.as_bytes()).expect("write brand-new mirror src");
+
+    let mut brand_new_manifest_rel = String::new();
+    for (path, is_brand_new) in [
+        (&diverged_path, false),
+        (&superset_path, false),
+        (&brand_new_path, true),
+    ] {
+        let cap = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &mirror_dir,
+            provider: "claude",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: Some("local"),
+            source_path: path,
+            db_links: &[],
+        })
+        .expect("capture legacy provider=claude manifest");
+        if is_brand_new {
+            brand_new_manifest_rel = cap.manifest_relative_path;
+        }
+    }
+
+    let cand_db_str = fixture.db_path().to_string_lossy().into_owned();
+    let mirror_dir_str = mirror_dir.to_string_lossy().into_owned();
+    let scratch_dry = fixture.root.path().join("scratch-dry");
+    fs::create_dir_all(&scratch_dry).expect("mkdir scratch-dry");
+
+    // 1. Dry-run must see BOTH existing `claude_code` conversations despite legacy `provider="claude"`:
+    //    diverged -> hold_diverged=1, superset -> replace=1, brand-new -> restore=1.
+    let dry_out = fixture.run_cass(&[
+        "mirror-restore",
+        "--data-dir",
+        &mirror_dir_str,
+        "--candidate-db",
+        &cand_db_str,
+        "--scratch",
+        scratch_dry.to_str().unwrap(),
+        "--snapshot-root",
+        "snap-r2-b3",
+        "--json",
+    ]);
+    assert_eq!(
+        dry_out.status.code(),
+        Some(0),
+        "mirror-restore dry-run failed: stderr={}",
+        String::from_utf8_lossy(&dry_out.stderr)
+    );
+    let dry_json: Value = serde_json::from_slice(&dry_out.stdout).expect("dry-run json");
+    assert_eq!(dry_json["identities_considered"], json!(3), "dry={dry_json}");
+    assert_eq!(dry_json["candidate_versions_seen"], json!(2), "must match claude_code DB rows: {dry_json}");
+    assert_eq!(dry_json["hold_diverged"], json!(1), "diverged claude row must HOLD: {dry_json}");
+    assert_eq!(dry_json["replace"], json!(1), "superset claude row must plan Replace: {dry_json}");
+    assert_eq!(dry_json["restore"], json!(1), "brand-new claude row must plan RestoreNew: {dry_json}");
+    assert_eq!(dry_json["planned_actions"], json!(2), "only Replace + RestoreNew planned: {dry_json}");
+
+    // 2. Apply must execute Replace (demoting legacy source_message_links without CHECK error)
+    //    and RestoreNew (publishing non-null backlink), while leaving diverged conversation untouched!
+    let scratch_apply = fixture.root.path().join("scratch-apply");
+    fs::create_dir_all(&scratch_apply).expect("mkdir scratch-apply");
+    let journal_path = fixture.root.path().join("restore-r2-b3.journal.json");
+    let apply_out = fixture.run_cass(&[
+        "mirror-restore",
+        "--data-dir",
+        &mirror_dir_str,
+        "--candidate-db",
+        &cand_db_str,
+        "--scratch",
+        scratch_apply.to_str().unwrap(),
+        "--snapshot-root",
+        "snap-r2-b3",
+        "--generation",
+        "gen-r2-b3",
+        "--journal",
+        journal_path.to_str().unwrap(),
+        "--apply",
+        "--json",
+    ]);
+    assert_eq!(
+        apply_out.status.code(),
+        Some(0),
+        "mirror-restore --apply failed: stderr={}",
+        String::from_utf8_lossy(&apply_out.stderr)
+    );
+    let apply_json: Value = serde_json::from_slice(&apply_out.stdout).expect("apply json");
+    assert_eq!(apply_json["applied"], json!(true), "apply={apply_json}");
+    assert_eq!(apply_json["replaced"], json!(1), "apply={apply_json}");
+    assert_eq!(apply_json["restored"], json!(1), "apply={apply_json}");
+    assert_eq!(apply_json["published"], json!(2), "apply={apply_json}");
+    assert_eq!(
+        apply_json["published_without_backlink"],
+        json!(0),
+        "legacy provider=claude RestoreNew must resolve its claude_code conversation_id backlink: {apply_json}"
+    );
+
+    let conn = Conn::open_read(&fixture.db_path()).expect("reopen cand db");
+    // Diverged conversation remained intact (2 messages, no appended tail).
+    let diverged_msgs: Vec<String> = conn
+        .query_all_map(
+            "SELECT m.content FROM messages m JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.source_path = ?1 ORDER BY m.idx",
+            &[SqlValue::Text(diverged_path.to_string_lossy().into_owned())],
+            |r| r.get_typed(0),
+        )
+        .expect("query diverged msgs");
+    assert_eq!(
+        diverged_msgs,
+        vec![
+            "initial question".to_string(),
+            "DB_DIVERGED_ANSWER_KEEP_SAFE".to_string(),
+        ],
+        "diverged session must not be corrupted by mirror-restore"
+    );
+
+    // Superset conversation replaced cleanly with 3 messages.
+    let superset_msgs: Vec<String> = conn
+        .query_all_map(
+            "SELECT m.content FROM messages m JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.source_path = ?1 ORDER BY m.idx",
+            &[SqlValue::Text(superset_path.to_string_lossy().into_owned())],
+            |r| r.get_typed(0),
+        )
+        .expect("query superset msgs");
+    assert_eq!(
+        superset_msgs,
+        vec![
+            "superset question".to_string(),
+            "superset answer one".to_string(),
+            "SUPERSET_NEW_TAIL_MESSAGE".to_string(),
+        ]
+    );
+
+    // Legacy canonical `source_message_links` on replaced messages were demoted cleanly.
+    for link_id in superset_link_ids {
+        let (auth, mid): (Option<String>, Option<i64>) = conn
+            .query_row_map(
+                "SELECT authority, message_id FROM source_message_links WHERE id = ?1",
+                &[SqlValue::Integer(link_id)],
+                |r| Ok((r.get_typed(0)?, r.get_typed(1)?)),
+            )
+            .expect("query demoted replace link");
+        assert_eq!(auth.as_deref(), Some("historical"));
+        assert_eq!(mid, None);
+    }
+
+    // Brand-new manifest has a non-null `db_links[0].conversation_id`.
+    let brand_new_manifest_disk = mirror_dir.join("raw-mirror/v1").join(&brand_new_manifest_rel);
+    let manifest_json: Value = serde_json::from_slice(
+        &fs::read(&brand_new_manifest_disk).expect("read brand-new manifest"),
+    )
+    .expect("parse brand-new manifest");
+    let linked_cid = manifest_json["db_links"]
+        .as_array()
+        .and_then(|arr| arr.iter().find_map(|link| link["conversation_id"].as_i64()));
+    assert!(
+        linked_cid.is_some(),
+        "brand-new legacy provider=claude manifest must carry non-null conversation_id backlink: {manifest_json}"
+    );
+}
