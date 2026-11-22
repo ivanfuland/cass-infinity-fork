@@ -116,6 +116,7 @@ SH
       local bundle="$dir/$ID"
       mkdir "$bundle"
       cp -p -- "$BUNDLE/"{cass,cass-mcp,install.sh,release.env,SHA256SUMS} "$bundle/"
+      [ ! -d "$BUNDLE/templates" ] || cp -a -- "$BUNDLE/templates" "$bundle/"
       case "$kind" in
         install)
           invoke install "$bundle"
