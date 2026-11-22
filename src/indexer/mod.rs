@@ -20483,32 +20483,34 @@ pub(crate) fn build_pairing_candidates(
                 })
             }
             "tool_result" => PairingCandidate::ToolResult {
-                tool_call_id: m.extra.get("tool_call_id").and_then(|v| v.as_str()).map(str::to_string),
+                tool_call_id: m
+                    .extra
+                    .get("tool_call_id")
+                    .or_else(|| m.extra.get("tool_use_id"))
+                    .or_else(|| m.extra.get("call_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
             },
             _ => PairingCandidate::ToolResult { tool_call_id: Some(format!("__cass_pairing_neutral_{idx}__")) },
         })
         .collect()
 }
 
-/// PR6 T2b: run R1-R4 judgment + redaction over every message in `conv`
-/// using `events` (message-position-aligned per `events_from_blob`'s
-/// contract; short/`None` entries just mean that position isn't judged --
-/// 宁漏勿误). Returns the per-message markers (`PreparedConversation.excluded`
-/// alignment) and mutates `conv.messages` in place via `apply`/
-/// `apply_sibling` exactly as `docs/excluded-rules.md` §处理顺序 specifies:
-/// decide (all rows) -> apply (hit rows) -> apply_sibling (same-`event_key`
-/// rows, second pass, so a sibling's own block replacement never races
-/// against a not-yet-applied primary hit in the same event).
+/// Run v2 recall + R2/R3 judgment and redaction over every message in `conv`
+/// using `events` (message-position-aligned [`BlobEvent`]s carrying each
+/// message's structural facts and original parsed JSON record). Returns the
+/// per-message markers and bounded `recall_uncovered_by_reason` counts,
+/// mutating `conv.messages` in place via `recall_v2::apply_with_redaction` and
+/// `exclusion::apply_sibling`.
 fn judge_and_redact_reparsed(
     conv: &mut NormalizedConversation,
-    events: &[crate::indexer::exclusion::RawEvent],
+    events: &[crate::indexer::exclusion::BlobEvent],
     blob_relative_path: &str,
     paths_cfg: &crate::sources::config::ExcludedContextPaths,
     redaction_enabled: bool,
-) -> Vec<Option<crate::indexer::exclusion::ExcludedMarker>> {
-    use crate::indexer::exclusion::{
-        PairingContext, apply_sibling, apply_with_redaction, decide, field_map_for,
-    };
+) -> (Vec<Option<crate::indexer::exclusion::ExcludedMarker>>, BTreeMap<String, u64>) {
+    use crate::indexer::exclusion::{PairingContext, apply_sibling, field_map_for};
+    use crate::indexer::recall_v2::{Outcome, apply_with_redaction, decide_for_record};
 
     let candidates = build_pairing_candidates(conv);
     let pairing_ctx = PairingContext::build(&candidates);
@@ -20516,47 +20518,32 @@ fn judge_and_redact_reparsed(
     let mut redactor = crate::indexer::redact_secrets::MemoizingRedactor::new();
 
     let mut markers: Vec<Option<crate::indexer::exclusion::ExcludedMarker>> = vec![None; conv.messages.len()];
+    let mut recall_uncovered: BTreeMap<String, u64> = BTreeMap::new();
     let mut hits: Vec<(usize, crate::indexer::exclusion::ExcludedMarker)> = Vec::new();
     for idx in 0..conv.messages.len() {
-        // R1-N16 (任务书 #118b): the codex idx0-user candidate count used
-        // to be taken here, but this loop never runs at all when alignment
-        // fails (`judge_reparsed_conversation` short-circuits before
-        // calling this function) -- moved to `judge_reparsed_conversation`
-        // itself so the denominator doesn't shrink on alignment failure.
-        let Some(event) = events.get(idx) else { continue };
-        let decision = decide(&conv.messages[idx], idx, event, &pairing_ctx, &conv.agent_slug, paths_cfg);
-        let Some(decision) = decision else { continue };
-        if matches!(decision.reason, crate::indexer::exclusion::ExclusionReason::CodexHostShell) {
+        let Some(blob_event) = events.get(idx) else { continue };
+        let exclusion = match decide_for_record(
+            conv,
+            idx,
+            &blob_event.event,
+            &pairing_ctx,
+            paths_cfg,
+            &blob_event.raw_record,
+        ) {
+            Outcome::Exclude(exclusion) => exclusion,
+            Outcome::Preserve(Some(reason)) => {
+                *recall_uncovered.entry(reason.as_str().to_string()).or_insert(0) += 1;
+                continue;
+            }
+            Outcome::Preserve(None) => continue,
+        };
+        if matches!(exclusion.decision.reason, crate::indexer::exclusion::ExclusionReason::CodexHostShell) {
             record_codex_host_shell_hit();
         }
-        // R1-N2 (任务书 #118a): title cleanup happens HERE, in judge, before
-        // `apply()` clears `msg.content` -- `pre_redaction_content` is saved
-        // just above so the comparison below has the excluded row's ORIGINAL
-        // text to compare `title` against.
-        //
-        // R2-N3 (任务书 #119c): this comparison is against `title` on the
-        // LEFT and `pre_redaction_content` on the RIGHT -- both UNREDACTED,
-        // per spec §2.2's own wording ("若 title 是任一被排除消息**原文**的
-        // 子串"). The prior implementation compared against
-        // `redactor.redact_text(&pre_redaction_content)` instead, on the
-        // theory that "sha/title 判定都用脱敏后正文口径" -- but spec §2.2
-        // only says that for sha/bytes (the very next clause: "对象 = 脱敏
-        // 后、本应写入 content 的字符串"); the title clause is separate and
-        // explicitly says 原文. Comparing redacted content against an
-        // unredacted title breaks exactly when it matters most: if the
-        // excluded row (and hence the title derived from it) contains a
-        // secret, redaction removes that secret substring from the
-        // right-hand side, the two no longer match, and the secret-bearing
-        // title is left un-cleared in the database. Comparing both sides
-        // unredacted also means this needs no `redaction_enabled()` check --
-        // there is nothing here for that switch to gate.
         let pre_redaction_content = conv.messages[idx].content.clone();
-        // SRC05B-07: the enabled-ness is stated by the caller here. The
-        // legacy transport passes the process-wide switch; the source-aware
-        // path passes `true`, because its own contract always desensitises.
         let marker = apply_with_redaction(
             &mut conv.messages[idx],
-            &decision,
+            &exclusion,
             &mut redactor,
             blob_relative_path,
             idx as u32,
@@ -20576,21 +20563,40 @@ fn judge_and_redact_reparsed(
             if idx == *hit_idx {
                 continue;
             }
-            if events.get(idx).map(|e| e.event_key.as_str()) == Some(marker.raw.event_key.as_str()) {
+            if events.get(idx).map(|e| e.event.event_key.as_str()) == Some(marker.raw.event_key.as_str()) {
                 apply_sibling(msg, marker, field_map);
             }
         }
     }
-    markers
+    (markers, recall_uncovered)
 }
 
 /// Shared by [`prepare_conversation_for_ingest`] and
-/// [`prepare_conversation_for_restore`] (T2b.2, control-plane approved
-/// 2026-09-07): the event/message-count alignment self-check that guards
-/// [`judge_and_redact_reparsed`] was previously inlined only in the ingest
-/// path. Extracted here so restore's reparse-then-judge step gets the same
-/// `EVENT_ALIGN_FAILED` accounting (宁漏勿误) instead of a second,
-/// independently-maintained copy of the same three lines.
+/// [`prepare_conversation_for_restore`]: runs the alignment guard and v2
+/// judgment over [`BlobEvent`]s, returning both exclusion markers and bounded
+/// uncovered-recall diagnostics.
+pub(crate) fn judge_reparsed_blob_events_with_redaction(
+    conv: &mut NormalizedConversation,
+    events: &[crate::indexer::exclusion::BlobEvent],
+    blob_relative_path: &str,
+    paths_cfg: &crate::sources::config::ExcludedContextPaths,
+    redaction_enabled: bool,
+) -> (Vec<Option<crate::indexer::exclusion::ExcludedMarker>>, BTreeMap<String, u64>) {
+    if conv.agent_slug == "codex" && conv.messages.first().map(|m| m.role.as_str()) == Some("user") {
+        record_codex_idx0_user_candidate();
+    }
+    if !crate::indexer::exclusion::structural_facts_available(&conv.agent_slug) {
+        return (vec![None; conv.messages.len()], BTreeMap::new());
+    }
+    if events.len() == conv.messages.len() {
+        judge_and_redact_reparsed(conv, events, blob_relative_path, paths_cfg, redaction_enabled)
+    } else {
+        record_event_align_failed();
+        record_event_align_failure(conv, events.len());
+        (vec![None; conv.messages.len()], BTreeMap::new())
+    }
+}
+
 pub(crate) fn judge_reparsed_conversation(
     conv: &mut NormalizedConversation,
     events: &[crate::indexer::exclusion::RawEvent],
@@ -20614,39 +20620,22 @@ pub(crate) fn judge_reparsed_conversation_with_redaction(
     paths_cfg: &crate::sources::config::ExcludedContextPaths,
     redaction_enabled: bool,
 ) -> Vec<Option<crate::indexer::exclusion::ExcludedMarker>> {
-    // R1-N16 (任务书 #118b): meta 三键之二（mission #116⑥）候选总数在这里
-    // 计，与 `events`/`conv.messages` 是否对齐无关（分母不应因为对齐失败而
-    // 缩水）——候选口径与 R3 锚点定义一致（`agent_slug=="codex" && idx==0 &&
-    // role=="user"`），只有 idx 0 能匹配，故直接判第一条消息而不整段循环。
-    if conv.agent_slug == "codex" && conv.messages.first().map(|m| m.role.as_str()) == Some("user") {
-        record_codex_idx0_user_candidate();
-    }
-    // R1-N16 (任务书 #118b): connectors with no exclusion-judgment support
-    // at all (`events_from_blob` returns `Vec::new()` for anything but
-    // claude_code/codex) always have `events.len() == 0`; comparing that
-    // against a non-empty `conv.messages.len()` below would count every
-    // such session as an alignment *failure*, which is a narrower, real
-    // thing this counter tracks (a claude_code/codex session whose events
-    // genuinely don't line up with its messages) -- not "this connector
-    // doesn't have structural facts to align in the first place".
-    if !crate::indexer::exclusion::structural_facts_available(&conv.agent_slug) {
-        return vec![None; conv.messages.len()];
-    }
-    // T2b R1 (control-plane 裁定): events_from_blob's alignment is a
-    // disclosed positional approximation (see events_from_blob's own doc
-    // comment) -- when the flat event count doesn't even match the
-    // reparsed message count, positional indexing can't be trusted at
-    // all for this session, so skip judgment entirely (宁漏勿误: no
-    // exclusion rather than a wrong one) instead of silently judging
-    // against misaligned events.
-    if events.len() == conv.messages.len() {
-        judge_and_redact_reparsed(conv, events, blob_relative_path, paths_cfg, redaction_enabled)
-    } else {
-        record_event_align_failed();
-        // R2-N7 (任务书 #129): name the session, not just count it.
-        record_event_align_failure(conv, events.len());
-        vec![None; conv.messages.len()]
-    }
+    let blob_events: Vec<crate::indexer::exclusion::BlobEvent> = events
+        .iter()
+        .cloned()
+        .map(|event| crate::indexer::exclusion::BlobEvent {
+            event,
+            raw_record: serde_json::Value::Null,
+        })
+        .collect();
+    judge_reparsed_blob_events_with_redaction(
+        conv,
+        &blob_events,
+        blob_relative_path,
+        paths_cfg,
+        redaction_enabled,
+    )
+    .0
 }
 
 /// `connector` is the *same* connector instance the caller already used for
@@ -20992,13 +20981,16 @@ fn prepare_conversation_for_ingest(
             outcome.excluded
         } else {
             let events =
-                crate::indexer::exclusion::events_from_blob(&reparsed.agent_slug, &materialized);
-            judge_reparsed_conversation(
+                crate::indexer::exclusion::blob_events_from_blob(&reparsed.agent_slug, &materialized);
+            let (markers, uncovered) = judge_reparsed_blob_events_with_redaction(
                 &mut reparsed,
                 &events,
                 &record.blob_relative_path,
                 &paths_cfg,
-            )
+                crate::indexer::redact_secrets::redaction_enabled(),
+            );
+            recall_uncovered = uncovered;
+            markers
         };
 
         conv = reparsed;
@@ -21098,16 +21090,22 @@ pub(crate) fn prepare_conversation_for_restore(
         apply_workspace_rewrite(&mut conv, root);
     }
 
-    let excluded = if consumed_manifest.manifest_relative_path.is_empty() {
-        vec![None; conv.messages.len()]
+    let (excluded, recall_uncovered) = if consumed_manifest.manifest_relative_path.is_empty() {
+        (vec![None; conv.messages.len()], BTreeMap::new())
     } else {
         // 任务书 #118b N8 同口径 (#119b 收口, R2-B6): 恢复侧与摄入侧共用同一份
         // 操作者配置，坏配置必须让整条恢复失败，不能静默退回内置默认清单。
         let paths_cfg = crate::sources::config::ExcludedContextPaths::load().map_err(|e| {
             PrepareError(format!("excluded_context_paths.toml 加载失败（不回退内置默认清单）: {e:#}"))
         })?;
-        let events = crate::indexer::exclusion::events_from_blob(&conv.agent_slug, materialized);
-        judge_reparsed_conversation(&mut conv, &events, &consumed_manifest.blob_relative_path, &paths_cfg)
+        let events = crate::indexer::exclusion::blob_events_from_blob(&conv.agent_slug, materialized);
+        judge_reparsed_blob_events_with_redaction(
+            &mut conv,
+            &events,
+            &consumed_manifest.blob_relative_path,
+            &paths_cfg,
+            crate::indexer::redact_secrets::redaction_enabled(),
+        )
     };
 
     compact_large_connector_extras_for_size(connector_name, &mut conv, Some(sealed_source_size_bytes));
@@ -21123,7 +21121,7 @@ pub(crate) fn prepare_conversation_for_restore(
     Ok(crate::indexer::exclusion::PreparedConversation {
         conv,
         excluded,
-        recall_uncovered_by_reason: BTreeMap::new(),
+        recall_uncovered_by_reason: recall_uncovered,
     })
 }
 
@@ -21821,6 +21819,13 @@ pub mod persist {
     /// touched, on the `cass::scan_session` target. Until now the only
     /// per-session evidence was aggregate counters, so "which session went
     /// missing" needed a DB diff. `bytes` is the source file size.
+    /// Connectors whose Plan-A ingest path runs v2 recall judgment and reports
+    /// bounded `recall_uncovered_by_reason` diagnostics on both batch and
+    /// resident scan_session outputs.
+    pub(super) fn reports_recall_uncovered(agent_slug: &str) -> bool {
+        matches!(agent_slug, "claude_code" | "codex" | "pi_agent")
+    }
+
     fn emit_scan_session(
         agent_slug: &str,
         external_id: Option<&str>,
@@ -21831,10 +21836,7 @@ pub mod persist {
         let bytes = std::fs::metadata(source_path)
             .map(|meta| meta.len())
             .unwrap_or(0);
-        // Ticket 02: a Pi line also carries the uncovered diagnostics for
-        // that one conversation. A refused Pi conversation counts zero, and
-        // no other connector's line gains a field.
-        if agent_slug == "pi_agent" {
+        if reports_recall_uncovered(agent_slug) {
             let empty = BTreeMap::new();
             let uncovered = match outcome {
                 ScanSessionOutcome::Error => &empty,
@@ -23106,7 +23108,7 @@ pub mod persist {
             let Some(prepared) = convs.get(*index) else {
                 continue;
             };
-            let uncovered = (prepared.conv.agent_slug == "pi_agent"
+            let uncovered = (reports_recall_uncovered(&prepared.conv.agent_slug)
                 && *result != ScanSessionOutcome::Error)
                 .then_some(&prepared.recall_uncovered_by_reason);
             if let Some(uncovered) = uncovered {
@@ -41899,6 +41901,288 @@ normalization="l2"
         let (_hits, codex_idx0_user_total, event_align_failed) = last_index_run_counters_snapshot();
         assert_eq!(event_align_failed, 0, "a connector with no exclusion-judgment support must not count as an alignment failure");
         assert_eq!(codex_idx0_user_total, 0, "non-codex sessions must not bump the codex-specific denominator");
+    }
+
+    #[test]
+    fn judge_reparsed_blob_events_applies_recall_v2_for_claude_bash_codex_exec_and_multiline_json() {
+        use crate::connectors::{
+            Connector, ScanContext, ScanRoot,
+            claude_code::ClaudeCodeConnector, codex::CodexConnector,
+        };
+        use franken_agent_detection::NormalizedInvocation;
+        use crate::indexer::exclusion::blob_events_from_blob;
+
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let envelope = crate::recall_output::encode(
+            crate::recall_output::RecallTool::Search,
+            &serde_json::json!({
+                "hits": [{
+                    "source_id": "local",
+                    "source_path": "/tmp/prior.jsonl",
+                    "line_number": 7,
+                    "snippet": "sentinel-plan-a-v2-body"
+                }]
+            }),
+        )
+        .unwrap();
+
+        // 1) Claude Bash direct CLI recall + object-form toolUseResult.stdout
+        let dir = TempDir::new().unwrap();
+        let claude_proj = dir.path().join(".claude").join("projects").join("p1");
+        std::fs::create_dir_all(&claude_proj).unwrap();
+        let claude_bash = claude_proj.join("bash-recall.jsonl");
+        let call_line = serde_json::json!({
+            "uuid": "c-1",
+            "type": "assistant",
+            "timestamp": "2026-11-22T01:00:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "tu-bash",
+                    "name": "Bash",
+                    "input": {"command": "cass search \"alpha\" --json"}
+                }]
+            }
+        });
+        let result_line = serde_json::json!({
+            "uuid": "c-2",
+            "type": "user",
+            "timestamp": "2026-11-22T01:00:01Z",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tu-bash",
+                    "content": envelope
+                }]
+            },
+            "toolUseResult": {
+                "stdout": envelope,
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false
+            }
+        });
+        std::fs::write(&claude_bash, format!("{call_line}\n{result_line}\n")).unwrap();
+        let ctx = ScanContext::with_roots(
+            dir.path().join(".claude"),
+            vec![ScanRoot::local(claude_bash.clone())],
+            None,
+        );
+        let mut conv = ClaudeCodeConnector::new().scan(&ctx).unwrap().remove(0);
+        let events = blob_events_from_blob("claude_code", &claude_bash);
+        assert_eq!(events.len(), conv.messages.len());
+        let (markers, uncovered) = judge_reparsed_blob_events_with_redaction(
+            &mut conv,
+            &events,
+            "blobs/blake3/ab/bash.raw",
+            &paths_cfg,
+            true,
+        );
+        let marker = markers[1].as_ref().expect("Claude Bash CLI recall must be excluded under v2");
+        assert_eq!(marker.rule_version, 2);
+        assert!(uncovered.is_empty());
+        assert!(conv.messages[1].content.is_empty());
+        assert_eq!(conv.messages[1].extra["toolUseResult"]["stdout"]["redacted"], true);
+        assert_eq!(conv.messages[1].extra["toolUseResult"]["interrupted"], false);
+        assert!(
+            !serde_json::to_string(&conv.messages[1].extra)
+                .unwrap()
+                .contains("sentinel-plan-a-v2-body")
+        );
+
+        // 2) Codex exec custom_tool_call recall via BlobEvent.raw_record + bare cass_search uncovered diagnostic
+        let codex_dir = dir.path().join("sessions").join("2026").join("11").join("22");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let codex_file = codex_dir.join("rollout-2026-11-22T01-00-00-exec.jsonl");
+        let exec_app = serde_json::json!({
+            "exit_code": 0,
+            "output": envelope,
+            "wall_time_seconds": 0.25,
+            "chunk_id": "c1"
+        });
+        let codex_lines = [
+            serde_json::json!({
+                "timestamp": "2026-11-22T01:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "call-exec-1",
+                    "name": "exec",
+                    "input": "text(await tools.exec_command({\"cmd\":\"cass search \\\"alpha\\\" --recall\"}));"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-11-22T01:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-exec-1",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed\nWall time 0.25 seconds\nOutput:"},
+                        {"type": "input_text", "text": exec_app.to_string()}
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-11-22T01:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "call-bare-1",
+                    "name": "cass_search",
+                    "arguments": "{\"query\":\"plain\"}"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-11-22T01:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-bare-1",
+                    "output": "{\"hits\":[{\"source_id\":\"local\",\"source_path\":\"/tmp/x.jsonl\"}]}"
+                }
+            }),
+        ];
+        std::fs::write(
+            &codex_file,
+            codex_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let codex_ctx = ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![ScanRoot::local(codex_file.clone())],
+            None,
+        );
+        let mut codex_conv = CodexConnector::new().scan(&codex_ctx).unwrap().remove(0);
+        let codex_events = blob_events_from_blob("codex", &codex_file);
+        assert_eq!(codex_events.len(), codex_conv.messages.len());
+        let (codex_markers, codex_uncovered) = judge_reparsed_blob_events_with_redaction(
+            &mut codex_conv,
+            &codex_events,
+            "blobs/blake3/ab/codex.raw",
+            &paths_cfg,
+            true,
+        );
+        let exec_marker = codex_markers[1].as_ref().expect("Codex exec recall must be excluded under v2");
+        assert_eq!(exec_marker.rule_version, 2);
+        assert!(codex_conv.messages[1].content.is_empty());
+        assert!(
+            !serde_json::to_string(&codex_conv.messages[1].extra)
+                .unwrap()
+                .contains("sentinel-plan-a-v2-body")
+        );
+        assert!(codex_markers[3].is_none(), "bare cass_search without C04 envelope must be preserved under v2");
+        assert_eq!(codex_uncovered.get("ambiguous_tool_identity").copied(), Some(1));
+
+        // 3) Multi-line .json Claude session recall cleaned in both content and extra
+        let claude_json = claude_proj.join("multiline-recall.json");
+        let pretty = serde_json::to_string_pretty(&serde_json::json!({
+            "sessionId": "multiline-json-recall",
+            "messages": [
+                {
+                    "id": "jm0",
+                    "role": "tool_call",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "tu-json",
+                        "name": "mcp__cass-mcp__cass_search",
+                        "input": {"query": "alpha"}
+                    }]
+                },
+                {
+                    "id": "jm1",
+                    "role": "tool_result",
+                    "tool_call_id": "tu-json",
+                    "content": envelope
+                }
+            ]
+        }))
+        .unwrap();
+        std::fs::write(&claude_json, pretty).unwrap();
+        let json_ctx = ScanContext::with_roots(
+            dir.path().join(".claude"),
+            vec![ScanRoot::local(claude_json.clone())],
+            None,
+        );
+        let mut json_conv = ClaudeCodeConnector::new().scan(&json_ctx).unwrap().remove(0);
+        // Ensure invocation carries the call_id cleanly for pairing
+        assert_eq!(
+            json_conv.messages[0].invocations.first(),
+            Some(&NormalizedInvocation {
+                kind: "tool".to_string(),
+                name: "mcp__cass-mcp__cass_search".to_string(),
+                raw_name: None,
+                call_id: Some("tu-json".to_string()),
+                arguments: Some(serde_json::json!({"query": "alpha"})),
+            })
+        );
+        let json_events = blob_events_from_blob("claude_code", &claude_json);
+        assert_eq!(json_events.len(), json_conv.messages.len());
+        let (json_markers, _) = judge_reparsed_blob_events_with_redaction(
+            &mut json_conv,
+            &json_events,
+            "blobs/blake3/ab/json.raw",
+            &paths_cfg,
+            true,
+        );
+        let json_marker = json_markers[1].as_ref().expect("multi-line .json Claude recall must be excluded");
+        assert_eq!(json_marker.rule_version, 2);
+        assert!(json_conv.messages[1].content.is_empty());
+        assert_eq!(json_conv.messages[1].extra["content"]["redacted"], true);
+        assert!(
+            !serde_json::to_string(&json_conv.messages[1].extra)
+                .unwrap()
+                .contains("sentinel-plan-a-v2-body")
+        );
+    }
+
+    #[test]
+    fn reports_recall_uncovered_folds_claude_codex_and_pi_and_skips_other_agents() {
+        use crate::indexer::exclusion::PreparedConversation;
+
+        assert!(persist::reports_recall_uncovered("claude_code"));
+        assert!(persist::reports_recall_uncovered("codex"));
+        assert!(persist::reports_recall_uncovered("pi_agent"));
+        assert!(!persist::reports_recall_uncovered("opencode"));
+        assert!(!persist::reports_recall_uncovered("gemini"));
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("uncovered.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        let make_prepared = |agent: &str, ext: &str, reason: &str, count: u64| {
+            let mut conv = norm_conv(Some(ext), vec![norm_msg(0, 100)]);
+            conv.agent_slug = agent.to_string();
+            let mut map = BTreeMap::new();
+            map.insert(reason.to_string(), count);
+            PreparedConversation {
+                conv,
+                excluded: vec![None],
+                recall_uncovered_by_reason: map,
+            }
+        };
+
+        let batch = vec![
+            make_prepared("claude_code", "cc-1", "unsupported_shell", 2),
+            make_prepared("codex", "cx-1", "ambiguous_tool_identity", 3),
+            make_prepared("pi_agent", "pi-1", "invalid_recall_format", 1),
+            make_prepared("opencode", "oc-1", "unpaired_result", 5),
+        ];
+
+        let outcome = persist::persist_conversations_batched_with_raw_mirror_links(
+            &storage,
+            dir.path(),
+            &batch,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+        )
+        .unwrap();
+        assert_eq!(outcome.recall_uncovered_by_reason.get("unsupported_shell").copied(), Some(2));
+        assert_eq!(outcome.recall_uncovered_by_reason.get("ambiguous_tool_identity").copied(), Some(3));
+        assert_eq!(outcome.recall_uncovered_by_reason.get("invalid_recall_format").copied(), Some(1));
+        assert_eq!(outcome.recall_uncovered_by_reason.get("unpaired_result"), None);
     }
 
     #[test]

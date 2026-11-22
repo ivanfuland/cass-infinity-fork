@@ -205,45 +205,39 @@ pub struct RawEvent {
     pub blocks: Vec<RawBlock>,
 }
 
+/// One raw event paired with the parsed source JSON record it came from.
+///
+/// Carried alongside [`RawEvent`] so `recall_v2::decide_for_record` can inspect
+/// original transport envelopes (such as Codex `custom_tool_call_output`)
+/// without re-reading the live source file.
+#[derive(Debug, Clone)]
+pub(crate) struct BlobEvent {
+    pub event: RawEvent,
+    pub raw_record: serde_json::Value,
+}
+
 // ============================================================================
 // T2b (任务书 #114): `RawEvent` production from a raw-mirror blob.
 // ============================================================================
 
-/// Build the raw event/block facts for one connector's raw-mirror blob file
-/// (already materialized back into its original directory shape by
-/// `materialize_capture_to_scratch`, then reparsed by that connector's own
-/// file parser -- `events_from_blob` reads the *same bytes* directly,
-/// independently of the connector parser, since the connector's own
-/// `NormalizedMessage`/`NormalizedConversation` output drops the raw event
-/// identity (claude_code's per-line `uuid`, codex's `payload.id`) entirely --
-/// neither field survives into any `NormalizedMessage` field.
-///
-/// **Disclosed alignment judgment call** (spec/plan describe this as
-/// "`Vec<Option<RawEvent>>`按消息序对齐"; this round implements the
-/// empirically-verified case, not a full reimplementation of each
-/// connector's own message-splitting logic): claude_code normally emits one
-/// event = one message, **except** when one JSONL line's `message.content[]`
-/// mixes a `tool_result` block with other (`text`/`tool_use`) blocks -- T1b's
-/// documented example (messages 1287477/1287478: one event, `content` =
-/// `[tool_result, text]`, projected into a `user` row (idx N, the non-
-/// `tool_result` content) followed by a `tool_result` row (idx N+1)) -- in
-/// which case this function pushes the *same* `RawEvent` (identical
-/// `event_key`, full `blocks`) twice in a row, so positional alignment with
-/// the connector's own two emitted rows holds for this documented shape.
-/// Rarer shapes (multiple `tool_result` blocks in one event, `tool_use` mixed
-/// with `tool_result`, etc.) are not modeled and fall back to a single
-/// emitted entry -- `decide` only ever looks at `event.blocks` by kind/id,
-/// never by the calling message's own position within a split event, so a
-/// coarser split only risks *under*-splitting the vector length (宁漏勿误:
-/// the caller's `events.get(idx)` degrades to `None` for a short vector,
-/// never to a wrong event). Connectors other than `claude_code`/`codex`
-/// return an empty vec (no structural facts -- R7/R11 "不启用").
-pub(crate) fn events_from_blob(agent_slug: &str, blob_path: &Path) -> Vec<RawEvent> {
+/// Build the raw event/block facts plus original JSON record for one
+/// connector's raw-mirror blob file (materialized into scratch). Supports both
+/// line-oriented JSONL and whole-document `.json` sessions (Claude `messages[]`
+/// and Codex `items[]`). Connectors other than `claude_code`/`codex` return an
+/// empty vec (no structural facts -- R7/R11 "不启用").
+pub(crate) fn blob_events_from_blob(agent_slug: &str, blob_path: &Path) -> Vec<BlobEvent> {
     match agent_slug {
-        "claude_code" => claude_code_events_from_blob(blob_path).unwrap_or_default(),
-        "codex" => codex_events_from_blob(blob_path).unwrap_or_default(),
+        "claude_code" => claude_code_blob_events_from_blob(blob_path).unwrap_or_default(),
+        "codex" => codex_blob_events_from_blob(blob_path).unwrap_or_default(),
         _ => Vec::new(),
     }
+}
+
+pub(crate) fn events_from_blob(agent_slug: &str, blob_path: &Path) -> Vec<RawEvent> {
+    blob_events_from_blob(agent_slug, blob_path)
+        .into_iter()
+        .map(|entry| entry.event)
+        .collect()
 }
 
 /// R1-N16 (任务书 #118b): whether `events_from_blob` has any judgment logic
@@ -254,17 +248,6 @@ pub(crate) fn events_from_blob(agent_slug: &str, blob_path: &Path) -> Vec<RawEve
 /// caller's `event_align_failed` counter is meant to track.
 pub(crate) fn structural_facts_available(agent_slug: &str) -> bool {
     matches!(agent_slug, "claude_code" | "codex")
-}
-
-/// R1-N15 (任务书 #118b): pairs each surviving non-blank line with its
-/// 1-based PHYSICAL line number in the original file. Pre-fix, callers
-/// `enumerate()`d the already-filtered `Vec<String>`, so `line:N` (the
-/// `event_key` fallback for a line with no `uuid`/`id`) was off by however
-/// many blank lines preceded it -- wrong by construction whenever a blank
-/// line appears anywhere earlier in the file.
-fn read_jsonl_lines(blob_path: &Path) -> std::io::Result<Vec<(usize, String)>> {
-    let text = std::fs::read_to_string(blob_path)?;
-    Ok(text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()).map(|(i, l)| (i + 1, l.to_string())).collect())
 }
 
 /// Mirrors `franken_agent_detection::connectors::claude_code`'s content-block
@@ -410,12 +393,165 @@ fn push_claude_code_events(value: &serde_json::Value, line_no: usize, events: &m
     }
 }
 
-fn claude_code_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
-    let lines = read_jsonl_lines(blob_path)?;
-    let mut events = Vec::with_capacity(lines.len());
-    for (line_no, line) in &lines {
+fn is_json_document_path(blob_path: &Path) -> bool {
+    blob_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+}
+
+fn claude_code_document_events(doc: &serde_json::Value, blob_path: &Path) -> Vec<BlobEvent> {
+    let mut events = Vec::new();
+    if let Some(arr) = doc.get("messages").and_then(serde_json::Value::as_array) {
+        for (index, item) in arr.iter().enumerate() {
+            let content_val = item.get("content").or_else(|| item.get("text"));
+            let content_str = content_val.map(project_content).unwrap_or_default();
+            if content_str.trim().is_empty() {
+                continue;
+            }
+            let role = item
+                .get("role")
+                .or_else(|| item.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("agent");
+            let event_key = item
+                .get("uuid")
+                .or_else(|| item.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("element:{index}"));
+            let item_tool_id = item
+                .get("tool_call_id")
+                .or_else(|| item.get("tool_use_id"))
+                .or_else(|| item.get("call_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+
+            let blocks = match content_val {
+                Some(serde_json::Value::Array(content)) => {
+                    let mut parsed = Vec::with_capacity(content.len());
+                    for (i, block) in content.iter().enumerate() {
+                        let block_type = block.get("type").and_then(|v| v.as_str());
+                        let kind = match block_type {
+                            Some("text" | "input_text" | "output_text")
+                                if block.get("text").and_then(|v| v.as_str()).is_some() =>
+                            {
+                                BlockKind::Text
+                            }
+                            None if block.is_string()
+                                || block.get("text").and_then(|v| v.as_str()).is_some() =>
+                            {
+                                BlockKind::Text
+                            }
+                            Some("tool_use") if block.get("name").and_then(|v| v.as_str()).is_some() => {
+                                BlockKind::ToolUse
+                            }
+                            Some("tool_result") => BlockKind::ToolResult,
+                            Some("thinking")
+                                if block
+                                    .get("thinking")
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| block.get("text").and_then(|v| v.as_str()))
+                                    .is_some() =>
+                            {
+                                BlockKind::Other
+                            }
+                            _ => continue,
+                        };
+                        let tool_use_id = block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| block.get("tool_use_id").and_then(|v| v.as_str()))
+                            .map(str::to_string);
+                        let tool_name = block.get("name").and_then(|v| v.as_str()).map(str::to_string);
+                        let args = block.get("input").cloned();
+                        parsed.push(RawBlock { index: i as u32, kind, tool_use_id, tool_name, args });
+                    }
+                    if role == "tool_result" && !parsed.iter().any(|b| b.kind == BlockKind::ToolResult) {
+                        if parsed.is_empty() {
+                            parsed.push(RawBlock {
+                                index: 0,
+                                kind: BlockKind::ToolResult,
+                                tool_use_id: item_tool_id.clone(),
+                                tool_name: None,
+                                args: None,
+                            });
+                        } else {
+                            for b in &mut parsed {
+                                if b.kind == BlockKind::Text {
+                                    b.kind = BlockKind::ToolResult;
+                                    if b.tool_use_id.is_none() {
+                                        b.tool_use_id = item_tool_id.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    parsed
+                }
+                _ => {
+                    let kind = match role {
+                        "tool_result" => BlockKind::ToolResult,
+                        "tool_call" => BlockKind::ToolUse,
+                        _ => BlockKind::Text,
+                    };
+                    vec![RawBlock {
+                        index: 0,
+                        kind,
+                        tool_use_id: item_tool_id,
+                        tool_name: item.get("name").and_then(serde_json::Value::as_str).map(str::to_string),
+                        args: item.get("input").or_else(|| item.get("arguments")).cloned(),
+                    }]
+                }
+            };
+            events.push(BlobEvent {
+                event: RawEvent { event_key, blocks },
+                raw_record: item.clone(),
+            });
+        }
+    }
+    if events.is_empty()
+        && blob_path.components().any(|c| c.as_os_str() == "local-agent-mode-sessions")
+        && ["title", "sessionId", "cliSessionId", "cwd"].iter().any(|key| {
+            doc.get(*key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+        })
+    {
+        events.push(BlobEvent {
+            event: RawEvent { event_key: "sidecar:0".to_string(), blocks: Vec::new() },
+            raw_record: doc.clone(),
+        });
+    }
+    events
+}
+
+fn claude_code_blob_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<BlobEvent>> {
+    let text = std::fs::read_to_string(blob_path)?;
+    if is_json_document_path(blob_path) {
+        return Ok(match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(doc) => claude_code_document_events(&doc, blob_path),
+            Err(_) => Vec::new(),
+        });
+    }
+    let mut events = Vec::new();
+    let mut parsed_lines = 0usize;
+    for (idx, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        push_claude_code_events(&value, *line_no, &mut events);
+        parsed_lines += 1;
+        let mut line_events = Vec::new();
+        push_claude_code_events(&value, idx + 1, &mut line_events);
+        for event in line_events {
+            events.push(BlobEvent { event, raw_record: value.clone() });
+        }
+    }
+    if parsed_lines == 0
+        && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        return Ok(claude_code_document_events(&doc, blob_path));
     }
     Ok(events)
 }
@@ -554,12 +690,82 @@ fn push_codex_events(value: &serde_json::Value, line_no: usize, events: &mut Vec
     events.push(RawEvent { event_key, blocks });
 }
 
-fn codex_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
-    let lines = read_jsonl_lines(blob_path)?;
-    let mut events = Vec::with_capacity(lines.len());
-    for (line_no, line) in &lines {
+fn codex_document_events(doc: &serde_json::Value) -> Vec<BlobEvent> {
+    let mut events = Vec::new();
+    if let Some(items) = doc.get("items").and_then(serde_json::Value::as_array) {
+        for (index, item) in items.iter().enumerate() {
+            let content_val = item.get("content");
+            let content_str = content_val.map(project_content).unwrap_or_default();
+            if content_str.trim().is_empty() {
+                continue;
+            }
+            let role = item.get("role").and_then(serde_json::Value::as_str).unwrap_or("agent");
+            let event_key = item
+                .get("id")
+                .or_else(|| item.get("uuid"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("element:{index}"));
+            let tool_use_id = item
+                .get("tool_call_id")
+                .or_else(|| item.get("call_id"))
+                .or_else(|| item.get("tool_use_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let kind = match role {
+                "tool_result" => BlockKind::ToolResult,
+                "tool_call" => BlockKind::ToolUse,
+                _ => BlockKind::Text,
+            };
+            let tool_name = item.get("name").and_then(serde_json::Value::as_str).map(str::to_string);
+            let args = item.get("input").or_else(|| item.get("arguments")).cloned();
+            let blocks = match content_val {
+                Some(serde_json::Value::Array(arr)) if !arr.is_empty() => (0..arr.len())
+                    .map(|i| RawBlock {
+                        index: i as u32,
+                        kind,
+                        tool_use_id: tool_use_id.clone(),
+                        tool_name: tool_name.clone(),
+                        args: args.clone(),
+                    })
+                    .collect(),
+                _ => vec![RawBlock { index: 0, kind, tool_use_id, tool_name, args }],
+            };
+            events.push(BlobEvent {
+                event: RawEvent { event_key, blocks },
+                raw_record: item.clone(),
+            });
+        }
+    }
+    events
+}
+
+fn codex_blob_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<BlobEvent>> {
+    let text = std::fs::read_to_string(blob_path)?;
+    if is_json_document_path(blob_path) {
+        return Ok(match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(doc) => codex_document_events(&doc),
+            Err(_) => Vec::new(),
+        });
+    }
+    let mut events = Vec::new();
+    let mut parsed_lines = 0usize;
+    for (idx, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        push_codex_events(&value, *line_no, &mut events);
+        parsed_lines += 1;
+        let mut line_events = Vec::new();
+        push_codex_events(&value, idx + 1, &mut line_events);
+        for event in line_events {
+            events.push(BlobEvent { event, raw_record: value.clone() });
+        }
+    }
+    if parsed_lines == 0
+        && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        return Ok(codex_document_events(&doc));
     }
     Ok(events)
 }
@@ -1246,7 +1452,16 @@ pub(crate) fn decide(
 /// carries its text directly on `payload.message`, not `payload.content`/
 /// `.output` at all.
 pub const EXTRA_FIELD_MAP: &[(&str, &[&str])] = &[
-    ("claude_code", &["message.content[*].content", "message.content[*].text", "toolUseResult.file.content"]),
+    (
+        "claude_code",
+        &[
+            "message.content[*].content",
+            "message.content[*].text",
+            "content[*].content",
+            "content[*].text",
+            "toolUseResult.file.content",
+        ],
+    ),
     (
         "codex",
         &[
@@ -1257,6 +1472,7 @@ pub const EXTRA_FIELD_MAP: &[(&str, &[&str])] = &[
             "payload.output",
             "payload.content",
             "payload.message",
+            "content[*].text",
         ],
     ),
 ];
@@ -1389,6 +1605,96 @@ fn strip_claude_array_tool_use_result(value: &mut serde_json::Value, owned_bodie
             .and_then(serde_json::Value::as_str)
             .is_some_and(|text| owned_bodies.iter().any(|body| is_owned_body_copy(text, body)));
         if owned && let Some(slot) = item.get_mut("text") {
+            *slot = placeholder.clone();
+        }
+    }
+}
+
+/// R1-B5: Claude Code's object-form `toolUseResult` (for example `Bash` tool
+/// results carrying `{"stdout": "<cass_recall...>", "stderr": "",
+/// "interrupted": false, "isImage": false}`). Walk the object subtree and
+/// replace only string/text-array values proven to copy an owned excluded body,
+/// preserving every sibling metadata field (`interrupted`, `isImage`,
+/// `filePath`, `type`, etc.).
+fn strip_claude_object_tool_use_result(
+    value: &mut serde_json::Value,
+    owned_bodies: &[String],
+    placeholder: &serde_json::Value,
+) {
+    if owned_bodies.is_empty() {
+        return;
+    }
+    let Some(obj) = value.get_mut("toolUseResult").filter(|v| v.is_object()) else { return };
+    strip_owned_values_in_object(obj, None, owned_bodies, placeholder);
+}
+
+fn strip_owned_values_in_object(
+    node: &mut serde_json::Value,
+    key_hint: Option<&str>,
+    owned_bodies: &[String],
+    placeholder: &serde_json::Value,
+) {
+    match node {
+        serde_json::Value::String(recorded) => {
+            let exact_or_superset = owned_bodies.iter().any(|body| is_owned_body_copy(recorded, body));
+            let payload_key_copy = matches!(key_hint, Some("stdout" | "stderr" | "output" | "content" | "text"))
+                && !recorded.trim().is_empty()
+                && owned_bodies.iter().any(|body| {
+                    let st = recorded.trim();
+                    let bt = body.trim();
+                    st == bt
+                        || (bt.contains(st)
+                            && recorded.len().saturating_add(TOOL_USE_RESULT_WRAPPER_SLACK) >= body.len())
+                });
+            if exact_or_superset || payload_key_copy {
+                *node = placeholder.clone();
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let joined = project_parts(items);
+            if !joined.is_empty() && owned_bodies.iter().any(|body| is_owned_body_copy(&joined, body)) {
+                for item in items.iter_mut() {
+                    if item.as_str().is_some_and(|text| !text.is_empty()) {
+                        *item = placeholder.clone();
+                    } else if is_joined_text_part(item)
+                        && let Some(slot) = item.get_mut("text")
+                    {
+                        *slot = placeholder.clone();
+                    }
+                }
+                return;
+            }
+            for item in items.iter_mut() {
+                strip_owned_values_in_object(item, None, owned_bodies, placeholder);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                strip_owned_values_in_object(child, Some(key.as_str()), owned_bodies, placeholder);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whole-document `.json` items carry their body directly on top-level
+/// `content`/`text` (no outer `message` or `payload` envelope). Replace bare
+/// string copies proven to match an owned excluded body without disturbing
+/// structured arrays (which `EXTRA_FIELD_MAP`'s `content[*].*` entries handle).
+fn strip_top_level_document_body(
+    value: &mut serde_json::Value,
+    owned_bodies: &[String],
+    placeholder: &serde_json::Value,
+) {
+    if value.get("message").is_some() || value.get("payload").is_some() {
+        return;
+    }
+    for key in ["content", "text"] {
+        let is_owned = value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|recorded| owned_bodies.iter().any(|body| is_owned_body_copy(recorded, body)));
+        if is_owned && let Some(slot) = value.get_mut(key) {
             *slot = placeholder.clone();
         }
     }
@@ -1561,6 +1867,8 @@ fn apply_extra(
             }
             strip_claude_string_tool_use_result(&mut inner, &bodies, placeholder);
             strip_claude_array_tool_use_result(&mut inner, &bodies, placeholder);
+            strip_claude_object_tool_use_result(&mut inner, &bodies, placeholder);
+            strip_top_level_document_body(&mut inner, &bodies, placeholder);
             let rewritten = serde_json::to_string(&inner).unwrap_or(raw);
             extra[HISTORICAL_RAW_JSON_SENTINEL_KEY] = serde_json::Value::String(rewritten);
         }
@@ -1573,6 +1881,8 @@ fn apply_extra(
     }
     strip_claude_string_tool_use_result(extra, &bodies, placeholder);
     strip_claude_array_tool_use_result(extra, &bodies, placeholder);
+    strip_claude_object_tool_use_result(extra, &bodies, placeholder);
+    strip_top_level_document_body(extra, &bodies, placeholder);
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -3723,5 +4033,212 @@ mod tests {
         );
         let err = ExcludedMarker::from_json_str(&json).expect_err("short sha256 must be rejected");
         assert!(err.to_string().contains("sha256"), "error must name the offending field: {err}");
+    }
+
+    #[test]
+    fn blob_events_from_blob_claude_multiline_json_aligns_with_real_connector() {
+        use crate::connectors::{Connector, ScanContext, ScanRoot, claude_code::ClaudeCodeConnector};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let proj = dir.path().join(".claude").join("projects").join("demo");
+        std::fs::create_dir_all(&proj).unwrap();
+        let session = proj.join("legacy-session.json");
+        let pretty = serde_json::to_string_pretty(&serde_json::json!({
+            "sessionId": "legacy-claude-json",
+            "cwd": "/workspace/demo",
+            "messages": [
+                {"id": "m0", "role": "user", "content": "find prior decision"},
+                {"id": "m1", "role": "assistant", "content": "   "},
+                {
+                    "id": "m2",
+                    "role": "tool_call",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu-json-1",
+                            "name": "mcp__cass-mcp__cass_search",
+                            "input": {"query": "alpha"}
+                        }
+                    ]
+                },
+                {
+                    "id": "m3",
+                    "role": "tool_result",
+                    "tool_call_id": "tu-json-1",
+                    "content": "<cass_recall tool=\"cass_search\" version=\"1\">{\"hits\":[]}</cass_recall>"
+                }
+            ]
+        }))
+        .unwrap();
+        std::fs::write(&session, pretty).unwrap();
+
+        let ctx = ScanContext::with_roots(
+            dir.path().join(".claude"),
+            vec![ScanRoot::local(session.clone())],
+            None,
+        );
+        let convs = ClaudeCodeConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        let events = blob_events_from_blob("claude_code", &session);
+        assert_eq!(
+            events.len(),
+            convs[0].messages.len(),
+            "multi-line .json Claude session must align 1:1 with connector messages"
+        );
+        assert_eq!(events[2].event.event_key, "m3");
+        assert_eq!(events[2].event.blocks[0].kind, BlockKind::ToolResult);
+        assert_eq!(events[2].event.blocks[0].tool_use_id.as_deref(), Some("tu-json-1"));
+        assert_eq!(events[2].raw_record["id"], "m3");
+    }
+
+    #[test]
+    fn blob_events_from_blob_codex_multiline_json_aligns_with_real_connector() {
+        use crate::connectors::{Connector, ScanContext, ScanRoot, codex::CodexConnector};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions").join("2026").join("11").join("22");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let session = sessions.join("rollout-2026-11-22T01-00-00-legacy.json");
+        let pretty = serde_json::to_string_pretty(&serde_json::json!({
+            "session": {"cwd": "/workspace/demo"},
+            "items": [
+                {
+                    "id": "i0",
+                    "role": "user",
+                    "content": "# AGENTS.md instructions for /workspace/demo\n<environment_context>\n<cwd>/workspace/demo</cwd>\n</environment_context>"
+                },
+                {"id": "i1", "role": "assistant", "content": ""},
+                {"id": "i2", "role": "assistant", "content": "ready"}
+            ]
+        }))
+        .unwrap();
+        std::fs::write(&session, pretty).unwrap();
+
+        let ctx = ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![ScanRoot::local(session.clone())],
+            None,
+        );
+        let convs = CodexConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        let events = blob_events_from_blob("codex", &session);
+        assert_eq!(
+            events.len(),
+            convs[0].messages.len(),
+            "multi-line .json Codex session must align 1:1 with connector messages"
+        );
+        assert_eq!(events[0].event.event_key, "i0");
+        assert_eq!(events[0].event.blocks[0].kind, BlockKind::Text);
+        assert_eq!(events[1].raw_record["id"], "i2");
+    }
+
+    #[test]
+    fn apply_strips_claude_object_tool_use_result_stdout_and_preserves_sibling_metadata() {
+        let recall_body = "<cass_recall tool=\"cass_search\" version=\"1\">{\"hits\":[{\"source_id\":\"local\",\"source_path\":\"/tmp/s.jsonl\",\"snippet\":\"sentinel-bash-recall-body\"}]}</cass_recall>";
+        let mut msg = NormalizedMessage {
+            idx: 1,
+            role: "tool_result".to_string(),
+            author: None,
+            created_at: Some(1_700_000_000_000),
+            content: recall_body.to_string(),
+            extra: serde_json::json!({
+                "uuid": "u-bash-1",
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "tu-bash-1", "content": recall_body}
+                    ]
+                },
+                "toolUseResult": {
+                    "stdout": recall_body,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                    "unrelatedNote": "keep-this-sibling"
+                }
+            }),
+            invocations: Vec::new(),
+            snippets: Vec::new(),
+        };
+        let decision = Decision {
+            reason: ExclusionReason::CassRecall,
+            anchor: ExclusionAnchor {
+                tool_call_id: Some("tu-bash-1".to_string()),
+                tool_name: Some("Bash".to_string()),
+                paths: None,
+                shell: None,
+            },
+            event_key: "u-bash-1".to_string(),
+            target_blocks: vec![0],
+        };
+        let mut redactor = MemoizingRedactor::new();
+        let marker = apply_with_redaction(
+            &mut msg,
+            &decision,
+            &mut redactor,
+            "blobs/blake3/ab/bash.raw",
+            1,
+            field_map_for("claude_code"),
+            true,
+        );
+        assert!(msg.content.is_empty());
+        assert_eq!(msg.extra["toolUseResult"]["stdout"]["redacted"], true);
+        assert_eq!(msg.extra["toolUseResult"]["stdout"]["sha256"], marker.sha256);
+        assert_eq!(msg.extra["toolUseResult"]["interrupted"], false);
+        assert_eq!(msg.extra["toolUseResult"]["isImage"], false);
+        assert_eq!(msg.extra["toolUseResult"]["stderr"], "");
+        assert_eq!(msg.extra["toolUseResult"]["unrelatedNote"], "keep-this-sibling");
+        let serialized = serde_json::to_string(&msg.extra).unwrap();
+        assert!(
+            !serialized.contains("sentinel-bash-recall-body"),
+            "object toolUseResult.stdout must not leak recall body: {serialized}"
+        );
+    }
+
+    #[test]
+    fn apply_strips_multiline_json_top_level_content() {
+        let recall_body = "<cass_recall tool=\"cass_search\" version=\"1\">{\"hits\":[{\"source_id\":\"local\",\"source_path\":\"/tmp/s.jsonl\",\"snippet\":\"sentinel-json-doc-body\"}]}</cass_recall>";
+        let mut msg = NormalizedMessage {
+            idx: 2,
+            role: "tool_result".to_string(),
+            author: None,
+            created_at: Some(1_700_000_000_000),
+            content: recall_body.to_string(),
+            extra: serde_json::json!({
+                "id": "m3",
+                "role": "tool_result",
+                "tool_call_id": "tu-json-1",
+                "content": recall_body
+            }),
+            invocations: Vec::new(),
+            snippets: Vec::new(),
+        };
+        let decision = Decision {
+            reason: ExclusionReason::CassRecall,
+            anchor: ExclusionAnchor {
+                tool_call_id: Some("tu-json-1".to_string()),
+                tool_name: Some("mcp__cass-mcp__cass_search".to_string()),
+                paths: None,
+                shell: None,
+            },
+            event_key: "m3".to_string(),
+            target_blocks: vec![0],
+        };
+        let mut redactor = MemoizingRedactor::new();
+        let marker = apply_with_redaction(
+            &mut msg,
+            &decision,
+            &mut redactor,
+            "blobs/blake3/ab/doc.raw",
+            2,
+            field_map_for("claude_code"),
+            true,
+        );
+        assert!(msg.content.is_empty());
+        assert_eq!(msg.extra["content"]["redacted"], true);
+        assert_eq!(msg.extra["content"]["sha256"], marker.sha256);
+        assert_eq!(msg.extra["id"], "m3");
+        assert!(!serde_json::to_string(&msg.extra).unwrap().contains("sentinel-json-doc-body"));
     }
 }
