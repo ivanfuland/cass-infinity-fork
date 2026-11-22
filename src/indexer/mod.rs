@@ -19429,6 +19429,84 @@ fn judge_and_redact_reparsed(
             }
         }
     }
+
+    // Whole-document `.json`/`.claude` Anthropic Messages API `role: "user"` turns
+    // can embed `{"type": "tool_result"}` blocks alongside user `{"type": "text"}`
+    // blocks in a single unsplit message (no sibling `role: "tool_result"` row).
+    // Evaluate each embedded `ToolResult` block through the exact same `recall_v2`
+    // judgment and redact matching blocks + `toolUseResult` copies inside `extra`,
+    // while keeping the user's prose intact.
+    for idx in 0..conv.messages.len() {
+        if conv.messages[idx].role != "user" {
+            continue;
+        }
+        let Some(blob_event) = events.get(idx) else { continue };
+        let embedded_results: Vec<crate::indexer::exclusion::RawBlock> = blob_event
+            .event
+            .blocks
+            .iter()
+            .filter(|b| b.kind == crate::indexer::exclusion::BlockKind::ToolResult)
+            .cloned()
+            .collect();
+        if embedded_results.is_empty() {
+            continue;
+        }
+        let has_sibling_tool_result_row = conv.messages.iter().enumerate().any(|(other_idx, m)| {
+            other_idx != idx
+                && m.role == "tool_result"
+                && events.get(other_idx).map(|e| e.event.event_key.as_str())
+                    == Some(blob_event.event.event_key.as_str())
+        });
+        if has_sibling_tool_result_row {
+            continue;
+        }
+        for blk in &embedded_results {
+            let Some(blk_body) = crate::indexer::exclusion::embedded_tool_result_body(
+                &blob_event.raw_record,
+                blk.index,
+            ) else {
+                continue;
+            };
+            let mut embedded_candidates = candidates[..idx].to_vec();
+            embedded_candidates.push(crate::indexer::exclusion::PairingCandidate::ToolResult {
+                tool_call_id: blk.tool_use_id.clone(),
+            });
+            let embedded_ctx = PairingContext::build(&embedded_candidates);
+            let mut synthetic_msg = conv.messages[idx].clone();
+            synthetic_msg.role = "tool_result".to_string();
+            synthetic_msg.content = blk_body.clone();
+            match crate::indexer::recall_v2::decide(
+                &synthetic_msg,
+                idx,
+                &blob_event.event,
+                &embedded_ctx,
+                &conv.agent_slug,
+                paths_cfg,
+            ) {
+                Outcome::Exclude(exclusion) => {
+                    let marker = apply_with_redaction(
+                        &mut synthetic_msg,
+                        &exclusion,
+                        &mut redactor,
+                        blob_relative_path,
+                        idx as u32,
+                        field_map,
+                        redaction_enabled,
+                    );
+                    crate::indexer::exclusion::apply_embedded_tool_result_extra(
+                        &mut conv.messages[idx],
+                        &marker,
+                        &blk_body,
+                        field_map,
+                    );
+                }
+                Outcome::Preserve(Some(reason)) => {
+                    *recall_uncovered.entry(reason.as_str().to_string()).or_insert(0) += 1;
+                }
+                Outcome::Preserve(None) => {}
+            }
+        }
+    }
     (markers, recall_uncovered)
 }
 

@@ -2777,3 +2777,181 @@ fn mcp_activate_v2_r2_round4_regressions() {
         "recall secret must not survive in img_tr extra: {decoded}"
     );
 }
+
+#[test]
+fn mcp_activate_v2_r2_round5_regressions() {
+    let fixture = Fixture::new();
+    let case = CaseDir::new("mcp_activate_v2_plan_a", "r2-round5-regressions");
+
+    const FORM_A_SECRET: &str = "r2_5_f1a_embedded_user_tool_result_secret";
+    const FORM_A_USER_PROSE: &str = "r2_5_f1a_user_followup_prose_must_survive";
+    const FORM_B_R1_SECRET: &str = "r2_5_f1b_outer_id_inner_idless_mcp_secret";
+    const FORM_B_R2_SECRET: &str = "r2_5_f1b_outer_id_inner_idless_r2_context_secret";
+    const F2_RECALL_SECRET: &str = "r2_5_f2_empty_leading_text_recall_secret";
+
+    // 1. Finding 1 Form A: Standard Anthropic Messages API whole-document `.json` where
+    //    `role: "user"` embeds `{"type": "tool_result", ...}` + `{"type": "text", ...}` + `toolUseResult`.
+    let form_a_payload = wrapper(RecallTool::Search, &native_search_value(FORM_A_SECRET));
+    let form_a_doc = json!({
+        "title": "Claude Anthropic Mixed User Turn Doc",
+        "messages": [
+            {
+                "role": "assistant",
+                "timestamp": "2026-01-12T00:00:00.000Z",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_r5_1a", "name": "mcp__cass-mcp__cass_search", "input": {"query": "r5-1a"}}
+                ]
+            },
+            {
+                "role": "user",
+                "timestamp": "2026-01-12T00:00:01.000Z",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_r5_1a", "content": form_a_payload},
+                    {"type": "text", "text": FORM_A_USER_PROSE}
+                ],
+                "toolUseResult": form_a_payload
+            }
+        ]
+    });
+    let form_a_path = fixture.home().join(".claude/projects/r2-5/session_1a.json");
+    std::fs::create_dir_all(form_a_path.parent().unwrap()).unwrap();
+    std::fs::write(&form_a_path, serde_json::to_string_pretty(&form_a_doc).unwrap() + "\n").unwrap();
+
+    // 2. Finding 1 Form B: `role: "tool_result"` with outer `tool_use_id` and inner id-less
+    //    `{"type": "tool_result"}` + `{"type": "text"}` for both R1 MCP and R2 context file read.
+    let form_b_r1_payload = wrapper(RecallTool::Search, &native_search_value(FORM_B_R1_SECRET));
+    let form_b_doc = json!({
+        "title": "Claude Outer Tool Id Inner Idless Block Doc",
+        "messages": [
+            {"role": "user", "timestamp": "2026-01-12T01:00:00.000Z", "content": "outer tool id prompt stays"},
+            {
+                "role": "assistant",
+                "timestamp": "2026-01-12T01:00:01.000Z",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_r5_1b_mcp", "name": "mcp__cass-mcp__cass_search", "input": {"query": "r5-1b"}},
+                    {"type": "tool_use", "id": "toolu_r5_1b_r2", "name": "Read", "input": {"file_path": "/synthetic/ws/CLAUDE.local.md"}}
+                ]
+            },
+            {
+                "role": "tool_result",
+                "timestamp": "2026-01-12T01:00:02.000Z",
+                "tool_use_id": "toolu_r5_1b_mcp",
+                "content": [
+                    {"type": "tool_result", "content": form_b_r1_payload},
+                    {"type": "text", "text": form_b_r1_payload}
+                ]
+            },
+            {
+                "role": "tool_result",
+                "timestamp": "2026-01-12T01:00:03.000Z",
+                "tool_use_id": "toolu_r5_1b_r2",
+                "content": [
+                    {"type": "tool_result", "content": FORM_B_R2_SECRET},
+                    {"type": "text", "text": FORM_B_R2_SECRET}
+                ]
+            }
+        ]
+    });
+    let form_b_path = fixture.home().join(".claude/projects/r2-5/session_1b.json");
+    std::fs::write(&form_b_path, serde_json::to_string_pretty(&form_b_doc).unwrap() + "\n").unwrap();
+
+    // 3. Finding 2: Leading empty `{"type": "text", "text": "", "meta": "keep_empty_block"}`
+    //    must be skipped when anchoring `target_blocks` (leaving `blocks: [1]` and `content[0].text == ""`).
+    let f2_doc = json!({
+        "title": "Claude Leading Empty Text Block Doc",
+        "messages": [
+            {"role": "user", "timestamp": "2026-01-12T02:00:00.000Z", "content": "empty leading text prompt stays"},
+            {
+                "role": "assistant",
+                "timestamp": "2026-01-12T02:00:01.000Z",
+                "content": [{"type": "tool_use", "id": "toolu_r5_2", "name": "mcp__cass-mcp__cass_search", "input": {"query": "r5-2"}}]
+            },
+            {
+                "role": "tool_result",
+                "timestamp": "2026-01-12T02:00:02.000Z",
+                "tool_use_id": "toolu_r5_2",
+                "content": [
+                    {"type": "text", "text": "", "meta": "keep_empty_block"},
+                    {"type": "text", "text": wrapper(RecallTool::Search, &native_search_value(F2_RECALL_SECRET))}
+                ]
+            }
+        ]
+    });
+    let f2_path = fixture.home().join(".claude/projects/r2-5/session_2.json");
+    std::fs::write(&f2_path, serde_json::to_string_pretty(&f2_doc).unwrap() + "\n").unwrap();
+
+    let output = fixture.index(&[], &[]);
+    write_evidence(&case, &["index", "--json"], &[], &output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "r2-round5 index failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("index json");
+    assert_eq!(report["success"], json!(true));
+    assert_eq!(report["recall_uncovered_total"], json!(0), "report={report}");
+    assert_eq!(report["indexing_stats"]["event_align_failed"], json!(0), "report={report}");
+
+    let db = fixture.open_db();
+    // 3 excluded tool_result rows: Form B R1 + Form B R2 + Finding 2.
+    assert_eq!(marker_rule_versions(&db).len(), 3, "Form B (2) + F2 (1) must be excluded");
+    assert_excluded_rows_clean(
+        &db,
+        &[FORM_A_SECRET, FORM_B_R1_SECRET, FORM_B_R2_SECRET, F2_RECALL_SECRET],
+        "r2-round5-regressions",
+    );
+
+    // Form A check: user follow-up row keeps its prose, while embedded tool_result & toolUseResult
+    // in `extra` have ZERO recall secret leakage.
+    let form_a_rows: Vec<(String, Option<String>, Option<Vec<u8>>)> = db
+        .query_all_map(
+            "SELECT m.content, m.extra_json, m.extra_bin FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.source_path LIKE '%session_1a.json' AND m.role = 'user'",
+            &[],
+            |r| Ok((r.get_typed(0)?, r.get_typed(1).ok(), r.get_typed(2).ok())),
+        )
+        .expect("query form A user row");
+    assert_eq!(form_a_rows.len(), 1);
+    assert_eq!(form_a_rows[0].0, FORM_A_USER_PROSE);
+    let form_a_extra = decode_extra(form_a_rows[0].1.clone(), form_a_rows[0].2.clone());
+    assert!(
+        !form_a_extra.to_string().contains(FORM_A_SECRET),
+        "Form A embedded tool_result secret leaked in user extra: {form_a_extra}"
+    );
+    assert_eq!(
+        form_a_extra["content"][1]["text"],
+        json!(FORM_A_USER_PROSE),
+        "Form A user text block must survive intact: {form_a_extra}"
+    );
+
+    // Form B check: neither R1 nor R2 secret survives in any message content.
+    let all_contents = message_contents(&db);
+    for secret in [FORM_A_SECRET, FORM_B_R1_SECRET, FORM_B_R2_SECRET, F2_RECALL_SECRET] {
+        assert!(
+            !all_contents.iter().any(|c| c.contains(secret)),
+            "secret {secret:?} leaked into messages.content"
+        );
+    }
+
+    // Finding 2 check: marker records `raw.blocks == [1]` and leading empty block stays `""`.
+    let f2_rows: Vec<(String, Option<String>, Option<Vec<u8>>)> = db
+        .query_all_map(
+            "SELECT json(m.excluded), m.extra_json, m.extra_bin FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE c.source_path LIKE '%session_2.json' AND m.excluded IS NOT NULL",
+            &[],
+            |r| Ok((r.get_typed(0)?, r.get_typed(1).ok(), r.get_typed(2).ok())),
+        )
+        .expect("query f2 row");
+    assert_eq!(f2_rows.len(), 1);
+    let f2_marker: Value = serde_json::from_str(&f2_rows[0].0).expect("f2 marker json");
+    assert_eq!(f2_marker["raw"]["blocks"], json!([1]), "f2_marker={f2_marker}");
+    let f2_extra = decode_extra(f2_rows[0].1.clone(), f2_rows[0].2.clone());
+    assert_eq!(
+        f2_extra["content"][0]["text"],
+        json!(""),
+        "leading empty text block must remain empty string: {f2_extra}"
+    );
+}

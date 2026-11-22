@@ -434,12 +434,18 @@ fn claude_code_document_events(doc: &serde_json::Value, blob_path: &Path) -> Vec
                         let block_type = block.get("type").and_then(|v| v.as_str());
                         let kind = match block_type {
                             Some("text" | "input_text" | "output_text")
-                                if block.get("text").and_then(|v| v.as_str()).is_some() =>
+                                if block
+                                    .get("text")
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|text| !text.is_empty()) =>
                             {
                                 BlockKind::Text
                             }
-                            None if block.is_string()
-                                || block.get("text").and_then(|v| v.as_str()).is_some() =>
+                            None if block.as_str().is_some_and(|text| !text.is_empty())
+                                || block
+                                    .get("text")
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|text| !text.is_empty()) =>
                             {
                                 BlockKind::Text
                             }
@@ -471,25 +477,46 @@ fn claude_code_document_events(doc: &serde_json::Value, blob_path: &Path) -> Vec
                             .map(parse_tool_args_value);
                         parsed.push(RawBlock { index: i as u32, kind, tool_use_id, tool_name, args });
                     }
-                    if role == "tool_result" && !parsed.iter().any(|b| b.kind == BlockKind::ToolResult) {
-                        // Whole-document `.json`/`.claude` `role: "tool_result"` items with
-                        // multi-part text/string arrays project to ONE `NormalizedMessage`.
-                        // Keep ONE `ToolResult` block anchored on the first rendered text
-                        // element (avoiding leading non-text blocks such as `image`) so
-                        // id-less R4 block location sees a single unambiguous target.
-                        let target_idx = parsed
-                            .iter()
-                            .find(|b| b.kind == BlockKind::Text)
-                            .map(|b| b.index)
-                            .unwrap_or(0);
-                        parsed.clear();
-                        parsed.push(RawBlock {
-                            index: target_idx,
-                            kind: BlockKind::ToolResult,
-                            tool_use_id: item_tool_id.clone(),
-                            tool_name: None,
-                            args: None,
-                        });
+                    if role == "tool_result" {
+                        if !parsed.iter().any(|b| b.kind == BlockKind::ToolResult) {
+                            // Whole-document `.json`/`.claude` `role: "tool_result"` items with
+                            // multi-part text/string arrays project to ONE `NormalizedMessage`.
+                            // Keep ONE `ToolResult` block anchored on the first rendered text
+                            // element (avoiding leading non-text or empty blocks) so id-less R4
+                            // block location sees a single unambiguous target.
+                            let target_idx = parsed
+                                .iter()
+                                .find(|b| b.kind == BlockKind::Text)
+                                .map(|b| b.index)
+                                .unwrap_or(0);
+                            parsed.clear();
+                            parsed.push(RawBlock {
+                                index: target_idx,
+                                kind: BlockKind::ToolResult,
+                                tool_use_id: item_tool_id.clone(),
+                                tool_name: None,
+                                args: None,
+                            });
+                        } else if let Some(outer_id) = item_tool_id.as_deref() {
+                            // Outer `role: "tool_result"` carries `tool_use_id`, while the single
+                            // embedded `{"type":"tool_result"}` block omitted its own id: inherit
+                            // the outer id when unambiguous.
+                            let missing_id_count = parsed
+                                .iter()
+                                .filter(|b| b.kind == BlockKind::ToolResult && b.tool_use_id.is_none())
+                                .count();
+                            let already_matched = parsed.iter().any(|b| {
+                                b.kind == BlockKind::ToolResult
+                                    && b.tool_use_id.as_deref() == Some(outer_id)
+                            });
+                            if missing_id_count == 1 && !already_matched {
+                                for b in &mut parsed {
+                                    if b.kind == BlockKind::ToolResult && b.tool_use_id.is_none() {
+                                        b.tool_use_id = Some(outer_id.to_string());
+                                    }
+                                }
+                            }
+                        }
                     }
                     parsed
                 }
@@ -1838,6 +1865,16 @@ fn strip_top_level_document_body(
                             && owned_bodies.iter().any(|body| is_owned_body_copy(recorded, body))
                         {
                             *item = placeholder.clone();
+                        } else if is_joined_text_part(item)
+                            && item
+                                .get("text")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|recorded| {
+                                    owned_bodies.iter().any(|body| is_owned_body_copy(recorded, body))
+                                })
+                            && let Some(slot) = item.get_mut("text")
+                        {
+                            *slot = placeholder.clone();
                         }
                     }
                 }
@@ -2194,6 +2231,44 @@ pub(crate) fn apply_sibling(msg: &mut NormalizedMessage, marker: &ExcludedMarker
     // path clear an excluded body's string copy at all (pre-fix it passed a
     // single block, so R3-N2's all-members guard could never be satisfied).
     apply_extra(&mut msg.extra, field_map, &marker.raw.blocks, &placeholder, None);
+}
+
+/// Extract the rendered body of an embedded `{"type": "tool_result"}` block at
+/// `block_index` inside a whole-document `.json`/`.claude` record's `content[]`
+/// array (used when an Anthropic Messages API `role: "user"` turn carries both
+/// `tool_result` blocks and user text without splitting rows).
+pub(crate) fn embedded_tool_result_body(
+    raw_record: &serde_json::Value,
+    block_index: u32,
+) -> Option<String> {
+    let blocks = raw_record
+        .pointer("/message/content")
+        .or_else(|| raw_record.get("content"))
+        .and_then(serde_json::Value::as_array)?;
+    let block = blocks.get(block_index as usize)?;
+    for key in ["content", "text"] {
+        if let Some(val) = block.get(key) {
+            let rendered = project_content(val);
+            if !rendered.is_empty() {
+                return Some(rendered);
+            }
+        }
+    }
+    None
+}
+
+/// Redact one embedded `tool_result` block inside an unsplit `role: "user"`
+/// whole-document row's `extra` (including any matching `toolUseResult` copy),
+/// leaving the user's own `content` and sibling `text` blocks untouched.
+pub(crate) fn apply_embedded_tool_result_extra(
+    msg: &mut NormalizedMessage,
+    marker: &ExcludedMarker,
+    block_body: &str,
+    field_map: ExtraFieldMap,
+) {
+    let placeholder =
+        serde_json::json!({"redacted": true, "sha256": marker.sha256, "bytes": marker.bytes});
+    apply_extra(&mut msg.extra, field_map, &marker.raw.blocks, &placeholder, Some(block_body));
 }
 
 #[cfg(test)]
