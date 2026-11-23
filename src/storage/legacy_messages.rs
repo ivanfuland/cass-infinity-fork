@@ -13,10 +13,7 @@
 //! that a caller must invoke explicitly, and that reads the *message* view of
 //! a schema-7/8 archive — the `messages` row and its raw `extra_bin` /
 //! `extra_json` columns — through a private read-only connection. It never
-//! migrates, never writes `meta`, never creates a table, and never claims the
-//! archive carries source facts: [`LegacyMessageReader::read_source_facts`]
-//! always fails with the stable `source_facts_unavailable` code, including on
-//! an archive with zero messages.
+//! migrates, never writes `meta`, and never creates a table.
 //!
 //! Version authority is `PRAGMA user_version`, the marker the schema-7/8 code
 //! itself wrote (`storage::schema::ensure` → `set_user_version_sql`) and the
@@ -50,9 +47,6 @@ pub const CODE_SCHEMA_SHAPE_INVALID: &str = "legacy_schema_shape_invalid";
 pub const CODE_QUERY_FAILED: &str = "legacy_query_failed";
 /// Stable code: an explicit `extra` decode failed.
 pub const CODE_EXTRA_DECODE_FAILED: &str = "legacy_extra_decode_failed";
-/// Stable code: source facts are never available through this adapter
-/// (PRX v0.4 §4 — the legacy handle must not invent source facts).
-pub const CODE_SOURCE_FACTS_UNAVAILABLE: &str = "source_facts_unavailable";
 
 /// Coarse classification of an open failure.
 ///
@@ -107,8 +101,6 @@ pub enum LegacyReadError {
     QueryFailed { message_id: Option<i64> },
     /// An explicit `extra` decode failed.
     ExtraDecodeFailed { message_id: i64, column: &'static str },
-    /// Source facts are unavailable through a legacy read-only handle.
-    SourceFactsUnavailable,
 }
 
 impl LegacyReadError {
@@ -123,7 +115,6 @@ impl LegacyReadError {
             Self::ShapeInvalid { .. } => CODE_SCHEMA_SHAPE_INVALID,
             Self::QueryFailed { .. } => CODE_QUERY_FAILED,
             Self::ExtraDecodeFailed { .. } => CODE_EXTRA_DECODE_FAILED,
-            Self::SourceFactsUnavailable => CODE_SOURCE_FACTS_UNAVAILABLE,
         }
     }
 }
@@ -148,9 +139,6 @@ impl fmt::Display for LegacyReadError {
             Self::QueryFailed { message_id: None } => write!(f, "reading legacy messages failed"),
             Self::ExtraDecodeFailed { message_id, column } => {
                 write!(f, "decoding legacy extra failed for message {message_id} column {column}")
-            }
-            Self::SourceFactsUnavailable => {
-                write!(f, "source facts are unavailable through a legacy read-only archive")
             }
         }
     }
@@ -303,21 +291,6 @@ impl LegacyMessageReader {
                 },
             )
             .map_err(|_| LegacyReadError::QueryFailed { message_id: None })
-    }
-
-    /// The legacy adapter's source-fact entry point.
-    ///
-    /// A schema-7/8 archive has no `source_inputs` / `source_records` /
-    /// `source_message_links` rows and this adapter will not fabricate them
-    /// (PRX v0.4 §4). The answer is therefore always the same: the stable
-    /// `source_facts_unavailable` error, on an empty archive just as much as
-    /// on a populated one. It never returns an empty successful result and
-    /// never writes.
-    ///
-    /// # Errors
-    /// Always [`LegacyReadError::SourceFactsUnavailable`].
-    pub fn read_source_facts(&self) -> Result<(), LegacyReadError> {
-        Err(LegacyReadError::SourceFactsUnavailable)
     }
 }
 

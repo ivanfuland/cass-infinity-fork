@@ -9,7 +9,7 @@ pub(crate) mod parallel_wal_shadow;
 pub mod quarantine;
 pub mod quarantine_retry;
 /// Ticket 05 / Task10: v2 MCP recall judgment and source extraction.
-/// `source_ingest` applies it as the default rule epoch (2).
+/// `recall_v2` applies it as the default rule epoch (2).
 pub(crate) mod recall_v2;
 pub mod redact_secrets;
 pub mod refresh_ledger;
@@ -17,7 +17,6 @@ pub mod scan_root_meta;
 pub(crate) mod responsiveness;
 pub mod semantic;
 pub mod semantic_progress;
-pub(crate) mod source_ingest;
 pub(crate) mod source_ownership;
 pub(crate) mod staging_reclaim;
 
@@ -912,10 +911,6 @@ pub struct SemanticCleanupFailure {
 }
 
 /// Aggregate indexing statistics for JSON output (T7.4).
-fn is_zero_usize(value: &usize) -> bool {
-    *value == 0
-}
-
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IndexingStats {
     /// Time spent in scanning phase (ms)
@@ -946,15 +941,6 @@ pub struct IndexingStats {
     pub semantic_watch_once: Option<SemanticWatchOnceStats>,
     /// Conversations skipped by ingest quarantine during this run.
     pub quarantined_conversations: usize,
-    /// SRC05B-07: sealed inputs this run committed. "The source commit is
-    /// complete" is this number, not a claim about the vector side.
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
-    pub source_inputs_committed: usize,
-    /// SRC05B-07: committed inputs whose semantic derivation was not read back
-    /// in memory and is left to the existing catch-up. Non-zero means the
-    /// source commit is complete while vector recovery is still outstanding.
-    #[serde(default, skip_serializing_if = "is_zero_usize")]
-    pub source_inputs_pending_recovery: usize,
     /// True when SQLite ingest succeeded but inline lexical updates were
     /// deferred and the caller must rebuild lexical assets from the archive.
     pub lexical_update_deferred: bool,
@@ -1700,17 +1686,6 @@ pub struct IndexOptions {
     /// Minimum interval (in seconds) between watch scan cycles. Prevents tight-loop
     /// CPU burn when filesystem events arrive continuously. Default: 30.
     pub watch_interval_secs: u64,
-    /// SRC05B-07 / Task 19: the caller-supplied fixed safety-configuration
-    /// copy.
-    ///
-    /// `Some` is an explicit override: the run uses this copy as its fixed
-    /// configuration instead of the default one. `None` no longer means the
-    /// legacy path -- a run that actually ingests prepares the default fixed
-    /// configuration once from the live effective rules and reuses that copy
-    /// for the whole run. A `--no-ingest` run, an absent-path early return and
-    /// a canonical-only derived rebuild prepare nothing. A supplied copy that
-    /// is missing or broken is a startup failure; it never falls back.
-    pub source_safety_config: Option<PathBuf>,
 }
 
 pub fn set_robot_trace_ingest_enabled(enabled: bool) -> bool {
@@ -5696,25 +5671,13 @@ fn should_skip_unchanged_explicit_watch_once_paths(
     opts: &IndexOptions,
     storage: &FrankenStorage,
     roots: &[(ConnectorKind, ScanRoot)],
-    source_fidelity_enabled: bool,
 ) -> Result<bool> {
     if opts.watch || opts.full || opts.force_rebuild || opts.semantic {
         return Ok(false);
     }
-    // SRC05B-09A: this skip answers "the file has not been touched since the
-    // last index run" from the mtime and from a conversation already recorded
-    // for that path. Neither is a source fact: a run whose source receipt is
-    // missing, or whose fixed safety copy changed, has a current mtime and a
-    // conversation row while its input is still unfinished, and skipping on
-    // that evidence would report a completed run over an input that was never
-    // sealed. The source-aware path has its own answer for "already read"
-    // (prepare + the kernel's verified replay), so it never takes this one.
-    //
-    // Task 19: `source_fidelity_enabled` states that this run prepares a
-    // fixed configuration even though no explicit copy was named. It is a
-    // caller-owned fact about the run, not a product switch, and it must
-    // disable the shortcut for exactly the same reason the explicit copy does.
-    if source_fidelity_enabled || opts.source_safety_config.is_some() {
+    // Schema 9 legacy compatibility: never short-circuit unchanged watch-once
+    // paths when an older archive still holds unfinished `source_inputs` rows.
+    if storage.has_legacy_unfinished_source_inputs()? {
         return Ok(false);
     }
 
@@ -5743,7 +5706,6 @@ fn should_skip_unchanged_explicit_watch_once_paths(
 fn can_skip_unchanged_explicit_watch_once_index_run(
     opts: &IndexOptions,
     storage: &FrankenStorage,
-    source_fidelity_enabled: bool,
 ) -> Result<bool> {
     if opts.watch || opts.full || opts.force_rebuild || opts.semantic {
         return Ok(false);
@@ -5759,12 +5721,7 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
     let additional_scan_roots =
         additional_scan_roots_for_scan_or_watch(storage, &opts.data_dir)?;
     let watch_roots = build_watch_roots(additional_scan_roots);
-    if !should_skip_unchanged_explicit_watch_once_paths(
-        opts,
-        storage,
-        &watch_roots,
-        source_fidelity_enabled,
-    )? {
+    if !should_skip_unchanged_explicit_watch_once_paths(opts, storage, &watch_roots)? {
         return Ok(false);
     }
 
@@ -6968,17 +6925,6 @@ pub(crate) enum IndexMessage {
         connector_name: &'static str,
         error: String,
     },
-    /// SRC05B-07: one prepared sealed input.
-    ///
-    /// This is deliberately not a `Batch`: an input is one unit of work with
-    /// its own root association, and it may never be split into several
-    /// independent conversation commits. The consumer commits it and, when the
-    /// commit fails, withholds that root's watermark.
-    SourceInput {
-        connector_name: &'static str,
-        job: Box<source_ingest::SourceInputJob>,
-        byte_reservation: usize,
-    },
     /// Producer has finished scanning
     Done {
         connector_name: &'static str,
@@ -7574,9 +7520,6 @@ struct StreamingProducerConfig {
     /// PR8 C3: the metadata every scan root (configured + home) is looked up
     /// in for its `identity_host` / `root_id`.
     scan_roots_meta: Arc<scan_root_meta::ScanRootMetaIndex>,
-    /// SRC05B-07: the loaded fixed safety configuration, when the caller asked
-    /// for the source-aware path.
-    source_safety: Option<Arc<source_ingest::FixedSafetyConfig>>,
 }
 
 /// PR8 C3: one connector's watermarks-enabled roots, split by where they come
@@ -7620,8 +7563,6 @@ fn batch_scan_one_root(
     active_source_filter: &ActiveSessionSourceFilter,
     convs: &mut Vec<crate::indexer::exclusion::PreparedConversation>,
     scan_errors: &mut Vec<String>,
-    source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
-    source_jobs: &mut Vec<source_ingest::SourceInputJob>,
 ) -> (RootScanOutcome, bool) {
     let mut prepare_failed = false;
     let capture_fallback_roots: Vec<ScanRoot> = conn
@@ -7631,10 +7572,6 @@ fn batch_scan_one_root(
         .cloned()
         .map(ScanRoot::local)
         .collect();
-    let mut collect_source_input = |job: source_ingest::SourceInputJob| {
-        source_jobs.push(job);
-        Ok(())
-    };
     let (outcome, fatal) = run_local_root_scan(
         conn,
         name,
@@ -7671,8 +7608,6 @@ fn batch_scan_one_root(
                 }
             }
         },
-        source_safety,
-        if source_safety.is_some() { Some(&mut collect_source_input) } else { None },
     );
 
     if let Some(error) = fatal {
@@ -7768,29 +7703,6 @@ fn scan_one_root_for_producer(
         .cloned()
         .map(ScanRoot::local)
         .collect();
-    let connector_name = name;
-    let mut deliver_source_input = |job: source_ingest::SourceInputJob| {
-        // Same backpressure as a batch: the reservation is acquired before
-        // the message can be queued and released by the consumer once it has
-        // committed the input.
-        let byte_reservation = config
-            .flow_limiter
-            .acquire(job.byte_reservation)
-            .map_err(|_| anyhow::Error::new(StreamingConsumerDisconnected { connector_name }))?;
-        tx.send(IndexMessage::SourceInput {
-            connector_name,
-            job: Box::new(job),
-            byte_reservation,
-        })
-        .map_err(|_| anyhow::Error::new(StreamingConsumerDisconnected { connector_name }))
-    };
-    // SRC05B-routing: one producer runs one connector, so the capability is
-    // decided here, once, and the whole root keeps the legacy projection path
-    // when this connector is not wired to the sealed read.
-    let source_safety = config
-        .source_safety
-        .as_ref()
-        .filter(|_| source_ingest::supports_source_fidelity(name));
     let (outcome, fatal) = run_local_root_scan(
         conn,
         name,
@@ -7844,8 +7756,6 @@ fn scan_one_root_for_producer(
                 }
             }
         },
-        source_safety,
-        if source_safety.is_some() { Some(&mut deliver_source_input) } else { None },
     );
 
     if let Err(error) = batch_sender.flush() {
@@ -7944,9 +7854,7 @@ fn spawn_connector_producer(
             root_outcomes.extend(outcomes);
             scan_succeeded = roots_succeeded;
             consumer_disconnected = disconnected;
-        } else if detect.detected
-            && !(config.source_safety.is_some() && source_ingest::supports_source_fidelity(name))
-        {
+        } else if detect.detected {
             // Update discovered agents count immediately when detected
             if let Some(p) = &config.progress {
                 p.discovered_agents.fetch_add(1, Ordering::Relaxed);
@@ -7982,7 +7890,7 @@ fn spawn_connector_producer(
                 config.active_source_filter.as_ref(),
             );
             record_scan_invocation();
-            match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+            match conn.scan_with_callback(&ctx, &mut |conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
                     name,
@@ -8080,6 +7988,7 @@ fn spawn_connector_producer(
                 .local_root_plans
                 .get(name)
                 .and_then(|plans| plans.configured_for(root))
+                && (plan.meta.watermarks_enabled || plan_enforces_ownership(plan))
             {
                 let (outcome, root_succeeded, root_disconnected) = scan_one_root_for_producer(
                     conn.as_ref(),
@@ -8141,7 +8050,7 @@ fn spawn_connector_producer(
                 config.active_source_filter.as_ref(),
             );
             record_scan_invocation();
-            match conn.scan_with_callback(&ctx, &mut |mut conversation| {
+            match conn.scan_with_callback(&ctx, &mut |conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
                     name,
@@ -8394,13 +8303,6 @@ fn run_streaming_consumer(
     // Per-connector stats tracking (T7.4)
     let mut connector_stats: HashMap<String, ConnectorStats> = HashMap::new();
     let mut failed_scan_connectors = BTreeSet::new();
-    // SRC05B-07: roots whose source-aware input did not commit. Recorded here
-    // (not in the producer) because the commit happens in this loop, and the
-    // root must not advance its watermark on the strength of a scan that lost
-    // an input.
-    let mut failed_source_roots: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut source_inputs_committed = 0usize;
-    let mut source_inputs_pending_recovery = 0usize;
     // Task10: one map per run; only a successful input's own judgment folds in.
     let mut recall_uncovered_by_reason: BTreeMap<String, u64> = BTreeMap::new();
 
@@ -8433,93 +8335,6 @@ fn run_streaming_consumer(
             rx.recv()
         };
         match next_message {
-            Ok(IndexMessage::SourceInput {
-                connector_name,
-                job,
-                byte_reservation,
-            }) => {
-                let root_id = job.root_id.clone();
-                let outcome = source_ingest::commit_source_input_dispatched(
-                    storage,
-                    &job,
-                    defer_streaming_checkpoints,
-                );
-                flow_limiter.release(byte_reservation);
-                let stats = connector_stats
-                    .entry(connector_name.to_string())
-                    .or_insert_with(|| ConnectorStats {
-                        name: connector_name.to_string(),
-                        ..Default::default()
-                    });
-                match outcome {
-                    Ok(commit) if commit.outcome.is_success() => {
-                        source_inputs_committed += 1;
-                        if matches!(
-                            commit.outcome,
-                            source_ingest::SourceInputOutcome::PostCommitPendingRecovery { .. }
-                        ) {
-                            source_inputs_pending_recovery += 1;
-                        }
-                        // The commit's rows go into the same counters every
-                        // other ingest writes, so the run's totals and its
-                        // canonical-mutation accounting both see them. The
-                        // input's own delta is used for what it proves (which
-                        // messages were accepted) and then released; the vector
-                        // end is the existing hole/backfill path.
-                        total_conversations += commit.inserted_conversations;
-                        total_messages += commit.inserted_messages;
-                        accumulate_recall_uncovered(
-                            &mut recall_uncovered_by_reason,
-                            &commit.recall_uncovered_by_reason,
-                        );
-                        ingest_outcome.canonical_mutations =
-                            ingest_outcome.canonical_mutations.accumulate(
-                                crate::indexer::CanonicalMutationCounts {
-                                    inserted_conversations: commit.inserted_conversations,
-                                    inserted_messages: commit.inserted_messages,
-                                },
-                            );
-                        drop(commit.delta);
-                        tracing::info!(
-                            target: "cass::scan_session",
-                            connector = connector_name,
-                            root_id = %root_id,
-                            input = %commit.outcome.input_key().hex(),
-                            outcome = %commit.outcome.describe(),
-                            recall_uncovered_total = commit.recall_uncovered_total,
-                            recall_uncovered_reasons = %recall_uncovered_reasons_field(
-                                &commit.recall_uncovered_by_reason
-                            ),
-                            "source_input"
-                        );
-                        if let Some(p) = progress {
-                            p.current.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    other => {
-                        // A lost input is this connector's and this root's
-                        // failure: it must reach both the connector-level and
-                        // the root-level watermark decision.
-                        failed_scan_connectors.insert(connector_name.to_string());
-                        failed_source_roots
-                            .entry(connector_name.to_string())
-                            .or_default()
-                            .insert(root_id.clone());
-                        ingest_outcome.scan_had_errors = true;
-                        let reason = match other {
-                            Ok(commit) => commit.outcome.describe(),
-                            Err(error) => error.to_string(),
-                        };
-                        stats.error = Some(reason.clone());
-                        tracing::warn!(
-                            connector = connector_name,
-                            root_id = %root_id,
-                            reason = %reason,
-                            "source_aware_input_not_committed"
-                        );
-                    }
-                }
-            }
             Ok(IndexMessage::Batch {
                 connector_name,
                 conversations,
@@ -8727,19 +8542,6 @@ fn run_streaming_consumer(
                 root_outcomes,
             }) => {
                 active_producers -= 1;
-                // A root whose input did not commit reports failed here, even
-                // though its own enumeration looked clean. Without this the
-                // watermark would advance past a file the run never ingested.
-                let failed_roots = failed_source_roots.get(connector_name);
-                let root_outcomes: Vec<RootScanOutcome> = root_outcomes
-                    .into_iter()
-                    .map(|outcome| {
-                        match failed_roots.filter(|roots| roots.contains(&outcome.root_id)) {
-                            Some(_) => failed_outcome(outcome),
-                            None => outcome,
-                        }
-                    })
-                    .collect();
                 ingest_outcome.root_outcomes.extend(root_outcomes);
                 let effective_scan_succeeded =
                     scan_succeeded && !failed_scan_connectors.contains(connector_name);
@@ -8831,8 +8633,6 @@ fn run_streaming_consumer(
         stats.agents_discovered = discovered_names.clone();
         stats.total_conversations = total_conversations;
         stats.total_messages = total_messages;
-        stats.source_inputs_committed = source_inputs_committed;
-        stats.source_inputs_pending_recovery = source_inputs_pending_recovery;
         // Ticket 02 (`cass-alien-fresh-ingest`): the Pi diagnostics the batch
         // path carried up are folded once, before the round snapshot. The
         // source-aware commit origin never enters this carrier.
@@ -8876,7 +8676,6 @@ fn run_streaming_index(
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
-    source_safety: Option<Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<NonWatchIngestOutcome> {
     memprobe_point("run_streaming_index", "ingest", "start");
     let result = run_streaming_index_with_connector_factories(
@@ -8890,7 +8689,6 @@ fn run_streaming_index(
         scan_start_ts,
         progress_bump,
         active_session_source_skips,
-        source_safety,
     );
     memprobe_point("run_streaming_index", "ingest", "end");
     result
@@ -8951,7 +8749,6 @@ fn run_streaming_index_with_connector_factories(
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
-    source_safety: Option<Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<NonWatchIngestOutcome> {
     if connector_factories.is_empty() {
         tracing::warn!("no enabled connectors are configured for indexing; skipping scan");
@@ -9012,12 +8809,10 @@ fn run_streaming_index_with_connector_factories(
             &connector_factories,
             &additional_scan_roots,
             scan_roots_meta,
-            source_safety.as_ref(),
             true,
             &opts.data_dir,
         )?),
         scan_roots_meta: Arc::new(scan_roots_meta.clone()),
-        source_safety: source_safety.clone(),
         progress: opts.progress.clone(),
         active_source_filter: Arc::new(ActiveSessionSourceFilter::with_shared_skips(
             opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
@@ -9119,7 +8914,6 @@ fn run_batch_index(
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
-    source_safety: Option<Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<NonWatchIngestOutcome> {
     memprobe_point("run_batch_index", "ingest", "start");
     let result = run_batch_index_with_connector_factories(
@@ -9133,7 +8927,6 @@ fn run_batch_index(
         scan_start_ts,
         progress_bump,
         active_session_source_skips,
-        source_safety,
     );
     memprobe_point("run_batch_index", "ingest", "end");
     result
@@ -9151,7 +8944,6 @@ fn run_batch_index_with_connector_factories(
     _scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
-    source_safety: Option<Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<NonWatchIngestOutcome> {
     let scan_start = std::time::Instant::now();
 
@@ -9181,9 +8973,6 @@ fn run_batch_index_with_connector_factories(
         scan_error: Option<String>,
         /// PR8 C3: this connector's per-root outcomes, persisted at finalize.
         root_outcomes: Vec<RootScanOutcome>,
-        /// SRC05B-07: sealed inputs this connector prepared, committed after
-        /// the parallel scan joins (the commit needs the single writer).
-        source_jobs: Vec<source_ingest::SourceInputJob>,
     }
 
     let progress_ref = opts.progress.as_ref();
@@ -9203,7 +8992,6 @@ fn run_batch_index_with_connector_factories(
         &connector_factories,
         &additional_scan_roots,
         scan_roots_meta,
-        source_safety.as_ref(),
         true,
         &opts.data_dir,
     )?;
@@ -9222,16 +9010,8 @@ fn run_batch_index_with_connector_factories(
                 let mut scan_succeeded = true;
                 let mut scan_errors = Vec::new();
                 let mut root_outcomes: Vec<RootScanOutcome> = Vec::new();
-                let mut source_jobs: Vec<source_ingest::SourceInputJob> = Vec::new();
                 let empty_plans = ConnectorRootPlans::default();
                 let plans = root_plans_by_connector.get(name).unwrap_or(&empty_plans);
-                // SRC05B-routing: the batch scan of this connector takes the
-                // safety configuration only when this connector can read
-                // through it. `None` here is the legacy projection path, byte
-                // for byte the one a run without the flag takes.
-                let connector_safety = source_safety
-                    .as_ref()
-                    .filter(|_| source_ingest::supports_source_fidelity(name));
 
                 if detect.detected && !plans.home.is_empty() {
                     // Update discovered agents count immediately when detected
@@ -9243,7 +9023,7 @@ fn run_batch_index_with_connector_factories(
                     is_discovered = true;
 
                     for plan in &plans.home {
-                        let (mut outcome, mut root_succeeded) = batch_scan_one_root(
+                        let (outcome, root_succeeded) = batch_scan_one_root(
                             conn.as_ref(),
                             name,
                             &data_dir,
@@ -9251,18 +9031,13 @@ fn run_batch_index_with_connector_factories(
                             active_source_filter.as_ref(),
                             &mut convs,
                             &mut scan_errors,
-                            connector_safety,
-                            &mut source_jobs,
                         );
-                        let _ = &source_jobs;
                         if !root_succeeded {
                             scan_succeeded = false;
                         }
                         root_outcomes.push(outcome);
                     }
-                } else if detect.detected
-                    && !(source_safety.is_some() && source_ingest::supports_source_fidelity(name))
-                {
+                } else if detect.detected {
                     // Update discovered agents count immediately when detected
                     // This gives fast UI feedback during the discovery phase
                     // Note: AtomicUsize has no contention, only the mutex was problematic
@@ -9335,8 +9110,10 @@ fn run_batch_index_with_connector_factories(
                         // constraint 9) takes the per-root path; exempt roots
                         // (`full_scan` source) fall through to the baseline
                         // full-root scan.
-                        if let Some(plan) = plans.configured_for(root) {
-                            let (mut outcome, mut root_succeeded) = batch_scan_one_root(
+                        if let Some(plan) = plans.configured_for(root)
+                            && (plan.meta.watermarks_enabled || plan_enforces_ownership(plan))
+                        {
+                            let (outcome, root_succeeded) = batch_scan_one_root(
                                 conn.as_ref(),
                                 name,
                                 &data_dir,
@@ -9344,10 +9121,7 @@ fn run_batch_index_with_connector_factories(
                                 active_source_filter.as_ref(),
                                 &mut convs,
                                 &mut scan_errors,
-                                connector_safety,
-                                &mut source_jobs,
                             );
-                            let _ = &source_jobs;
                             if !root_succeeded {
                                 scan_succeeded = false;
                             }
@@ -9458,90 +9232,11 @@ fn run_batch_index_with_connector_factories(
                     scan_succeeded,
                     scan_error,
                     root_outcomes,
-                    source_jobs,
                 })
             })
             .collect();
 
-    // SRC05B-07: commit every prepared sealed input now that the parallel scan
-    // has joined. A commit failure is that connector's and that root's
-    // failure, and it must land in the root outcome before the watermark
-    // decision reads it.
-    let mut source_inputs_committed = 0usize;
-    let mut source_inputs_pending_recovery = 0usize;
     let mut recall_uncovered_by_reason: BTreeMap<String, u64> = BTreeMap::new();
-    let mut pending_source_mutations = crate::indexer::CanonicalMutationCounts::default();
-    let mut pending_batches = pending_batches;
-    for pending in pending_batches.iter_mut() {
-        if pending.source_jobs.is_empty() {
-            continue;
-        }
-        let mut failures: Vec<String> = Vec::new();
-        let mut failed_root_ids: BTreeSet<String> = BTreeSet::new();
-        for job in &pending.source_jobs {
-            let root_id = job.root_id.clone();
-            let hint = job.origin_hint();
-            let outcome = source_ingest::commit_source_input_dispatched(storage, job, false);
-            match outcome {
-                Ok(commit) if commit.outcome.is_success() => {
-                    source_inputs_committed += 1;
-                    if matches!(
-                        commit.outcome,
-                        source_ingest::SourceInputOutcome::PostCommitPendingRecovery { .. }
-                    ) {
-                        source_inputs_pending_recovery += 1;
-                    }
-                    accumulate_recall_uncovered(
-                        &mut recall_uncovered_by_reason,
-                        &commit.recall_uncovered_by_reason,
-                    );
-                    tracing::info!(
-                        target: "cass::scan_session",
-                        connector = pending.name,
-                        root_id = %root_id,
-                        input = %commit.outcome.input_key().hex(),
-                        outcome = %commit.outcome.describe(),
-                        recall_uncovered_total = commit.recall_uncovered_total,
-                        recall_uncovered_reasons = %recall_uncovered_reasons_field(
-                            &commit.recall_uncovered_by_reason
-                        ),
-                        "source_input"
-                    );
-                    pending_source_mutations =
-                        pending_source_mutations.accumulate(crate::indexer::CanonicalMutationCounts {
-                            inserted_conversations: commit.inserted_conversations,
-                            inserted_messages: commit.inserted_messages,
-                        });
-                    if let Some(p) = &opts.progress {
-                        p.current.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                other => {
-                    let reason = match other {
-                        Ok(commit) => commit.outcome.describe(),
-                        Err(error) => error.to_string(),
-                    };
-                    failures.push(format!("{hint}: {reason}"));
-                    failed_root_ids.insert(root_id);
-                }
-            }
-        }
-        if !failed_root_ids.is_empty() {
-            pending.scan_succeeded = false;
-            for outcome in &mut pending.root_outcomes {
-                if failed_root_ids.contains(&outcome.root_id) {
-                    *outcome = failed_outcome(outcome.clone());
-                }
-            }
-        }
-        if !failures.is_empty() {
-            let joined = failures.join("; ");
-            pending.scan_error = Some(match pending.scan_error.take() {
-                Some(existing) => format!("{existing}; {joined}"),
-                None => joined,
-            });
-        }
-    }
 
     // Post-parallel phase: collect discovered agent names with single mutex lock
     // This eliminates O(connectors) mutex acquisitions during parallel execution
@@ -9654,8 +9349,6 @@ fn run_batch_index_with_connector_factories(
         stats.agents_discovered = discovered_names.clone();
         stats.total_conversations = total_conversations;
         stats.total_messages = total_messages;
-        stats.source_inputs_committed = source_inputs_committed;
-        stats.source_inputs_pending_recovery = source_inputs_pending_recovery;
         // Ticket 02 (`cass-alien-fresh-ingest`): the Pi diagnostics the batch
         // path carried up are folded once, before the round snapshot. The
         // source-aware commit origin never enters this carrier.
@@ -9671,9 +9364,6 @@ fn run_batch_index_with_connector_factories(
         stats.lexical_update_deferred |= ingest_outcome.lexical_update_deferred;
     }
 
-    ingest_outcome.canonical_mutations = ingest_outcome
-        .canonical_mutations
-        .accumulate(pending_source_mutations);
     ingest_outcome.scanned_connectors.extend(scanned_connectors);
     ingest_outcome.scan_had_errors |= scan_had_errors;
 
@@ -9803,16 +9493,10 @@ struct LocalRootPlan {
     /// already completed under the profile the current configuration
     /// assembles.
     ///
-    /// The source-aware scan may skip a file whose per-file state says
-    /// unchanged only when the file appears here. A first entry from the
-    /// legacy path, a changed path mapping or a changed fixed safety copy all
-    /// leave the pair out, and so does an unfinished input for the same
-    /// locator even when an earlier one completed -- an unknown, and a known
-    /// failure, are never treated as complete.
-    ///
-    /// Empty for a `full_scan` root: it keeps no watermark, so the metadata
-    /// comparison already hands over every candidate and nothing is skipped.
-    source_evidence: HashSet<(String, String)>,
+    /// Schema 9 legacy compatibility: relative locators that still have an
+    /// unfinished row (`state != 'complete'`) in a legacy `source_inputs`
+    /// table. These files are never skipped on `(size, mtime)` equality.
+    legacy_unfinished_source_locators: HashSet<String>,
     /// Shared only inside this invocation and this original declaration.
     ownership: Option<Arc<PreparedRootOwnership>>,
 }
@@ -9865,6 +9549,28 @@ fn prepare_root_ownership(
             .map_err(|error| error.to_string())
     };
     PreparedRootOwnership { sources, partition }
+}
+
+/// Whether `plan` carries an ownership partition that actually observed claims
+/// or failed discovery and must therefore gate capture and scanning.
+///
+/// When `partition` succeeded with zero claims across all connectors (for
+/// example, a mock or legacy connector that does not override
+/// `discover_source_files` on a home or unregistered root), there is nothing
+/// to arbitrate, so falling back to the un-arbitrated capture/scan path avoids
+/// silently short-circuiting connectors without discovery implementations.
+fn plan_enforces_ownership(plan: &LocalRootPlan) -> bool {
+    match &plan.ownership {
+        Some(prepared) => match &prepared.partition {
+            Ok(partition) => {
+                !partition.decisions.is_empty()
+                    || !partition.outside_claims.is_empty()
+                    || prepared.sources.values().any(|sources| !sources.is_empty())
+            }
+            Err(_) => true,
+        },
+        None => false,
+    }
 }
 
 fn physical_carriers_cover_source(
@@ -10005,7 +9711,6 @@ fn failed_outcome(outcome: RootScanOutcome) -> RootScanOutcome {
 fn local_root_plans(
     connector: &str,
     storage: &FrankenStorage,
-    source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<Vec<LocalRootPlan>> {
     let mut plans = Vec::new();
     for path in scan_root_meta::home_scan_roots(connector) {
@@ -10026,14 +9731,18 @@ fn local_root_plans(
             watermarks_enabled: true,
             mirror_root: false,
         };
-        let source_evidence =
-            source_completion_evidence(storage, connector, &root, &meta, source_safety)?;
+        let legacy_unfinished_source_locators = storage.legacy_unfinished_source_locators(
+            &meta.origin_host,
+            connector,
+            root.path.to_str().unwrap_or(""),
+            meta.canonical_path.to_str().unwrap_or(""),
+        )?;
         plans.push(LocalRootPlan {
             root,
             meta,
             watermark,
             file_states,
-            source_evidence,
+            legacy_unfinished_source_locators,
             ownership: None,
         });
     }
@@ -10057,7 +9766,6 @@ fn configured_local_root_plan(
     storage: &FrankenStorage,
     root: &ScanRoot,
     meta: &scan_root_meta::ScanRootMeta,
-    source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<LocalRootPlan> {
     if !meta.watermarks_enabled {
         return Ok(LocalRootPlan {
@@ -10065,103 +9773,26 @@ fn configured_local_root_plan(
             meta: meta.clone(),
             watermark: None,
             file_states: HashMap::new(),
-            source_evidence: HashSet::new(),
+            legacy_unfinished_source_locators: HashSet::new(),
             ownership: None,
         });
     }
     let watermark = storage.get_scan_watermark(&meta.root_id, connector)?;
     let file_states = storage.scan_file_states_for_root_connector(&meta.root_id, connector)?;
-    let source_evidence =
-        source_completion_evidence(storage, connector, root, meta, source_safety)?;
+    let legacy_unfinished_source_locators = storage.legacy_unfinished_source_locators(
+        &meta.origin_host,
+        connector,
+        root.path.to_str().unwrap_or(""),
+        meta.canonical_path.to_str().unwrap_or(""),
+    )?;
     Ok(LocalRootPlan {
         root: root.clone(),
         meta: meta.clone(),
         watermark,
         file_states,
-        source_evidence,
+        legacy_unfinished_source_locators,
         ownership: None,
     })
-}
-
-/// The `(role, relative locator)` pairs a previous run already completed under
-/// the profile the current configuration assembles (SRC05B-08).
-///
-/// This is the only evidence a source-aware skip may rest on, and it is read
-/// **here**, on the thread that holds the database handle, because the scan
-/// itself owns none. Every recorded input for the root takes part, in every
-/// state, and three facts have to agree before a pair counts:
-///
-/// - a **same-generation** input for this `(role, locator)` is `complete`: its
-///   stored `normalizer_id` is the one this root and role assemble now, so a
-///   changed path mapping or a changed effective configuration misses, and its
-///   stored `safety_contract_id` is the one the loaded fixed copy produces
-///   now, so a changed fixed safety copy misses too;
-/// - **no** same-generation input for that `(role, locator)` is unfinished.
-///   A completed read and a later `staged` / `Partial` / `Failed` read can
-///   coexist for one locator, and the earlier success must not hide the later
-///   failure: as long as the unfinished one is there, the file is read again.
-///   Rows from another generation are neither evidence nor a block -- they
-///   describe an older configuration and are diagnosed on their own.
-///
-/// The lookup key is the **original scan root** the input was sealed under
-/// (the declaration's identity element 4), never the `cfg:`/`home:` routing
-/// id: two roots that share a `(connector, locator)` pair must not answer for
-/// each other. A root whose path is not UTF-8, or a row whose stored role is
-/// not one the sealed path can carry, simply contributes nothing.
-fn source_completion_evidence(
-    storage: &FrankenStorage,
-    connector: &str,
-    root: &ScanRoot,
-    meta: &scan_root_meta::ScanRootMeta,
-    source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
-) -> Result<HashSet<(String, String)>> {
-    let Some(safety) = source_safety else {
-        return Ok(HashSet::new());
-    };
-    let Some(scan_root_text) = root.path.to_str() else {
-        return Ok(HashSet::new());
-    };
-    let rows = storage.recorded_source_inputs(
-        &meta.origin_host,
-        &source_ingest::fad_connector_name(connector),
-        scan_root_text,
-    )?;
-    let mut completed: HashSet<(String, String)> = HashSet::new();
-    let mut unfinished: HashSet<(String, String)> = HashSet::new();
-    let mut profiles: HashMap<String, source_ingest::SourceProfile> = HashMap::new();
-    for (state, role, relative_locator, normalizer_id, safety_contract_id) in rows {
-        let Some(role) = role else {
-            continue;
-        };
-        if !profiles.contains_key(&role) {
-            let Some(sealed_role) = source_ingest::sealed_role_from_key(&role) else {
-                continue;
-            };
-            let Ok(profile) = source_ingest::root_profile(safety, connector, root, sealed_role)
-            else {
-                continue;
-            };
-            profiles.insert(role.clone(), profile);
-        }
-        let Some(profile) = profiles.get(&role) else {
-            continue;
-        };
-        if normalizer_id != profile.normalizer_id
-            || safety_contract_id != profile.safety_contract_id
-        {
-            continue;
-        }
-        let key = (role, relative_locator);
-        if state == "complete" {
-            completed.insert(key);
-        } else {
-            unfinished.insert(key);
-        }
-    }
-    Ok(completed
-        .into_iter()
-        .filter(|key| !unfinished.contains(key))
-        .collect())
 }
 
 /// Build every connector's root plans once, before the scan loops start: the
@@ -10182,12 +9813,10 @@ fn build_connector_root_plans(
     connector_factories: &[(&'static str, ConnectorFactory)],
     additional_scan_roots: &[ScanRoot],
     scan_roots_meta: &scan_root_meta::ScanRootMetaIndex,
-    source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
     consume_ownership: bool,
     data_dir: &Path,
 ) -> Result<HashMap<&'static str, ConnectorRootPlans>> {
     let mut plans_by_connector = HashMap::new();
-    let consume_ownership = consume_ownership && source_safety.is_some();
     let mut prepared = HashMap::new();
     if consume_ownership {
         for root in additional_scan_roots {
@@ -10199,10 +9828,8 @@ fn build_connector_root_plans(
     }
 
     for (name, _) in connector_factories {
-        let connector_safety = source_safety
-            .filter(|_| source_ingest::supports_source_fidelity(name));
         let mut plans = ConnectorRootPlans {
-            home: local_root_plans(name, storage, connector_safety)?,
+            home: local_root_plans(name, storage)?,
             configured: HashMap::new(),
         };
         if consume_ownership {
@@ -10236,10 +9863,10 @@ fn build_connector_root_plans(
                 let Some(meta) = scan_roots_meta.get_by_path(&root.path) else { continue; };
                 meta
             };
-            if !meta.watermarks_enabled && source_safety.is_none() {
+            if !meta.watermarks_enabled && !consume_ownership {
                 continue;
             }
-            let mut plan = configured_local_root_plan(name, storage, root, meta, connector_safety)?;
+            let mut plan = configured_local_root_plan(name, storage, root, meta)?;
             let key = if consume_ownership {
                 plan.ownership = prepared.get(&(root.origin.source_id.clone(), canonical_path.clone())).cloned();
                 ConfiguredRootKey::Declaration { source_id: root.origin.source_id.clone(), canonical_path }
@@ -10363,23 +9990,6 @@ fn sorted_discovered_paths(candidates: &[(String, i64, i64, PathBuf)]) -> Vec<St
     paths
 }
 
-/// Whether a previous run's completed input already covers this file under the
-/// profile the current configuration assembles (SRC05B-08).
-///
-/// `false` whenever the discovered role has no sealed equivalent: that role is
-/// refused by `prepare_source_input` anyway, so the file is read and the root
-/// fails with the real reason instead of being skipped on a technicality.
-fn source_input_already_complete(
-    plan: &LocalRootPlan,
-    role: crate::connectors::DiscoveredSourceRole,
-    relative: &str,
-) -> bool {
-    source_ingest::sealed_role_key(role).is_some_and(|role| {
-        plan.source_evidence
-            .contains(&(role.to_string(), relative.to_string()))
-    })
-}
-
 /// Scan one watermarks-enabled root and report what it covered.
 ///
 /// Full scan (no watermark row) hands the connector the root itself with
@@ -10427,8 +10037,6 @@ fn run_local_root_scan(
         &scan_root_meta::ScanRootMeta,
         NormalizedConversation,
     ) -> Result<()>,
-    active_source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
-    on_source_input: Option<&mut dyn FnMut(source_ingest::SourceInputJob) -> Result<()>>,
 ) -> (RootScanOutcome, Option<anyhow::Error>) {
     let (mut outcome, fatal) = run_local_root_scan_inner(
         connector,
@@ -10438,8 +10046,6 @@ fn run_local_root_scan(
         capture_fallback_roots,
         active_source_filter,
         on_conversation,
-        active_source_safety,
-        on_source_input,
     );
     outcome.watermarks_enabled = plan.meta.watermarks_enabled;
     if plan.ownership.is_some() && let Some(error) = &outcome.error {
@@ -10467,12 +10073,6 @@ fn run_local_root_scan_inner(
         &scan_root_meta::ScanRootMeta,
         NormalizedConversation,
     ) -> Result<()>,
-    // SRC05B-07: the loaded fixed safety configuration and the sink for
-    // prepared inputs. When both are present the root takes the source-aware
-    // path instead of projecting conversations through the legacy callback;
-    // `None` keeps the legacy path byte-identical.
-    active_source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
-    mut on_source_input: Option<&mut dyn FnMut(source_ingest::SourceInputJob) -> Result<()>>,
 ) -> (RootScanOutcome, Option<anyhow::Error>) {
     let root_id = plan.meta.root_id.clone();
     let discovery_ctx = crate::connectors::ScanContext::with_roots(
@@ -10495,7 +10095,7 @@ fn run_local_root_scan_inner(
         if outside > 0 {
             tracing::info!(root_id, connector = connector_name, outside_count = outside,
                 "source discovery outside declaration");
-            if !source_ingest::supports_source_fidelity(connector_name) && connector_name != "opencode" {
+            if !source_ownership::is_arbitrated_connector(connector_name) && connector_name != "opencode" {
                 ownership_error = Some("source_ownership_outside_unit".to_string());
             }
         }
@@ -10520,7 +10120,7 @@ fn run_local_root_scan_inner(
             match decision {
                 SourceOwnershipDecision::Owner(owner) if owner == connector_name => accepted.push(source.clone()),
                 SourceOwnershipDecision::LegacyUnchanged => accepted.push(source.clone()),
-                SourceOwnershipDecision::Owner(_) if source_ingest::supports_source_fidelity(connector_name) => {},
+                SourceOwnershipDecision::Owner(_) if source_ownership::is_arbitrated_connector(connector_name) => {},
                 SourceOwnershipDecision::Owner(_) => invalid += 1,
                 SourceOwnershipDecision::Unresolved => unresolved += 1,
                 SourceOwnershipDecision::Ambiguous => ambiguous += 1,
@@ -10531,7 +10131,7 @@ fn run_local_root_scan_inner(
                 "source_ownership_unresolved={unresolved} source_ownership_ambiguous={ambiguous} source_ownership_invalid={invalid}"
             ));
         }
-        if !source_ingest::supports_source_fidelity(connector_name) {
+        if !source_ownership::is_arbitrated_connector(connector_name) {
             if let Some(error) = ownership_error.take() {
                 return (RootScanOutcome::failed_with_error(
                     connector_name, &root_id, plan.meta.mirror_root, error,
@@ -10604,15 +10204,20 @@ fn run_local_root_scan_inner(
     let metadata_selected: Vec<(String, i64, i64, PathBuf)> = match plan.watermark {
         Some(watermark) => candidates
             .iter()
-            .filter(|(relative, size, mtime, _)| match plan.file_states.get(relative) {
-                // No record for this path at this root: it has never been
-                // read here, whatever its mtime says.
-                None => true,
-                Some((recorded_size, recorded_mtime)) => {
-                    if plan.meta.mirror_root {
-                        recorded_size != size || recorded_mtime != mtime
-                    } else {
-                        *mtime > watermark || recorded_size != size
+            .filter(|(relative, size, mtime, _)| {
+                if plan.legacy_unfinished_source_locators.contains(relative) {
+                    return true;
+                }
+                match plan.file_states.get(relative) {
+                    // No record for this path at this root: it has never been
+                    // read here, whatever its mtime says.
+                    None => true,
+                    Some((recorded_size, recorded_mtime)) => {
+                        if plan.meta.mirror_root {
+                            recorded_size != size || recorded_mtime != mtime
+                        } else {
+                            *mtime > watermark || recorded_size != size
+                        }
                     }
                 }
             })
@@ -10621,135 +10226,18 @@ fn run_local_root_scan_inner(
         None => candidates.clone(),
     };
 
-    // SRC05B-07: the source-aware branch. It runs *before* the legacy
-    // pre-parse capture and the connector's conversation scan, because on this
-    // path the sealed read *is* the scan: the connector reads the sealed
-    // locator itself and the records, links and receipt are written from what
-    // it proves.
-    //
-    // SRC05B-08: it runs on exactly the selection above, so an unchanged file
-    // is not read again -- plus one condition the legacy path does not have.
-    // A file the metadata comparison calls unchanged is still read unless a
-    // previous run's completed input proves the current profile already
-    // covered it, so a first entry from the legacy path, a staged / partial /
-    // failed input, a changed mapping or a changed fixed safety copy is read
-    // again rather than assumed done.
-    if let Some(sink) = on_source_input.as_mut() {
-        let safety = active_source_safety
-            .expect("the source-aware branch requires a loaded safety configuration");
-        let mut delivered: Vec<(String, i64, i64)> = Vec::with_capacity(candidates.len());
-        for discovered_file in &discovered {
-            if should_skip_active_session_source(
-                active_source_filter,
-                connector_name,
-                &plan.root.origin.source_id,
-                &discovered_file.source_path,
-            ) {
-                continue;
-            }
-            if should_skip_subagent_source(&discovered_file.source_path) {
-                continue;
-            }
-            let Some((relative, size, mtime, _)) = candidates
-                .iter()
-                .find(|(_, _, _, path)| path == &discovered_file.source_path)
-            else {
-                // Discovery handed over a file the candidate pass dropped;
-                // that is a contract violation, not something to skip quietly.
-                return (
-                    RootScanOutcome::failed_with_error(
-                        connector_name,
-                        &root_id,
-                        plan.meta.mirror_root,
-                        format!(
-                            "discovered source {} has no scan candidate",
-                            discovered_file.source_path.display()
-                        ),
-                    ),
-                    None,
-                );
-            };
-            let metadata_says_read = metadata_selected
-                .iter()
-                .any(|(selected, _, _, _)| selected == relative);
-            if !metadata_says_read
-                && source_input_already_complete(plan, discovered_file.role, relative)
-            {
-                continue;
-            }
-            let request = source_ingest::SourceInputRequest {
-                connector_name,
-                data_dir,
-                root: &plan.root,
-                meta: &plan.meta,
-                discovered: discovered_file,
-                safety,
-            };
-            match source_ingest::prepare_source_input(connector, &request) {
-                Ok(mut job) => {
-                    if plan.ownership.is_some() {
-                        let identity = IngestIdentity::for_meta(&plan.meta);
-                        for item in &mut job.conversations {
-                            inject_provenance(&mut item.conversation, &plan.root.origin, &identity);
-                            canonicalize_claude_external_id(connector_name, &mut item.conversation);
-                        }
-                    }
-                    if let Err(error) = sink(job) {
-                        // The consumer went away: stop this root, exactly as
-                        // the legacy callback's fatal path does.
-                        return (
-                            RootScanOutcome::failed(connector_name, &root_id, plan.meta.mirror_root),
-                            Some(error),
-                        );
-                    }
-                    delivered.push((relative.clone(), *size, *mtime));
-                }
-                Err(error) => {
-                    // A refused input is this root's failure. Its files must
-                    // not advance any watermark, so the whole root reports
-                    // failed rather than a clean enumeration with a gap.
-                    tracing::warn!(
-                        connector = connector_name,
-                        root = %plan.meta.canonical_path.display(),
-                        path = %discovered_file.source_path.display(),
-                        error = %error,
-                        "source-aware input refused; failing the root"
-                    );
-                    return (
-                        RootScanOutcome::failed_with_error(
-                            connector_name,
-                            &root_id,
-                            plan.meta.mirror_root,
-                            error.to_string(),
-                        ),
-                        None,
-                    );
-                }
-            }
-        }
-        record_scan_invocation();
-        if let Some(error) = ownership_error {
-            return (RootScanOutcome::failed_with_error(
-                connector_name, &root_id, plan.meta.mirror_root, error,
-            ), None);
-        }
-        return (
-            RootScanOutcome {
-                connector: connector_name.to_string(),
-                root_id,
-                succeeded: true,
-                error: None,
-                files: delivered,
-                discovered_paths,
-                mirror_root: plan.meta.mirror_root,
-                // Stamped by `run_local_root_scan` from the plan.
-                watermarks_enabled: true,
-            },
-            None,
-        );
-    }
-
     if plan.watermark.is_some() && metadata_selected.is_empty() {
+        if let Some(error) = ownership_error {
+            return (
+                RootScanOutcome::failed_with_error(
+                    connector_name,
+                    &root_id,
+                    plan.meta.mirror_root,
+                    error,
+                ),
+                None,
+            );
+        }
         // Nothing changed: the watermark still moves forward (this root
         // and connector scanned cleanly), and no file state needs rewriting.
         return (
@@ -10768,6 +10256,7 @@ fn run_local_root_scan_inner(
         );
     }
 
+    let ownership_enforced = plan_enforces_ownership(plan);
     let (mut ctx, scanned_files) = if plan.watermark.is_some() {
         let scanned: Vec<(String, i64, i64)> = metadata_selected
             .iter()
@@ -10790,10 +10279,25 @@ fn run_local_root_scan_inner(
             .iter()
             .map(|(relative, size, mtime, _)| (relative.clone(), *size, *mtime))
             .collect();
-        (discovery_ctx.clone(), scanned)
+        let ctx = if ownership_enforced
+            && source_ownership::is_arbitrated_connector(connector_name)
+        {
+            let file_roots: Vec<ScanRoot> = candidates
+                .iter()
+                .map(|(_, _, _, path)| plan.root.with_path(path.clone()))
+                .collect();
+            crate::connectors::ScanContext::with_roots(
+                plan.root.path.clone(),
+                file_roots,
+                None,
+            )
+        } else {
+            discovery_ctx.clone()
+        };
+        (ctx, scanned)
     };
 
-    if plan.ownership.is_some() && connector_name == "gemini" && plan.watermark.is_some() {
+    if ownership_enforced && connector_name == "gemini" && plan.watermark.is_some() {
         if let Some(root) = ctx.scan_roots.first() {
             ctx.data_dir = root.path.clone();
         }
@@ -10801,8 +10305,19 @@ fn run_local_root_scan_inner(
     let selected_sources: Vec<_> = discovered.iter().filter(|source| {
         plan.watermark.is_none() || metadata_selected.iter().any(|(_, _, _, path)| path == &source.source_path)
     }).cloned().collect();
-    if plan.ownership.is_some() {
+    if ownership_enforced {
         if selected_sources.is_empty() {
+            if let Some(error) = ownership_error {
+                return (
+                    RootScanOutcome::failed_with_error(
+                        connector_name,
+                        &root_id,
+                        plan.meta.mirror_root,
+                        error,
+                    ),
+                    None,
+                );
+            }
             return (RootScanOutcome {
                 connector: connector_name.to_string(), root_id, succeeded: true,
                 discovered_paths, mirror_root: plan.meta.mirror_root, ..RootScanOutcome::default()
@@ -10819,7 +10334,7 @@ fn run_local_root_scan_inner(
 
     let mut fatal: Option<anyhow::Error> = None;
     let mut callback = |conversation: NormalizedConversation| {
-        if plan.ownership.is_some() && !physical_carriers_cover_source(&selected_sources, &conversation.source_path) {
+        if ownership_enforced && !physical_carriers_cover_source(&selected_sources, &conversation.source_path) {
             return Err(anyhow::anyhow!("source_ownership_unapproved_carrier"));
         }
         if should_skip_active_session_source(
@@ -10851,20 +10366,34 @@ fn run_local_root_scan_inner(
     };
 
     match scan_result {
-        Ok(()) if fatal.is_none() => (
-            RootScanOutcome {
-                connector: connector_name.to_string(),
-                root_id,
-                succeeded: true,
-                error: None,
-                files: scanned_files,
-                discovered_paths,
-                mirror_root: plan.meta.mirror_root,
-                // Stamped by `run_local_root_scan` from the plan.
-                watermarks_enabled: true,
-            },
-            None,
-        ),
+        Ok(()) if fatal.is_none() => {
+            if let Some(error) = ownership_error {
+                (
+                    RootScanOutcome::failed_with_error(
+                        connector_name,
+                        &root_id,
+                        plan.meta.mirror_root,
+                        error,
+                    ),
+                    None,
+                )
+            } else {
+                (
+                    RootScanOutcome {
+                        connector: connector_name.to_string(),
+                        root_id,
+                        succeeded: true,
+                        error: None,
+                        files: scanned_files,
+                        discovered_paths,
+                        mirror_root: plan.meta.mirror_root,
+                        // Stamped by `run_local_root_scan` from the plan.
+                        watermarks_enabled: true,
+                    },
+                    None,
+                )
+            }
+        }
         Ok(()) => (
             RootScanOutcome::failed(connector_name, &root_id, plan.meta.mirror_root),
             fatal,
@@ -11237,24 +10766,9 @@ pub fn run_index(
     // without holding a `&mut IndexRunLockGuard`. The clone is cheap
     // (single Arc bump) and lives only inside this function.
     let progress_bump = Arc::clone(&index_run_lock.last_progress_at_ms_atomic);
-    // Task 19: the run's fixed safety configuration, prepared at most once.
-    // Only a branch that really ingests fills this slot; no_ingest, the absent
-    // early return and the canonical-only derived rebuild never touch it.
-    let mut run_source_safety: Option<Arc<source_ingest::FixedSafetyConfig>> = None;
     // The atomic-store bump runs once per "interesting" batch boundary
     // — currently used at the per-conversation completion ingest loop
     // and the lexical commit boundary; see `bump_index_run_lock_progress_atomic`.
-
-    // SRC05B-07 wired the source-aware path into the one-shot local-root scan.
-    // SRC05B-09A adds the explicit `--watch-once <path>` run to it. SRC05B-09B
-    // adds the resident `--watch` event cycle, which was the last entry point
-    // still refusing. The refusal used to sit here; it is gone because the
-    // event cycle now consumes the same verified source kernel
-    // (`resident_source_watch_trigger`), so no entry point runs the legacy
-    // conversation path under a flag that claims source completeness.
-    //
-    // The safety object itself is loaded ONCE inside the watch branch below and
-    // carried for the whole process, rather than re-resolved on every cycle.
 
     if can_skip_absent_explicit_watch_once_index_run(&opts) {
         let path_count = opts
@@ -11490,7 +11004,7 @@ pub fn run_index(
         ));
     }
 
-    if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage, !opts.no_ingest)? {
+    if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage)? {
         let now_ms = FrankenStorage::now_millis();
         persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms, false)?;
         record_lexical_population_strategy_if_unset(
@@ -12301,13 +11815,6 @@ pub fn run_index(
                     additional_scan_roots_with_meta(&storage, &opts.data_dir)?;
                 let scan_roots_meta = Arc::new(scan_roots_meta);
 
-                // Task 19: prepare the run's fixed safety configuration once,
-                // before any watermark of this run is cleared. A failure to
-                // discover or publish it therefore leaves every watermark
-                // untouched.
-                let source_safety =
-                    ensure_run_source_safety(&opts, &mut run_source_safety)?;
-
                 // `cass index --full` clears the watermarks of the roots this
                 // run will scan (hard constraint 5: "只把当前扫描根的全部行置
                 // 零"), so the whole root is re-read while a fake home's or a
@@ -12334,7 +11841,6 @@ pub fn run_index(
                         scan_start_ts,
                         Some(&progress_bump),
                         &active_session_source_skips,
-                        Some(Arc::clone(&source_safety)),
                     )?;
                     // F4 (cass tech debt): a completed scan is a real
                     // forward-progress boundary; bump the atomic so the
@@ -12365,7 +11871,6 @@ pub fn run_index(
                         scan_start_ts,
                         Some(&progress_bump),
                         &active_session_source_skips,
-                        Some(Arc::clone(&source_safety)),
                     )?;
                     bump_index_run_lock_progress_atomic(&progress_bump);
                     scan_canonical_mutations =
@@ -12873,11 +12378,6 @@ pub fn run_index(
             close_storage_after_index(storage, &opts.db_path, "watch startup scan")?;
             anyhow::bail!(message);
         }
-        // Task 19: the watch branch prepares the same run-owned configuration
-        // once, before any root or explicit path is watched. This also covers
-        // the targeted watch-once entry point, whose startup scan was skipped.
-        let run_source_safety_for_watch =
-            ensure_run_source_safety(&opts, &mut run_source_safety)?;
         let additional_scan_roots =
             additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir)?;
         let watch_roots = build_watch_roots(additional_scan_roots.clone());
@@ -12892,7 +12392,6 @@ pub fn run_index(
                 &opts,
                 &storage,
                 &watch_roots,
-                !opts.no_ingest,
             )?
         {
             let path_count = opts
@@ -12964,16 +12463,6 @@ pub fn run_index(
         // Clone detector for the callback
         let detector_clone = stale_detector.clone();
 
-        // SRC05B-09B: the resident watch cycle reads through the verified
-        // source kernel, so a fixed safety configuration is loaded once for
-        // the whole process instead of being re-resolved on every cycle.
-        // Re-resolving would let a later cycle pick up an environment change
-        // the run never agreed to; the copy this process started with is the
-        // one every cycle must keep reading, and a copy that no longer matches
-        // is an explicit failure rather than a fallback to the legacy path.
-        // Task 19: the object is the run's own slot, prepared above.
-        let resident_source_safety_for_watch = Arc::clone(&run_source_safety_for_watch);
-
         let watch_result = watch_sources(
             opts.watch_once_paths.clone(),
             watch_roots.clone(),
@@ -12988,12 +12477,11 @@ pub fn run_index(
                         roots,
                         &state,
                         &storage_for_watch,
-                        Some(&resident_source_safety_for_watch),
                         &detector_clone,
                     )
                 } else if watch_once_mode {
                     let indexed = finalize_watch_once_reindex_result(
-                        reindex_paths_with_semantic_delta_and_safety(
+                        reindex_paths_with_semantic_delta(
                             &opts_clone,
                             paths,
                             roots,
@@ -13001,7 +12489,6 @@ pub fn run_index(
                             &storage_for_watch,
                             false,
                             semantic_enabled.then_some(&mut semantic_delta),
-                            Some(&resident_source_safety_for_watch),
                         ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
@@ -13016,7 +12503,7 @@ pub fn run_index(
                     indexed
                 } else {
                     finalize_watch_reindex_result(
-                        reindex_paths_with_semantic_delta_and_safety(
+                        reindex_paths_with_semantic_delta(
                             &opts_clone,
                             paths,
                             roots,
@@ -13024,7 +12511,6 @@ pub fn run_index(
                             &storage_for_watch,
                             false,
                             semantic_enabled.then_some(&mut semantic_delta),
-                            Some(&resident_source_safety_for_watch),
                         ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
@@ -16677,261 +16163,6 @@ fn selection_contains(selected: &Path, selected_is_dir: bool, discovered: &Path)
     }
 }
 
-/// The bounded root metadata for a selected path that belongs to no declared
-/// root (SRC05B-09A R3).
-///
-/// An ad-hoc path is legitimate, and this keeps the parent-directory fallback
-/// it had: the directory that holds it is the root its relative locator is
-/// measured from. It claims nothing else -- no source name, no origin host, no
-/// watermark -- and it is never the identity of a declared root.
-///
-/// `watermarks_enabled` is `false`: this root has no `(root_id, connector)`
-/// watermark row and none is written, because an explicit watch-once run keeps
-/// no persistent watch state.
-fn ad_hoc_watch_once_root_meta(
-    connector: &str,
-    scan_root: &ScanRoot,
-) -> scan_root_meta::ScanRootMeta {
-    let canonical_path = scan_root_meta::canonicalize_root_path(&scan_root.path);
-    scan_root_meta::ScanRootMeta {
-        root_id: scan_root_meta::home_root_id(connector, &canonical_path),
-        origin_host: scan_root
-            .origin
-            .host
-            .clone()
-            .unwrap_or_else(|| crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string()),
-        readonly: false,
-        canonical_path,
-        source_name: AD_HOC_SOURCE_NAME.to_string(),
-        watermarks_enabled: false,
-        mirror_root: false,
-    }
-}
-
-/// The source name of the bounded root an ad-hoc selected path is read under.
-/// Deliberately not `home`: this root is nobody's declared root.
-const AD_HOC_SOURCE_NAME: &str = "explicit-watch-once";
-
-/// SRC05B-09A: the explicit `--watch-once` paths, read as sealed source inputs.
-///
-/// The selected paths decide *which* inputs are read and nothing else: each one
-/// is discovered through its own connector, sealed and committed through the
-/// same single-input kernel the one-shot source scan uses
-/// (`prepare_source_input` + `commit_source_input_dispatched`). No second
-/// scheduler, no second canonical write path, and no persistent watch
-/// bookkeeping -- an explicit watch-once run has no next cycle to protect.
-///
-/// An input's identity is the one its **declared root** gives it. A selected
-/// path under a home root or a configured root is read as that root's input --
-/// the same root, relative locator, origin/namespace, parser context and
-/// effective configuration mapping a one-shot source scan of that root
-/// produces -- so the two entry points agree on one identity for one file, and
-/// reading it through either is a verified replay of the other. A selected path
-/// that belongs to no declared root keeps a bounded parent-directory fallback
-/// and claims no declared identity.
-///
-/// The file's own path is what enters the descriptor, never the sealed blob's
-/// transport path.
-///
-/// The legacy loop's mtime-based short-circuit
-/// (`explicit_watch_once_root_unchanged_after_last_index`) does not carry over,
-/// on purpose. It skips a file whose mtime predates `last_indexed_at` and which
-/// already has a conversation row; a file whose source receipt is missing, or
-/// whose fixed safety copy changed, satisfies both while its input is still
-/// unfinished. This path therefore takes no such skip -- an input that is read
-/// again lands as a kernel-verified replay, so "nothing new" is proved by the
-/// source facts instead of assumed from a timestamp. The persistent watch
-/// high-water mark stays untouched as well, exactly as the legacy
-/// `explicit_watch_once` gate keeps it.
-///
-/// An input that cannot be prepared, or that does not commit, fails the run:
-/// unlike the resident loop, an explicit watch-once invocation has no next
-/// cycle in which the same work could be retried.
-///
-/// Task 35: the declarations are routed by their own ownership decision, and
-/// a refusal is reported instead of stopping the remaining selections. The
-/// caller runs every selected unit before it turns the collected failures into
-/// a non-zero exit, so one refused unit cannot hide a healthy sibling.
-fn reindex_explicit_watch_once_source_aware(
-    opts: &IndexOptions,
-    units: &[WatchRouteUnit],
-    storage: &Mutex<FrankenStorage>,
-    safety: &Arc<source_ingest::FixedSafetyConfig>,
-) -> Result<(usize, usize, Vec<String>)> {
-    reset_last_index_run_counters();
-    // Constructed exactly as the legacy loop constructs it for this mode:
-    // `opts.watch` is false on an explicit watch-once run.
-    let active_source_filter = ActiveSessionSourceFilter::new(false);
-    let mut total_indexed = 0usize;
-    let mut landed = 0usize;
-    let mut recall_uncovered_by_reason: BTreeMap<String, u64> = BTreeMap::new();
-    let mut failures: Vec<String> = Vec::new();
-
-    // Task 35: this entry point consumes the units the router already decided.
-    // It does not enumerate every connector's declarations for a selected path
-    // again -- that re-reading is what pushed a legacy-owned file (Gemini)
-    // onto the sealed read when one declaration root held both kinds. Each
-    // unit carries its connector, its declaration plan and exactly the
-    // descriptors its own ownership decision accepted; a file another
-    // declaration owns is that declaration's unit, never this one's.
-    let factories = configured_connector_factories();
-    // The single-input key is the declaration key plus the input's own path
-    // and role: `(connector, source_id, root_id, canonical declaration root,
-    // source_path, role)`. Two overlapping sources that share the transitional
-    // local root id and even the same file still keep their own facts.
-    let mut seen: HashSet<(String, String, String, PathBuf, String, String)> = HashSet::new();
-
-    for unit in units {
-        if !unit.source_aware {
-            continue;
-        }
-        let Some((_, factory)) = factories
-            .iter()
-            .find(|(candidate, _)| *candidate == unit.connector)
-        else {
-            failures.push(format!("{}: connector is not registered", unit.connector));
-            continue;
-        };
-        let conn = factory();
-        let meta = &unit.plan.meta;
-        let scan_root = &unit.plan.root;
-        record_scan_invocation();
-        // A declared unit consumes the descriptors its own decision accepted.
-        // An ad-hoc unit discovers under its bounded root (the selection's
-        // directory or the selected file's parent), never the whole HOME, and
-        // keeps the original `explicit-watch-once` identity.
-        let discovered_files: Vec<crate::connectors::DiscoveredSourceFile> = if unit.adhoc {
-            let ctx = crate::connectors::ScanContext::with_roots(
-                opts.data_dir.clone(),
-                vec![unit.plan.root.clone()],
-                None,
-            );
-            match conn.discover_source_files(&ctx) {
-                Ok(found) => {
-                    let selection = unit
-                        .selection
-                        .as_deref()
-                        .unwrap_or(unit.plan.root.path.as_path());
-                    found
-                        .into_iter()
-                        .filter(|file| {
-                            selection_contains(selection, unit.selection_is_dir, &file.source_path)
-                        })
-                        .collect()
-                }
-                Err(error) => {
-                    failures.push(format!("{}: {error}", unit.plan.root.path.display()));
-                    continue;
-                }
-            }
-        } else {
-            unit.accepted.clone()
-        };
-        for discovered_file in &discovered_files {
-            if should_skip_active_session_source(
-                &active_source_filter,
-                unit.connector,
-                &discovered_file.origin.source_id,
-                &discovered_file.source_path,
-            ) {
-                continue;
-            }
-            if should_skip_subagent_source(&discovered_file.source_path) {
-                continue;
-            }
-            let key = (
-                unit.connector.to_string(),
-                meta.root_id.clone(),
-                scan_root.origin.source_id.clone(),
-                meta.canonical_path.clone(),
-                discovered_file.source_path.display().to_string(),
-                discovered_file.role.as_str().to_string(),
-            );
-            if !seen.insert(key) {
-                continue;
-            }
-            let request = source_ingest::SourceInputRequest {
-                connector_name: unit.connector,
-                data_dir: &opts.data_dir,
-                root: scan_root,
-                meta,
-                discovered: discovered_file,
-                safety,
-            };
-            let mut job = match source_ingest::prepare_source_input(conn.as_ref(), &request) {
-                Ok(job) => job,
-                Err(error) => {
-                    failures.push(format!(
-                        "{}: {error}",
-                        discovered_file.source_path.display()
-                    ));
-                    continue;
-                }
-            };
-            // The same order the one-shot source entry applies -- prepare,
-            // inject the declaration identity, canonicalize the Claude
-            // external id, then hand the job to the writer.
-            let identity = IngestIdentity::for_meta(meta);
-            for item in &mut job.conversations {
-                inject_provenance(&mut item.conversation, &scan_root.origin, &identity);
-                canonicalize_claude_external_id(unit.connector, &mut item.conversation);
-            }
-            let committed = {
-                let storage = storage
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-                source_ingest::commit_source_input_dispatched(&storage, &job, false)
-            };
-            match committed {
-                Ok(commit) if commit.outcome.is_success() => {
-                    total_indexed = total_indexed.saturating_add(commit.inserted_conversations);
-                    landed += 1;
-                    accumulate_recall_uncovered(
-                        &mut recall_uncovered_by_reason,
-                        &commit.recall_uncovered_by_reason,
-                    );
-                    tracing::info!(
-                        target: "cass::scan_session",
-                        connector = unit.connector,
-                        root_id = %job.root_id,
-                        input = %commit.outcome.input_key().hex(),
-                        outcome = %commit.outcome.describe(),
-                        recall_uncovered_total = commit.recall_uncovered_total,
-                        recall_uncovered_reasons = %recall_uncovered_reasons_field(
-                            &commit.recall_uncovered_by_reason
-                        ),
-                        "source_input"
-                    );
-                }
-                Ok(commit) => failures.push(format!(
-                    "{}: the source input did not commit: {}",
-                    discovered_file.source_path.display(),
-                    commit.outcome.describe()
-                )),
-                Err(error) => failures.push(format!(
-                    "{}: the source input did not commit: {error}",
-                    discovered_file.source_path.display()
-                )),
-            }
-        }
-    }
-
-    // The same counter the one-shot source paths report, so `--json` says how
-    // many inputs this run carried into a commit instead of a bare zero.
-    if let Some(p) = opts.progress.as_ref()
-        && let Ok(mut stats) = p.stats.lock()
-    {
-        stats.source_inputs_committed = stats.source_inputs_committed.saturating_add(landed);
-        accumulate_recall_uncovered(&mut stats.recall_uncovered_by_reason, &recall_uncovered_by_reason);
-        stats.recall_uncovered_total = stats.recall_uncovered_by_reason.values().copied().sum();
-    }
-
-    // Task 35: report instead of bailing here. The caller runs every selected
-    // unit first, then turns the collected failures into the non-zero exit, so
-    // a refused unit cannot hide a healthy sibling of this same invocation.
-    Ok((total_indexed, landed, failures))
-}
-
 /// SRC05B-09B: every connector's declared-root plans for one resident watch
 /// cycle, built with the run's fixed safety configuration.
 ///
@@ -16941,7 +16172,6 @@ fn reindex_explicit_watch_once_source_aware(
 fn build_resident_source_plans(
     opts: &IndexOptions,
     storage: &Mutex<FrankenStorage>,
-    safety: &Arc<source_ingest::FixedSafetyConfig>,
     force_full: bool,
 ) -> Result<HashMap<&'static str, ConnectorRootPlans>> {
     let storage = storage
@@ -16958,7 +16188,6 @@ fn build_resident_source_plans(
         &configured_connector_factories(),
         &additional_roots,
         &scan_roots_meta,
-        Some(safety),
         true,
         &opts.data_dir,
     )?;
@@ -16985,408 +16214,9 @@ fn clear_plan_state_for_force_full(plans: &mut HashMap<&'static str, ConnectorRo
         {
             plan.watermark = None;
             plan.file_states.clear();
-            plan.source_evidence.clear();
+            plan.legacy_unfinished_source_locators.clear();
         }
     }
-}
-
-/// What one resident source-aware trigger contributed to its watch cycle.
-///
-/// This exists so the cycle's own result is the source path's real result
-/// rather than a constant: the caller accumulates
-/// [`Self::processed_conversations`] into the same counter the legacy branch
-/// feeds, and everything downstream of that counter -- the semantic catch-up
-/// gate and the stale detector -- reads it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ResidentSourceTriggerOutcome {
-    /// Conversations this trigger carried into a commit, counted the way the
-    /// legacy branch counts them: conversations read, not rows created. A
-    /// replayed input installed nothing and contributes nothing.
-    processed_conversations: usize,
-    /// Messages those commits inserted, for the run's counters.
-    inserted_messages: usize,
-    /// Inputs that reached a successful receipt outcome.
-    committed_inputs: usize,
-    /// Files the declared roots handed over.
-    delivered_files: usize,
-}
-
-/// SRC05B-09B + Task 35: one resident-watch unit, read through the verified
-/// source kernel.
-///
-/// The unit's declaration is already resolved by the cycle's route: this does
-/// not re-resolve a declaration from the watched path (a wide root would
-/// re-select declarations the event never touched), and it does not re-dispatch
-/// a connector (the owner was decided before any writer ran).
-///
-/// Everything the resident loop already owns stays with the loop: this reads
-/// one declared root, commits what it sealed, and reports what may move. The
-/// event collection, debounce, run lock, progress and shutdown are untouched.
-#[allow(clippy::too_many_arguments)]
-fn resident_source_watch_trigger(
-    opts: &IndexOptions,
-    storage: &Mutex<FrankenStorage>,
-    safety: &Arc<source_ingest::FixedSafetyConfig>,
-    plan: &LocalRootPlan,
-    kind: ConnectorKind,
-    root: &ScanRoot,
-    max_ts: Option<i64>,
-    trigger_index: usize,
-    trigger_total: usize,
-    skips: &SharedActiveSessionSourceSkips,
-    roots_read: &mut HashSet<(String, String, String, String)>,
-    pending_watch_watermarks: &mut HashMap<ConnectorKind, i64>,
-    watch_preserve_by_kind: &mut HashMap<ConnectorKind, bool>,
-    cycle_had_failure: &mut bool,
-) -> Result<ResidentSourceTriggerOutcome> {
-    let connector_name = kind.slug();
-
-    // The copy this process started with is the only one this cycle may read.
-    // A copy that no longer matches is an explicit failure of this trigger --
-    // loud, and with nothing read -- never a quiet fall back to the legacy
-    // path, which would be the very thing the flag is meant to rule out.
-    if let Err(error) = safety.recheck_bytes() {
-        tracing::error!(
-            connector = connector_name,
-            scan_root = %root.path.display(),
-            error = %error,
-            "the fixed safety copy no longer matches; this watch cycle read nothing for this root"
-        );
-        *cycle_had_failure = true;
-        watch_preserve_by_kind.insert(kind, true);
-        return Ok(ResidentSourceTriggerOutcome::default());
-    }
-
-    if let Some(p) = &opts.progress {
-        p.phase.store(1, Ordering::Relaxed);
-    }
-    record_lexical_population_strategy_if_unset(
-        opts.progress.as_ref(),
-        LexicalPopulationStrategy::IncrementalInline,
-        "resident_source_watch_applies_inline_lexical_updates_for_changed_paths",
-    );
-
-    let scan_start_ts = FrankenStorage::now_millis();
-    let scan_start = Instant::now();
-    let skips_observed_before = lock_active_session_source_skips(skips).observed;
-
-    let connector = kind.create_connector();
-    let active_source_filter = ActiveSessionSourceFilter::with_shared_skips(
-        opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
-        Arc::clone(skips),
-    );
-
-    let mut outcomes: Vec<RootScanOutcome> = Vec::new();
-    let mut delivered = 0usize;
-    let mut root_failed = false;
-    let mut committed = 0usize;
-    let mut processed_conversations = 0usize;
-    let mut inserted_messages = 0usize;
-    let mut recall_uncovered_by_reason: BTreeMap<String, u64> = BTreeMap::new();
-    let mut failed_root_ids: BTreeSet<String> = BTreeSet::new();
-    // The high-water mark of inputs this trigger held at once. Committing from
-    // the sink keeps it at one; a design that collected the root's jobs first
-    // would show the whole backlog here. Logged so the property is checkable
-    // from a real run rather than only from the shape of the code.
-    let mut sink_in_flight_high_water = 0usize;
-    let mut sink_in_flight = 0usize;
-
-    for plan in std::iter::once(plan) {
-        // One declared root is read once per cycle. Task 35: the key keeps the
-        // declaration's source_id, root_id and canonical root, so two sources
-        // that fall back to the same transitional local identity -- or two
-        // roots of one source -- are not folded into a single read by a
-        // physical path or a bare root_id.
-        let identity = (
-            connector_name.to_string(),
-            plan.root.origin.source_id.clone(),
-            plan.meta.root_id.clone(),
-            plan.meta.canonical_path.display().to_string(),
-        );
-        if !roots_read.insert(identity) {
-            continue;
-        }
-        let mut on_source_input = |job: source_ingest::SourceInputJob| {
-            // The input is committed as the root hands it over and dropped
-            // immediately, so its sealed text and its byte reservation are
-            // released before the next input is read. The atomic unit is
-            // still the whole input; what is gone is a buffer holding every
-            // input of the root. This is the batch path's kernel -- that path
-            // collects first only because its parallel scan owns no database
-            // handle, which is not true here.
-            sink_in_flight += 1;
-            sink_in_flight_high_water = sink_in_flight_high_water.max(sink_in_flight);
-            let job_conversations = job.conversations.len();
-            let job_root_id = job.root_id.clone();
-            let result = match storage.lock() {
-                Ok(storage) => source_ingest::commit_source_input_dispatched(&storage, &job, false),
-                Err(_) => Err(source_ingest::SourceIngestError::Storage {
-                    detail: "storage lock poisoned".to_string(),
-                }),
-            };
-            drop(job);
-            sink_in_flight -= 1;
-            match result {
-                Ok(commit) if commit.outcome.is_success() => {
-                    committed = committed.saturating_add(1);
-                    inserted_messages = inserted_messages.saturating_add(commit.inserted_messages);
-                    accumulate_recall_uncovered(
-                        &mut recall_uncovered_by_reason,
-                        &commit.recall_uncovered_by_reason,
-                    );
-                    // A replay installed nothing, so it contributes nothing to
-                    // "what this cycle processed"; anything else counts the
-                    // conversations the input carried, which is the legacy
-                    // branch's own meaning for this number (conversations
-                    // read, not rows created) and is what makes
-                    // `--watch --semantic` see an append that extends an
-                    // existing conversation.
-                    if !matches!(
-                        commit.outcome,
-                        source_ingest::SourceInputOutcome::Completed { replay: true, .. }
-                    ) {
-                        processed_conversations =
-                            processed_conversations.saturating_add(job_conversations);
-                    }
-                    tracing::info!(
-                        target: "cass::scan_session",
-                        connector = connector_name,
-                        root_id = %job_root_id,
-                        input = %commit.outcome.input_key().hex(),
-                        outcome = %commit.outcome.describe(),
-                        recall_uncovered_total = commit.recall_uncovered_total,
-                        recall_uncovered_reasons = %recall_uncovered_reasons_field(
-                            &commit.recall_uncovered_by_reason
-                        ),
-                        "source_input"
-                    );
-                }
-                other => {
-                    // A discovery or a queued input is not a completed read:
-                    // the root only counts as done on a real receipt outcome.
-                    let reason = match other {
-                        Ok(commit) => commit.outcome.describe(),
-                        Err(error) => error.to_string(),
-                    };
-                    tracing::warn!(
-                        connector = connector_name,
-                        root_id = %job_root_id,
-                        reason = %reason,
-                        "resident watch: the source input did not commit; holding this root's progress"
-                    );
-                    root_failed = true;
-                    *cycle_had_failure = true;
-                    failed_root_ids.insert(job_root_id);
-                }
-            }
-            Ok(())
-        };
-        let (outcome, fatal) = run_local_root_scan(
-            connector.as_ref(),
-            connector_name,
-            &opts.data_dir,
-            plan,
-            &[],
-            &active_source_filter,
-            // The source-aware branch never projects a legacy conversation;
-            // reaching this callback would mean the branch did not run.
-            &mut |_, _, _| {
-                Err(anyhow::anyhow!(
-                    "the resident source-aware read tried to deliver a legacy conversation"
-                ))
-            },
-            Some(safety),
-            Some(&mut on_source_input),
-        );
-        if let Some(error) = fatal {
-            return Err(error);
-        }
-        delivered = delivered.saturating_add(outcome.files.len());
-        if !outcome.succeeded {
-            root_failed = true;
-            *cycle_had_failure = true;
-        }
-        outcomes.push(outcome);
-    }
-
-    let scan_ms = scan_start.elapsed().as_millis() as u64;
-    tracing::info!(
-        connector = %connector_name,
-        scan_root = %root.path.display(),
-        trigger_index,
-        trigger_total,
-        delivered_files = delivered,
-        committed_inputs = committed,
-        processed_conversations,
-        sink_in_flight_high_water,
-        "resident_source_watch_trigger"
-    );
-    if !failed_root_ids.is_empty() {
-        for outcome in &mut outcomes {
-            if failed_root_ids.contains(&outcome.root_id) {
-                outcome.succeeded = false;
-            }
-        }
-    }
-    {
-        let storage = storage
-            .lock()
-            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-        // Per-root completion progress moves only for a root that both scanned
-        // and committed cleanly; `persist_root_scan_outcomes` applies the rest
-        // of the gate (active-session skips, exclusions) itself.
-        persist_root_scan_outcomes(&storage, &outcomes, skips, true, 0, scan_start_ts)?;
-        refresh_run_counters_in_stats(opts);
-    }
-    let index_ms = scan_start.elapsed().as_millis() as u64;
-
-    if let Some(p) = &opts.progress {
-        p.total
-            .fetch_add(processed_conversations, Ordering::Relaxed);
-        p.phase.store(2, Ordering::Relaxed);
-        if let Ok(mut stats) = p.stats.lock() {
-            stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
-            stats.index_ms = stats.index_ms.saturating_add(index_ms);
-            stats.total_conversations = stats
-                .total_conversations
-                .saturating_add(processed_conversations);
-            stats.total_messages = stats.total_messages.saturating_add(inserted_messages);
-            stats.source_inputs_committed = stats.source_inputs_committed.saturating_add(committed);
-            accumulate_recall_uncovered(
-                &mut stats.recall_uncovered_by_reason,
-                &recall_uncovered_by_reason,
-            );
-            stats.recall_uncovered_total = stats.recall_uncovered_by_reason.values().copied().sum();
-            stats.connectors.push(ConnectorStats {
-                name: connector_name.to_string(),
-                conversations: processed_conversations,
-                messages: inserted_messages,
-                scan_ms,
-                error: None,
-            });
-            if !stats
-                .agents_discovered
-                .iter()
-                .any(|name| name == connector_name)
-            {
-                stats.agents_discovered.push(connector_name.to_string());
-            }
-        }
-    }
-
-    // Same rule the legacy cycle applies to `last_indexed_at`: one failure
-    // anywhere in this cycle makes the run's own counters untrustworthy for
-    // this persist, so health/status keep reporting the previous run.
-    if root_failed || *cycle_had_failure {
-        tracing::warn!(
-            root_failed,
-            cycle_had_failure = *cycle_had_failure,
-            "skipping watch last_indexed_at update after a source-input failure this cycle"
-        );
-    } else {
-        let storage = storage
-            .lock()
-            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
-        persist::with_ephemeral_writer(
-            &storage,
-            false,
-            "updating watch last_indexed_at",
-            |writer| {
-                let tx = writer
-                    .raw()
-                    .transaction_with_mode(crate::storage::api::TxMode::Immediate)?;
-                writer.set_last_indexed_at(FrankenStorage::now_millis())?;
-                persist_last_index_run_meta_counters(writer)?;
-                tx.commit()?;
-                Ok(())
-            },
-        )?;
-    }
-
-    let skips_observed_here = {
-        let state = lock_active_session_source_skips(skips);
-        state.observed && !skips_observed_before
-    };
-    // The per-kind holdback is this trigger's own outcome and nothing else.
-    // `cycle_had_failure` is deliberately absent: it is the cycle-wide flag
-    // that keeps the run's global counters from being written as a success,
-    // and letting it in here would let one kind's failure freeze an unrelated
-    // kind's own watermark for the same cycle. A sibling root of the *same*
-    // kind still holds its kind back, because that kind's own entry in
-    // `watch_preserve_by_kind` is already set and this function never clears
-    // it.
-    let holdback = root_failed || skips_observed_here || scan_path_exclusions_active();
-    if holdback {
-        // No ledger holds these back, so the shared watermark is their only
-        // retry protection: it stays where it was and the next event (or the
-        // next process) reads them again.
-        watch_preserve_by_kind.insert(kind, true);
-        tracing::info!(
-            ?kind,
-            scan_root = %root.path.display(),
-            "preserving the resident source watch watermark so an unfinished source input is retried"
-        );
-    } else if committed > 0
-        && let Some(ts_val) = max_ts
-    {
-        let entry = pending_watch_watermarks.entry(kind).or_insert(ts_val);
-        *entry = (*entry).max(ts_val);
-    }
-
-    Ok(ResidentSourceTriggerOutcome {
-        processed_conversations,
-        inserted_messages,
-        committed_inputs: committed,
-        delivered_files: delivered,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Task 35: fixed-mode watch routing
-//
-// The fixed safety configuration is a run-level choice. When it is present the
-// watch entries no longer start from `classify_paths`: the raw event paths are
-// routed against this cycle's source-root declarations first, the resolved
-// owner overrides the old kind hint, and a rejection is decided before any
-// writer runs. Everything below is private to this module; the connectors,
-// the sealed-input kernel and the persisted identity are the verified 24/32/34
-// primitives.
-// ---------------------------------------------------------------------------
-
-/// One executable unit the fixed-mode watch router produced.
-#[derive(Clone)]
-struct WatchRouteUnit {
-    /// The connector that reads this unit, from the declaration's decision.
-    connector: &'static str,
-    /// The watch capability of `connector`. A unit never exists for an owner
-    /// without one: that owner is rejected during routing.
-    kind: ConnectorKind,
-    /// The declaration's plan: root, metadata, watermark, per-file state and
-    /// the ownership partition shared with the one-shot scan.
-    plan: LocalRootPlan,
-    /// The root to read. For watch-once this carries the selected path (the
-    /// declaration's origin/meta still identify the input); for resident it is
-    /// the declaration root itself.
-    read_root: ScanRoot,
-    /// The explicit watch-once selection, if any.
-    selection: Option<PathBuf>,
-    selection_is_dir: bool,
-    min_ts: Option<i64>,
-    max_ts: Option<i64>,
-    /// `true` when the owner supports the sealed source kernel; `false` when
-    /// the unit keeps the legacy message writer.
-    source_aware: bool,
-    /// The descriptors this unit's declaration owns inside its selection. The
-    /// source-aware read consumes exactly this set; it never re-discovers a
-    /// selected path across every connector, which would push another
-    /// declaration's legacy-owned file onto the sealed read.
-    accepted: Vec<crate::connectors::DiscoveredSourceFile>,
-    /// An explicit selection no declaration covers, read through the bounded
-    /// ad-hoc root its connector classifies to. The executor discovers under
-    /// that bounded root (never the whole HOME) and keeps the original
-    /// `explicit-watch-once` identity, so a first-batch selection outside any
-    /// declaration still produces its source facts.
-    adhoc: bool,
 }
 
 /// A unit that could not be routed. Decided before any writer runs, so a
@@ -17426,7 +16256,6 @@ struct LegacyWatchTrigger {
 
 #[derive(Default)]
 struct WatchRoute {
-    units: Vec<WatchRouteUnit>,
     legacy: Vec<LegacyWatchTrigger>,
     rejections: Vec<WatchRouteRejection>,
     /// Paths no declaration covers. They keep the entry point's previous
@@ -17701,40 +16530,40 @@ fn route_fixed_watch(
                 plan.meta.canonical_path.clone(),
                 explicit_watch_once.then(|| selected.clone()),
             );
-            if !seen_units.insert(unit_key) {
-                continue;
-            }
-            let source_aware = source_ingest::supports_source_fidelity(name);
             let read_root = if explicit_watch_once {
                 plan.root.with_path(selected.clone())
             } else {
                 plan.root.clone()
             };
-            if source_aware {
-                route.units.push(WatchRouteUnit {
-                    connector: name,
-                    kind,
-                    plan: plan.clone(),
-                    read_root,
-                    selection: explicit_watch_once.then(|| selected.clone()),
-                    selection_is_dir,
-                    min_ts: modified_ms,
-                    max_ts: modified_ms,
-                    source_aware: true,
-                    accepted: accepted_sources.clone(),
-                    adhoc: false,
-                });
-            } else {
-                route.legacy.push(LegacyWatchTrigger {
-                    kind,
-                    root: read_root,
-                    meta: Some(plan.meta.clone()),
-                    native: false,
-                    verified: Some(Arc::new(accepted_sources.clone())),
-                    min_ts: modified_ms,
-                    max_ts: modified_ms,
-                });
+            if !seen_units.insert(unit_key) {
+                if let Some(existing) = route.legacy.iter_mut().find(|trigger| {
+                    trigger.kind == kind
+                        && !trigger.native
+                        && trigger.root.path == read_root.path
+                        && trigger.root.origin.source_id == plan.root.origin.source_id
+                        && trigger.meta.as_ref().map(|m| m.root_id.as_str())
+                            == Some(plan.meta.root_id.as_str())
+                }) {
+                    existing.min_ts = match (existing.min_ts, modified_ms) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    existing.max_ts = match (existing.max_ts, modified_ms) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                }
+                continue;
             }
+            route.legacy.push(LegacyWatchTrigger {
+                kind,
+                root: read_root,
+                meta: Some(plan.meta.clone()),
+                native: false,
+                verified: Some(Arc::new(accepted_sources.clone())),
+                min_ts: modified_ms,
+                max_ts: modified_ms,
+            });
         }
 
         // The native legacy declaration of every connector that reports a
@@ -17752,10 +16581,22 @@ fn route_fixed_watch(
             } else {
                 ScanRoot::local(native_root.clone())
             };
+            covered = true;
             if !seen_legacy.insert((*kind, read_root.path.clone(), false)) {
+                if let Some(existing) = route.legacy.iter_mut().find(|trigger| {
+                    trigger.kind == *kind && trigger.root.path == read_root.path && trigger.native
+                }) {
+                    existing.min_ts = match (existing.min_ts, modified_ms) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    existing.max_ts = match (existing.max_ts, modified_ms) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                }
                 continue;
             }
-            covered = true;
             route.legacy.push(LegacyWatchTrigger {
                 kind: *kind,
                 root: read_root,
@@ -17765,50 +16606,6 @@ fn route_fixed_watch(
                 min_ts: modified_ms,
                 max_ts: modified_ms,
             });
-        }
-
-        // An explicit selection no declaration covers keeps its bounded
-        // ad-hoc read when its connector supports the sealed kernel: the
-        // selected directory (or the parent of the selected file) is the
-        // root, the original `explicit-watch-once` identity is kept, and the
-        // executor discovers under that root only. A legacy connector keeps
-        // the legacy writer through the uncovered classification below.
-        if !covered
-            && explicit_watch_once
-            && let Some(kind) = explicit_watch_once_connector_hint(&selected)
-            && matches!(kind, ConnectorKind::Claude | ConnectorKind::Codex)
-        {
-            let bounded_root = if selection_is_dir {
-                selected.clone()
-            } else {
-                match selected.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-                    _ => selected.clone(),
-                }
-            };
-            let bounded = ScanRoot::local(bounded_root);
-            let meta = ad_hoc_watch_once_root_meta(kind.slug(), &bounded);
-            route.units.push(WatchRouteUnit {
-                connector: kind.slug(),
-                kind,
-                plan: LocalRootPlan {
-                    root: bounded.clone(),
-                    meta,
-                    watermark: None,
-                    file_states: HashMap::new(),
-                    source_evidence: HashSet::new(),
-                    ownership: None,
-                },
-                read_root: bounded,
-                selection: Some(selected.clone()),
-                selection_is_dir,
-                min_ts: modified_ms,
-                max_ts: modified_ms,
-                source_aware: true,
-                accepted: Vec::new(),
-                adhoc: true,
-            });
-            covered = true;
         }
 
         if !covered {
@@ -17858,7 +16655,6 @@ fn run_watch_rebuild_cycle(
     roots: &[(ConnectorKind, ScanRoot)],
     state: &Mutex<HashMap<ConnectorKind, i64>>,
     storage: &Mutex<FrankenStorage>,
-    safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
     detector: &StaleDetector,
 ) -> usize {
     if let Ok(mut g) = state.lock() {
@@ -17871,7 +16667,7 @@ fn run_watch_rebuild_cycle(
     detector.reset();
     // For rebuild, trigger reindex on all active roots
     let all_root_paths: Vec<PathBuf> = roots.iter().map(|(_, root)| root.path.clone()).collect();
-    let indexed = reindex_paths_with_semantic_delta_and_safety(
+    let indexed = reindex_paths_with_semantic_delta(
         opts,
         all_root_paths,
         roots,
@@ -17879,7 +16675,6 @@ fn run_watch_rebuild_cycle(
         storage,
         true,
         None,
-        safety,
     );
     finalize_watch_reindex_result(
         indexed,
@@ -17915,35 +16710,6 @@ fn reindex_paths_with_semantic_delta(
     force_full: bool,
     semantic_delta: Option<&mut WatchSemanticDelta>,
 ) -> Result<usize> {
-    reindex_paths_with_semantic_delta_and_safety(
-        opts,
-        paths,
-        roots,
-        state,
-        storage,
-        force_full,
-        semantic_delta,
-        None,
-    )
-}
-
-/// [`reindex_paths_with_semantic_delta`], with the run's already-loaded fixed
-/// safety configuration threaded in.
-///
-/// SRC05B-09B: the resident watch loop holds the safety object it loaded when
-/// the process started, so a cycle never re-resolves it. Every other caller
-/// passes `None` and keeps the previous behaviour of loading it here.
-#[allow(clippy::too_many_arguments)]
-fn reindex_paths_with_semantic_delta_and_safety(
-    opts: &IndexOptions,
-    paths: Vec<PathBuf>,
-    roots: &[(ConnectorKind, ScanRoot)],
-    state: &Mutex<HashMap<ConnectorKind, i64>>,
-    storage: &Mutex<FrankenStorage>,
-    force_full: bool,
-    semantic_delta: Option<&mut WatchSemanticDelta>,
-    resident_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
-) -> Result<usize> {
     // A callback with no routable work still starts a new diagnostic run.
     if let Some(progress) = &opts.progress
         && let Ok(mut stats) = progress.stats.lock()
@@ -17955,53 +16721,21 @@ fn reindex_paths_with_semantic_delta_and_safety(
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
 
-    // SRC05B-09A/B + Task 35: a fixed safety configuration routes this cycle
-    // from the raw paths through the declarations' own ownership decisions,
-    // before any writer runs. Every other run keeps the previous
-    // classification exactly as it was.
+    // Task 35: route this cycle from the raw paths through the declarations'
+    // own ownership decisions before any writer runs.
     let explicit_watch_once = opts
         .watch_once_paths
         .as_ref()
         .is_some_and(|paths| !paths.is_empty());
-    let safety = match resident_safety {
-        Some(safety) => Some(Arc::clone(safety)),
-        None => load_source_safety(opts)?,
-    };
 
-    let mut fixed: Option<(
-        Arc<source_ingest::FixedSafetyConfig>,
-        HashMap<&'static str, ConnectorRootPlans>,
-        WatchRoute,
-    )> = None;
-    if let Some(safety) = safety.as_ref() {
-        let plans = build_resident_source_plans(opts, storage, safety, force_full)?;
-        let route = route_fixed_watch(paths.clone(), &plans, explicit_watch_once);
-        fixed = Some((Arc::clone(safety), plans, route));
-    }
+    let plans = build_resident_source_plans(opts, storage, force_full)?;
+    let route = route_fixed_watch(paths, &plans, explicit_watch_once);
 
-    // The legacy reads of this cycle: the declarations whose owner keeps the
-    // message writer, plus every raw path no declaration covers, which keeps
-    // the entry point's previous classification.
-    let mut triggers: Vec<LegacyWatchTrigger> = Vec::new();
-    if let Some((_, _, route)) = &fixed {
-        triggers.extend(route.legacy.iter().cloned());
-        if !route.uncovered.is_empty() {
-            for (kind, root, min_ts, max_ts) in
-                classify_paths(route.uncovered.clone(), roots, explicit_watch_once)
-            {
-                triggers.push(LegacyWatchTrigger {
-                    kind,
-                    root,
-                    meta: None,
-                    native: false,
-                    verified: None,
-                    min_ts,
-                    max_ts,
-                });
-            }
-        }
-    } else {
-        for (kind, root, min_ts, max_ts) in classify_paths(paths, roots, explicit_watch_once) {
+    let mut triggers: Vec<LegacyWatchTrigger> = route.legacy.clone();
+    if !route.uncovered.is_empty() {
+        for (kind, root, min_ts, max_ts) in
+            classify_paths(route.uncovered.clone(), roots, explicit_watch_once)
+        {
             triggers.push(LegacyWatchTrigger {
                 kind,
                 root,
@@ -18014,10 +16748,7 @@ fn reindex_paths_with_semantic_delta_and_safety(
         }
     }
 
-    let has_fixed_work = fixed.as_ref().is_some_and(|(_, _, route)| {
-        !route.units.is_empty() || !route.rejections.is_empty()
-    });
-    if triggers.is_empty() && !has_fixed_work {
+    if triggers.is_empty() && route.rejections.is_empty() {
         return Ok(0);
     }
 
@@ -18117,83 +16848,13 @@ fn reindex_paths_with_semantic_delta_and_safety(
     for trigger in &triggers {
         *remaining_triggers_by_kind.entry(trigger.kind).or_default() += 1;
     }
-    if let Some((_, _, route)) = &fixed {
-        for unit in &route.units {
-            *remaining_triggers_by_kind.entry(unit.kind).or_default() += 1;
-        }
-    }
-
     // Task 35: every rejection is decided before any writer runs. A rejected
     // unit poisons the cycle-wide success marker and its own kind's shared
     // watermark; a kind this build has no capability for has no watermark to
     // hold back, but still fails the cycle. A sibling of the same kind may
     // finish its own legal work; it cannot publish a watermark past the
     // failure.
-    if let Some((_, _, route)) = &fixed {
-        cycle_had_failure |= apply_watch_rejections(route, &mut watch_preserve_by_kind);
-    }
-
-    // Active-session skips detected by the source-aware branch land here, so
-    // the run reads them back when deciding whether a root's state may move.
-    let resident_source_skips: SharedActiveSessionSourceSkips =
-        SharedActiveSessionSourceSkips::default();
-    // The declared units this cycle already read, keyed by the declaration's
-    // full identity: `(connector, source_id, root_id, canonical root)`.
-    let mut resident_source_roots_read: HashSet<(String, String, String, String)> = HashSet::new();
-    let mut explicit_watch_once_failures: Vec<String> = Vec::new();
-
-    // Task 35: the source-capable units run first, in their own deterministic
-    // order, and the legacy triggers follow. Every rejection above has already
-    // been applied, so nothing here can publish a state the route refused.
-    if let Some((safety, _plans, route)) = &fixed {
-        if explicit_watch_once {
-            let (indexed, _landed, failures) =
-                reindex_explicit_watch_once_source_aware(opts, &route.units, storage, safety)?;
-            total_indexed = total_indexed.saturating_add(indexed);
-            explicit_watch_once_failures.extend(failures);
-            if !explicit_watch_once_failures.is_empty() {
-                cycle_had_failure = true;
-            }
-        } else {
-            let unit_total = route.units.len();
-            for (unit_index, unit) in route.units.iter().enumerate() {
-                if let Some(remaining) = remaining_triggers_by_kind.get_mut(&unit.kind) {
-                    *remaining = remaining.saturating_sub(1);
-                }
-                let outcome = resident_source_watch_trigger(
-                    opts,
-                    storage,
-                    safety,
-                    &unit.plan,
-                    unit.kind,
-                    &unit.read_root,
-                    unit.max_ts,
-                    unit_index,
-                    unit_total,
-                    &resident_source_skips,
-                    &mut resident_source_roots_read,
-                    &mut pending_watch_watermarks,
-                    &mut watch_preserve_by_kind,
-                    &mut cycle_had_failure,
-                )?;
-                // The cycle's own result, in the shape the legacy branch
-                // produces: conversations this cycle processed. A cycle that
-                // read only through the source kernel must report them too, or
-                // the caller's result is zero and everything downstream of it
-                // -- the semantic catch-up gate and the stale detector -- sees
-                // a cycle that indexed nothing.
-                total_indexed = total_indexed.saturating_add(outcome.processed_conversations);
-                publish_watch_watermark_if_kind_complete(
-                    &opts.data_dir,
-                    state,
-                    unit.kind,
-                    &remaining_triggers_by_kind,
-                    &mut pending_watch_watermarks,
-                    &watch_preserve_by_kind,
-                )?;
-            }
-        }
-    }
+    cycle_had_failure |= apply_watch_rejections(&route, &mut watch_preserve_by_kind);
 
     // Task 35: one selected path can be covered by more than one declaration
     // (the connector's native detect root and a configured declaration). The
@@ -18316,12 +16977,25 @@ fn reindex_paths_with_semantic_delta_and_safety(
             continue;
         }
 
-        // Use explicit root context
-        let ctx = crate::connectors::ScanContext::with_roots(
-            root.path.clone(),
-            vec![root.clone()],
-            since_ts,
-        );
+        // Use explicit root context. For arbitrated connectors (`claude`, `codex`)
+        // with ownership-verified descriptors, pass those exact files so a shared
+        // configured root does not feed another connector's files into the scan.
+        let ctx = if let Some(sources) = verified.as_deref()
+            && source_ownership::is_arbitrated_connector(kind.slug())
+            && !sources.is_empty()
+        {
+            let file_roots: Vec<ScanRoot> = sources
+                .iter()
+                .map(|source| root.with_path(source.source_path.clone()))
+                .collect();
+            crate::connectors::ScanContext::with_roots(root.path.clone(), file_roots, since_ts)
+        } else {
+            crate::connectors::ScanContext::with_roots(
+                root.path.clone(),
+                vec![root.clone()],
+                since_ts,
+            )
+        };
 
         // Task 35: a fixed-mode unit reads exactly the descriptors its
         // declaration verified -- capture consumes that set instead of
@@ -18831,25 +17505,24 @@ fn reindex_paths_with_semantic_delta_and_safety(
     // outside its verified descriptors -- must not be hidden by a successful
     // exit. Healthy units have already landed; this only turns the run's own
     // result into a failure the caller can see.
-    if explicit_watch_once && fixed.is_some() && explicit_watch_once_runtime_failures > 0 {
+    if explicit_watch_once && explicit_watch_once_runtime_failures > 0 {
         anyhow::bail!(
             "cass index --watch-once: {explicit_watch_once_runtime_failures} fixed watch unit(s) failed at runtime (discovery, scan, or a source outside their verified descriptors)"
         );
     }
 
     // Task 35: an explicit invocation has no next cycle. Every refused unit --
-    // an unsupported owner, unresolved or ambiguous evidence, or a sealed input
-    // that did not land -- is reported after the healthy units have run.
+    // an unsupported owner, unresolved or ambiguous evidence -- is reported
+    // after the healthy units have run.
     if explicit_watch_once {
-        let mut failures = explicit_watch_once_failures;
-        if let Some((_, _, route)) = &fixed {
-            for rejection in &route.rejections {
-                failures.push(format!("{}: {}", rejection.connector, rejection.code));
-            }
-        }
+        let failures: Vec<String> = route
+            .rejections
+            .iter()
+            .map(|rejection| format!("{}: {}", rejection.connector, rejection.code))
+            .collect();
         if !failures.is_empty() {
             anyhow::bail!(
-                "cass index --watch-once: {} source input(s) did not land: {}",
+                "cass index --watch-once: {} watch unit(s) rejected: {}",
                 failures.len(),
                 failures.join("; ")
             );
@@ -18863,6 +17536,9 @@ fn explicit_watch_once_root_unchanged_after_last_index(
     storage: &FrankenStorage,
     root: &ScanRoot,
 ) -> Result<bool> {
+    if storage.has_legacy_unfinished_source_inputs()? {
+        return Ok(false);
+    }
     let metadata = match fs::metadata(&root.path) {
         Ok(metadata) if metadata.is_file() => metadata,
         _ => return Ok(false),
@@ -20467,96 +19143,268 @@ mod capture_source_kind_for_tests {
 pub(crate) fn build_pairing_candidates(
     conv: &NormalizedConversation,
 ) -> Vec<crate::indexer::exclusion::PairingCandidate> {
-    use crate::indexer::exclusion::{PairedTool, PairingCandidate};
+    build_pairing_candidates_with_events(conv, None)
+}
+
+fn build_pairing_candidates_with_events(
+    conv: &NormalizedConversation,
+    events: Option<&[crate::indexer::exclusion::BlobEvent]>,
+) -> Vec<crate::indexer::exclusion::PairingCandidate> {
+    use crate::indexer::exclusion::{
+        BlobEvent, BlockKind, PairedTool, PairingCandidate, parse_tool_args_value,
+    };
+
+    let paired_to_candidate = |mut paired: Vec<PairedTool>| match paired.len() {
+        0 => PairingCandidate::ToolCall(PairedTool {
+            tool_call_id: None,
+            tool_name: String::new(),
+            args: None,
+        }),
+        1 => PairingCandidate::ToolCall(paired.remove(0)),
+        _ => PairingCandidate::ToolCalls(paired),
+    };
+
+    let top_level_record_tool_call = |blob_event: &BlobEvent| -> Option<PairedTool> {
+        let rec = &blob_event.raw_record;
+        let name = rec.get("name").and_then(|v| v.as_str()).filter(|n| !n.is_empty())?;
+        Some(PairedTool {
+            tool_call_id: rec
+                .get("tool_call_id")
+                .or_else(|| rec.get("call_id"))
+                .or_else(|| rec.get("tool_use_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            tool_name: name.to_string(),
+            args: rec
+                .get("arguments")
+                .or_else(|| rec.get("input"))
+                .map(parse_tool_args_value),
+        })
+    };
+
+    let event_tool_calls = |blob_event: &BlobEvent| -> Vec<PairedTool> {
+        let from_blocks: Vec<PairedTool> = blob_event
+            .event
+            .blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::ToolUse)
+            .filter_map(|b| {
+                let name = b.tool_name.as_deref().filter(|n| !n.is_empty())?;
+                Some(PairedTool {
+                    tool_call_id: b.tool_use_id.clone(),
+                    tool_name: name.to_string(),
+                    args: b.args.as_ref().map(parse_tool_args_value),
+                })
+            })
+            .collect();
+        if !from_blocks.is_empty() {
+            return from_blocks;
+        }
+        top_level_record_tool_call(blob_event).into_iter().collect()
+    };
+
+    let merge_invocations_with_event =
+        |invocations: &[franken_agent_detection::NormalizedInvocation],
+         blob_event: Option<&BlobEvent>| {
+            let mut paired: Vec<PairedTool> = invocations
+                .iter()
+                .map(|inv| PairedTool {
+                    tool_call_id: inv.call_id.clone(),
+                    tool_name: inv.name.clone(),
+                    args: inv.arguments.as_ref().map(parse_tool_args_value),
+                })
+                .collect();
+            if let Some(ev) = blob_event {
+                let ev_calls = event_tool_calls(ev);
+                if ev_calls.len() == paired.len()
+                    && ev_calls
+                        .iter()
+                        .zip(paired.iter())
+                        .all(|(ec, pc)| ec.tool_name == pc.tool_name)
+                {
+                    for (pc, ec) in paired.iter_mut().zip(ev_calls.into_iter()) {
+                        if pc.tool_call_id.is_none() {
+                            pc.tool_call_id = ec.tool_call_id;
+                        }
+                        if pc.args.is_none() {
+                            pc.args = ec.args;
+                        }
+                    }
+                } else {
+                    for pc in &mut paired {
+                        if pc.tool_call_id.is_some() && pc.args.is_some() {
+                            continue;
+                        }
+                        let mut matches = ev_calls.iter().filter(|ec| {
+                            ec.tool_name == pc.tool_name
+                                && (pc.tool_call_id.is_none()
+                                    || ec.tool_call_id == pc.tool_call_id)
+                        });
+                        if let (Some(only), None) = (matches.next(), matches.next()) {
+                            if pc.tool_call_id.is_none() {
+                                pc.tool_call_id = only.tool_call_id.clone();
+                            }
+                            if pc.args.is_none() {
+                                pc.args = only.args.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            paired_to_candidate(paired)
+        };
+
+    let event_tool_result_id = |blob_event: &BlobEvent| -> Option<String> {
+        let mut unique_id: Option<&str> = None;
+        for b in &blob_event.event.blocks {
+            if b.kind != BlockKind::ToolResult {
+                continue;
+            }
+            if let Some(id) = b.tool_use_id.as_deref() {
+                match unique_id {
+                    None => unique_id = Some(id),
+                    Some(prev) if prev == id => {}
+                    Some(_) => return None,
+                }
+            }
+        }
+        if let Some(id) = unique_id {
+            return Some(id.to_string());
+        }
+        blob_event
+            .raw_record
+            .get("tool_call_id")
+            .or_else(|| blob_event.raw_record.get("tool_use_id"))
+            .or_else(|| blob_event.raw_record.get("call_id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
 
     conv.messages
         .iter()
         .enumerate()
-        .map(|(idx, m)| match m.role.as_str() {
-            "user" => PairingCandidate::TurnBoundary,
-            "tool_call" => {
-                let inv = m.invocations.first();
-                PairingCandidate::ToolCall(PairedTool {
-                    tool_call_id: inv.and_then(|i| i.call_id.clone()),
-                    tool_name: inv.map(|i| i.name.clone()).unwrap_or_default(),
-                    args: inv.and_then(|i| i.arguments.clone()),
-                })
+        .map(|(idx, m)| {
+            let blob_event = events.and_then(|ev| ev.get(idx));
+            match m.role.as_str() {
+                "user" => PairingCandidate::TurnBoundary,
+                "tool_call" => {
+                    if !m.invocations.is_empty() {
+                        merge_invocations_with_event(&m.invocations, blob_event)
+                    } else {
+                        // Whole-document Codex `.json` `items[]` entries with
+                        // top-level `role: "tool_call"` carry their metadata on
+                        // `extra` (`name`, `call_id`, `arguments`/`input`). On
+                        // >= 32 MiB sessions `compact_message_extra` strips
+                        // `m.extra` before `recall_v2`, so fall back to the
+                        // uncompacted raw-mirror `BlobEvent`.
+                        let from_extra = PairedTool {
+                            tool_call_id: m
+                                .extra
+                                .get("tool_call_id")
+                                .or_else(|| m.extra.get("call_id"))
+                                .or_else(|| m.extra.get("tool_use_id"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                            tool_name: m
+                                .extra
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            args: m
+                                .extra
+                                .get("arguments")
+                                .or_else(|| m.extra.get("input"))
+                                .map(parse_tool_args_value),
+                        };
+                        if !from_extra.tool_name.is_empty() || from_extra.args.is_some() {
+                            PairingCandidate::ToolCall(from_extra)
+                        } else if let Some(ev_calls) =
+                            blob_event.map(event_tool_calls).filter(|c| !c.is_empty())
+                        {
+                            paired_to_candidate(ev_calls)
+                        } else {
+                            PairingCandidate::ToolCall(from_extra)
+                        }
+                    }
+                }
+                "assistant" | "agent" => {
+                    if !m.invocations.is_empty() {
+                        merge_invocations_with_event(&m.invocations, blob_event)
+                    } else if let Some(top_call) = blob_event.and_then(top_level_record_tool_call) {
+                        PairingCandidate::ToolCall(top_call)
+                    } else {
+                        PairingCandidate::ToolResult {
+                            tool_call_id: Some(format!("__cass_pairing_neutral_{idx}__")),
+                        }
+                    }
+                }
+                "tool_result" => PairingCandidate::ToolResult {
+                    tool_call_id: m
+                        .extra
+                        .get("tool_call_id")
+                        .or_else(|| m.extra.get("tool_use_id"))
+                        .or_else(|| m.extra.get("call_id"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .or_else(|| blob_event.and_then(event_tool_result_id)),
+                },
+                _ => PairingCandidate::ToolResult {
+                    tool_call_id: Some(format!("__cass_pairing_neutral_{idx}__")),
+                },
             }
-            "tool_result" => PairingCandidate::ToolResult {
-                tool_call_id: m.extra.get("tool_call_id").and_then(|v| v.as_str()).map(str::to_string),
-            },
-            _ => PairingCandidate::ToolResult { tool_call_id: Some(format!("__cass_pairing_neutral_{idx}__")) },
         })
         .collect()
 }
 
-/// PR6 T2b: run R1-R4 judgment + redaction over every message in `conv`
-/// using `events` (message-position-aligned per `events_from_blob`'s
-/// contract; short/`None` entries just mean that position isn't judged --
-/// 宁漏勿误). Returns the per-message markers (`PreparedConversation.excluded`
-/// alignment) and mutates `conv.messages` in place via `apply`/
-/// `apply_sibling` exactly as `docs/excluded-rules.md` §处理顺序 specifies:
-/// decide (all rows) -> apply (hit rows) -> apply_sibling (same-`event_key`
-/// rows, second pass, so a sibling's own block replacement never races
-/// against a not-yet-applied primary hit in the same event).
+/// Run v2 recall + R2/R3 judgment and redaction over every message in `conv`
+/// using `events` (message-position-aligned [`BlobEvent`]s carrying each
+/// message's structural facts and original parsed JSON record). Returns the
+/// per-message markers and bounded `recall_uncovered_by_reason` counts,
+/// mutating `conv.messages` in place via `recall_v2::apply_with_redaction` and
+/// `exclusion::apply_sibling`.
 fn judge_and_redact_reparsed(
     conv: &mut NormalizedConversation,
-    events: &[crate::indexer::exclusion::RawEvent],
+    events: &[crate::indexer::exclusion::BlobEvent],
     blob_relative_path: &str,
     paths_cfg: &crate::sources::config::ExcludedContextPaths,
     redaction_enabled: bool,
-) -> Vec<Option<crate::indexer::exclusion::ExcludedMarker>> {
-    use crate::indexer::exclusion::{
-        PairingContext, apply_sibling, apply_with_redaction, decide, field_map_for,
-    };
+) -> (Vec<Option<crate::indexer::exclusion::ExcludedMarker>>, BTreeMap<String, u64>) {
+    use crate::indexer::exclusion::{PairingContext, apply_sibling, field_map_for};
+    use crate::indexer::recall_v2::{Outcome, apply_with_redaction, decide_for_record};
 
-    let candidates = build_pairing_candidates(conv);
+    let candidates = build_pairing_candidates_with_events(conv, Some(events));
     let pairing_ctx = PairingContext::build(&candidates);
     let field_map = field_map_for(&conv.agent_slug);
     let mut redactor = crate::indexer::redact_secrets::MemoizingRedactor::new();
 
     let mut markers: Vec<Option<crate::indexer::exclusion::ExcludedMarker>> = vec![None; conv.messages.len()];
+    let mut recall_uncovered: BTreeMap<String, u64> = BTreeMap::new();
     let mut hits: Vec<(usize, crate::indexer::exclusion::ExcludedMarker)> = Vec::new();
     for idx in 0..conv.messages.len() {
-        // R1-N16 (任务书 #118b): the codex idx0-user candidate count used
-        // to be taken here, but this loop never runs at all when alignment
-        // fails (`judge_reparsed_conversation` short-circuits before
-        // calling this function) -- moved to `judge_reparsed_conversation`
-        // itself so the denominator doesn't shrink on alignment failure.
-        let Some(event) = events.get(idx) else { continue };
-        let decision = decide(&conv.messages[idx], idx, event, &pairing_ctx, &conv.agent_slug, paths_cfg);
-        let Some(decision) = decision else { continue };
-        if matches!(decision.reason, crate::indexer::exclusion::ExclusionReason::CodexHostShell) {
+        let Some(blob_event) = events.get(idx) else { continue };
+        let exclusion = match decide_for_record(
+            conv,
+            idx,
+            &blob_event.event,
+            &pairing_ctx,
+            paths_cfg,
+            &blob_event.raw_record,
+        ) {
+            Outcome::Exclude(exclusion) => exclusion,
+            Outcome::Preserve(Some(reason)) => {
+                *recall_uncovered.entry(reason.as_str().to_string()).or_insert(0) += 1;
+                continue;
+            }
+            Outcome::Preserve(None) => continue,
+        };
+        if matches!(exclusion.decision.reason, crate::indexer::exclusion::ExclusionReason::CodexHostShell) {
             record_codex_host_shell_hit();
         }
-        // R1-N2 (任务书 #118a): title cleanup happens HERE, in judge, before
-        // `apply()` clears `msg.content` -- `pre_redaction_content` is saved
-        // just above so the comparison below has the excluded row's ORIGINAL
-        // text to compare `title` against.
-        //
-        // R2-N3 (任务书 #119c): this comparison is against `title` on the
-        // LEFT and `pre_redaction_content` on the RIGHT -- both UNREDACTED,
-        // per spec §2.2's own wording ("若 title 是任一被排除消息**原文**的
-        // 子串"). The prior implementation compared against
-        // `redactor.redact_text(&pre_redaction_content)` instead, on the
-        // theory that "sha/title 判定都用脱敏后正文口径" -- but spec §2.2
-        // only says that for sha/bytes (the very next clause: "对象 = 脱敏
-        // 后、本应写入 content 的字符串"); the title clause is separate and
-        // explicitly says 原文. Comparing redacted content against an
-        // unredacted title breaks exactly when it matters most: if the
-        // excluded row (and hence the title derived from it) contains a
-        // secret, redaction removes that secret substring from the
-        // right-hand side, the two no longer match, and the secret-bearing
-        // title is left un-cleared in the database. Comparing both sides
-        // unredacted also means this needs no `redaction_enabled()` check --
-        // there is nothing here for that switch to gate.
         let pre_redaction_content = conv.messages[idx].content.clone();
-        // SRC05B-07: the enabled-ness is stated by the caller here. The
-        // legacy transport passes the process-wide switch; the source-aware
-        // path passes `true`, because its own contract always desensitises.
         let marker = apply_with_redaction(
             &mut conv.messages[idx],
-            &decision,
+            &exclusion,
             &mut redactor,
             blob_relative_path,
             idx as u32,
@@ -20576,21 +19424,118 @@ fn judge_and_redact_reparsed(
             if idx == *hit_idx {
                 continue;
             }
-            if events.get(idx).map(|e| e.event_key.as_str()) == Some(marker.raw.event_key.as_str()) {
+            if events.get(idx).map(|e| e.event.event_key.as_str()) == Some(marker.raw.event_key.as_str()) {
                 apply_sibling(msg, marker, field_map);
             }
         }
     }
-    markers
+
+    // Whole-document `.json`/`.claude` Anthropic Messages API `role: "user"` turns
+    // can embed `{"type": "tool_result"}` blocks alongside user `{"type": "text"}`
+    // blocks in a single unsplit message (no sibling `role: "tool_result"` row).
+    // Evaluate each embedded `ToolResult` block through the exact same `recall_v2`
+    // judgment and redact matching blocks + `toolUseResult` copies inside `extra`,
+    // while keeping the user's prose intact.
+    for idx in 0..conv.messages.len() {
+        if conv.messages[idx].role != "user" {
+            continue;
+        }
+        let Some(blob_event) = events.get(idx) else { continue };
+        let embedded_results: Vec<crate::indexer::exclusion::RawBlock> = blob_event
+            .event
+            .blocks
+            .iter()
+            .filter(|b| b.kind == crate::indexer::exclusion::BlockKind::ToolResult)
+            .cloned()
+            .collect();
+        if embedded_results.is_empty() {
+            continue;
+        }
+        let has_sibling_tool_result_row = conv.messages.iter().enumerate().any(|(other_idx, m)| {
+            other_idx != idx
+                && m.role == "tool_result"
+                && events.get(other_idx).map(|e| e.event.event_key.as_str())
+                    == Some(blob_event.event.event_key.as_str())
+        });
+        if has_sibling_tool_result_row {
+            continue;
+        }
+        for blk in &embedded_results {
+            let Some(blk_body) = crate::indexer::exclusion::embedded_tool_result_body(
+                &blob_event.raw_record,
+                blk.index,
+            ) else {
+                continue;
+            };
+            let mut embedded_candidates = candidates[..idx].to_vec();
+            embedded_candidates.push(crate::indexer::exclusion::PairingCandidate::ToolResult {
+                tool_call_id: blk.tool_use_id.clone(),
+            });
+            let embedded_ctx = PairingContext::build(&embedded_candidates);
+            let mut synthetic_msg = conv.messages[idx].clone();
+            synthetic_msg.role = "tool_result".to_string();
+            synthetic_msg.content = blk_body.clone();
+            match crate::indexer::recall_v2::decide(
+                &synthetic_msg,
+                idx,
+                &blob_event.event,
+                &embedded_ctx,
+                &conv.agent_slug,
+                paths_cfg,
+            ) {
+                Outcome::Exclude(exclusion) => {
+                    let marker = apply_with_redaction(
+                        &mut synthetic_msg,
+                        &exclusion,
+                        &mut redactor,
+                        blob_relative_path,
+                        idx as u32,
+                        field_map,
+                        redaction_enabled,
+                    );
+                    crate::indexer::exclusion::apply_embedded_tool_result_extra(
+                        &mut conv.messages[idx],
+                        &marker,
+                        &blk_body,
+                        field_map,
+                    );
+                }
+                Outcome::Preserve(Some(reason)) => {
+                    *recall_uncovered.entry(reason.as_str().to_string()).or_insert(0) += 1;
+                }
+                Outcome::Preserve(None) => {}
+            }
+        }
+    }
+    (markers, recall_uncovered)
 }
 
 /// Shared by [`prepare_conversation_for_ingest`] and
-/// [`prepare_conversation_for_restore`] (T2b.2, control-plane approved
-/// 2026-09-07): the event/message-count alignment self-check that guards
-/// [`judge_and_redact_reparsed`] was previously inlined only in the ingest
-/// path. Extracted here so restore's reparse-then-judge step gets the same
-/// `EVENT_ALIGN_FAILED` accounting (宁漏勿误) instead of a second,
-/// independently-maintained copy of the same three lines.
+/// [`prepare_conversation_for_restore`]: runs the alignment guard and v2
+/// judgment over [`BlobEvent`]s, returning both exclusion markers and bounded
+/// uncovered-recall diagnostics.
+pub(crate) fn judge_reparsed_blob_events_with_redaction(
+    conv: &mut NormalizedConversation,
+    events: &[crate::indexer::exclusion::BlobEvent],
+    blob_relative_path: &str,
+    paths_cfg: &crate::sources::config::ExcludedContextPaths,
+    redaction_enabled: bool,
+) -> (Vec<Option<crate::indexer::exclusion::ExcludedMarker>>, BTreeMap<String, u64>) {
+    if conv.agent_slug == "codex" && conv.messages.first().map(|m| m.role.as_str()) == Some("user") {
+        record_codex_idx0_user_candidate();
+    }
+    if !crate::indexer::exclusion::structural_facts_available(&conv.agent_slug) {
+        return (vec![None; conv.messages.len()], BTreeMap::new());
+    }
+    if events.len() == conv.messages.len() {
+        judge_and_redact_reparsed(conv, events, blob_relative_path, paths_cfg, redaction_enabled)
+    } else {
+        record_event_align_failed();
+        record_event_align_failure(conv, events.len());
+        (vec![None; conv.messages.len()], BTreeMap::new())
+    }
+}
+
 pub(crate) fn judge_reparsed_conversation(
     conv: &mut NormalizedConversation,
     events: &[crate::indexer::exclusion::RawEvent],
@@ -20614,39 +19559,22 @@ pub(crate) fn judge_reparsed_conversation_with_redaction(
     paths_cfg: &crate::sources::config::ExcludedContextPaths,
     redaction_enabled: bool,
 ) -> Vec<Option<crate::indexer::exclusion::ExcludedMarker>> {
-    // R1-N16 (任务书 #118b): meta 三键之二（mission #116⑥）候选总数在这里
-    // 计，与 `events`/`conv.messages` 是否对齐无关（分母不应因为对齐失败而
-    // 缩水）——候选口径与 R3 锚点定义一致（`agent_slug=="codex" && idx==0 &&
-    // role=="user"`），只有 idx 0 能匹配，故直接判第一条消息而不整段循环。
-    if conv.agent_slug == "codex" && conv.messages.first().map(|m| m.role.as_str()) == Some("user") {
-        record_codex_idx0_user_candidate();
-    }
-    // R1-N16 (任务书 #118b): connectors with no exclusion-judgment support
-    // at all (`events_from_blob` returns `Vec::new()` for anything but
-    // claude_code/codex) always have `events.len() == 0`; comparing that
-    // against a non-empty `conv.messages.len()` below would count every
-    // such session as an alignment *failure*, which is a narrower, real
-    // thing this counter tracks (a claude_code/codex session whose events
-    // genuinely don't line up with its messages) -- not "this connector
-    // doesn't have structural facts to align in the first place".
-    if !crate::indexer::exclusion::structural_facts_available(&conv.agent_slug) {
-        return vec![None; conv.messages.len()];
-    }
-    // T2b R1 (control-plane 裁定): events_from_blob's alignment is a
-    // disclosed positional approximation (see events_from_blob's own doc
-    // comment) -- when the flat event count doesn't even match the
-    // reparsed message count, positional indexing can't be trusted at
-    // all for this session, so skip judgment entirely (宁漏勿误: no
-    // exclusion rather than a wrong one) instead of silently judging
-    // against misaligned events.
-    if events.len() == conv.messages.len() {
-        judge_and_redact_reparsed(conv, events, blob_relative_path, paths_cfg, redaction_enabled)
-    } else {
-        record_event_align_failed();
-        // R2-N7 (任务书 #129): name the session, not just count it.
-        record_event_align_failure(conv, events.len());
-        vec![None; conv.messages.len()]
-    }
+    let blob_events: Vec<crate::indexer::exclusion::BlobEvent> = events
+        .iter()
+        .cloned()
+        .map(|event| crate::indexer::exclusion::BlobEvent {
+            event,
+            raw_record: serde_json::Value::Null,
+        })
+        .collect();
+    judge_reparsed_blob_events_with_redaction(
+        conv,
+        &blob_events,
+        blob_relative_path,
+        paths_cfg,
+        redaction_enabled,
+    )
+    .0
 }
 
 /// `connector` is the *same* connector instance the caller already used for
@@ -20992,13 +19920,16 @@ fn prepare_conversation_for_ingest(
             outcome.excluded
         } else {
             let events =
-                crate::indexer::exclusion::events_from_blob(&reparsed.agent_slug, &materialized);
-            judge_reparsed_conversation(
+                crate::indexer::exclusion::blob_events_from_blob(&reparsed.agent_slug, &materialized);
+            let (markers, uncovered) = judge_reparsed_blob_events_with_redaction(
                 &mut reparsed,
                 &events,
                 &record.blob_relative_path,
                 &paths_cfg,
-            )
+                crate::indexer::redact_secrets::redaction_enabled(),
+            );
+            recall_uncovered = uncovered;
+            markers
         };
 
         conv = reparsed;
@@ -21098,16 +20029,22 @@ pub(crate) fn prepare_conversation_for_restore(
         apply_workspace_rewrite(&mut conv, root);
     }
 
-    let excluded = if consumed_manifest.manifest_relative_path.is_empty() {
-        vec![None; conv.messages.len()]
+    let (excluded, recall_uncovered) = if consumed_manifest.manifest_relative_path.is_empty() {
+        (vec![None; conv.messages.len()], BTreeMap::new())
     } else {
         // 任务书 #118b N8 同口径 (#119b 收口, R2-B6): 恢复侧与摄入侧共用同一份
         // 操作者配置，坏配置必须让整条恢复失败，不能静默退回内置默认清单。
         let paths_cfg = crate::sources::config::ExcludedContextPaths::load().map_err(|e| {
             PrepareError(format!("excluded_context_paths.toml 加载失败（不回退内置默认清单）: {e:#}"))
         })?;
-        let events = crate::indexer::exclusion::events_from_blob(&conv.agent_slug, materialized);
-        judge_reparsed_conversation(&mut conv, &events, &consumed_manifest.blob_relative_path, &paths_cfg)
+        let events = crate::indexer::exclusion::blob_events_from_blob(&conv.agent_slug, materialized);
+        judge_reparsed_blob_events_with_redaction(
+            &mut conv,
+            &events,
+            &consumed_manifest.blob_relative_path,
+            &paths_cfg,
+            crate::indexer::redact_secrets::redaction_enabled(),
+        )
     };
 
     compact_large_connector_extras_for_size(connector_name, &mut conv, Some(sealed_source_size_bytes));
@@ -21123,7 +20060,7 @@ pub(crate) fn prepare_conversation_for_restore(
     Ok(crate::indexer::exclusion::PreparedConversation {
         conv,
         excluded,
-        recall_uncovered_by_reason: BTreeMap::new(),
+        recall_uncovered_by_reason: recall_uncovered,
     })
 }
 
@@ -21214,10 +20151,19 @@ fn capture_discovered_source_file_before_parse(
         return;
     }
 
+    let raw_mirror_provider = if source.provider_slug.is_empty() {
+        if provider == "claude" {
+            "claude_code"
+        } else {
+            provider
+        }
+    } else {
+        source.provider_slug.as_str()
+    };
     match crate::raw_mirror::capture_source_file_with_identity(
         crate::raw_mirror::RawMirrorCaptureInput {
             data_dir,
-            provider,
+            provider: raw_mirror_provider,
             source_id: &source.origin.source_id,
             origin_kind: source.origin.kind.as_str(),
             origin_host: source.origin.host.as_deref(),
@@ -21253,43 +20199,6 @@ fn capture_discovered_source_file_before_parse(
                 "failed to capture discovered provider source into raw mirror before connector parse"
             );
         }
-    }
-}
-
-/// Prepare the run's fixed safety configuration exactly once.
-///
-/// Task 19: the slot belongs to `run_index` and lives as long as the run. The
-/// first branch that really ingests fills it; every later branch clones the
-/// same `Arc` and never re-discovers the live configuration. An empty slot
-/// means no branch has prepared it yet -- it does not mean "no configuration".
-fn ensure_run_source_safety(
-    opts: &IndexOptions,
-    slot: &mut Option<Arc<source_ingest::FixedSafetyConfig>>,
-) -> Result<Arc<source_ingest::FixedSafetyConfig>> {
-    if let Some(existing) = slot.as_ref() {
-        return Ok(Arc::clone(existing));
-    }
-    let prepared = source_ingest::prepare_source_safety(
-        &opts.data_dir,
-        opts.source_safety_config.as_deref(),
-    )
-    .map_err(|error| anyhow::anyhow!("{error}"))?;
-    *slot = Some(Arc::clone(&prepared));
-    Ok(prepared)
-}
-
-/// Load the caller-supplied fixed safety configuration, when one was given.
-///
-/// A misconfigured copy is a startup failure, not something to discover at the
-/// first discovered file: the operator learns before any index work runs.
-fn load_source_safety(
-    opts: &IndexOptions,
-) -> Result<Option<Arc<source_ingest::FixedSafetyConfig>>> {
-    match &opts.source_safety_config {
-        None => Ok(None),
-        Some(path) => source_ingest::load_fixed_safety_config(path)
-            .map(|config| Some(Arc::new(config)))
-            .map_err(|error| anyhow::anyhow!("{error}")),
     }
 }
 
@@ -21422,10 +20331,15 @@ fn capture_scan_root_file_before_parse(
     ) {
         return;
     }
+    let raw_mirror_provider = if provider == "claude" {
+        "claude_code"
+    } else {
+        provider
+    };
     match crate::raw_mirror::capture_source_file_with_identity(
         crate::raw_mirror::RawMirrorCaptureInput {
             data_dir,
-            provider,
+            provider: raw_mirror_provider,
             source_id: &root.origin.source_id,
             origin_kind: root.origin.kind.as_str(),
             origin_host: root.origin.host.as_deref(),
@@ -21821,6 +20735,13 @@ pub mod persist {
     /// touched, on the `cass::scan_session` target. Until now the only
     /// per-session evidence was aggregate counters, so "which session went
     /// missing" needed a DB diff. `bytes` is the source file size.
+    /// Connectors whose Plan-A ingest path runs v2 recall judgment and reports
+    /// bounded `recall_uncovered_by_reason` diagnostics on both batch and
+    /// resident scan_session outputs.
+    pub(super) fn reports_recall_uncovered(agent_slug: &str) -> bool {
+        matches!(agent_slug, "claude_code" | "codex" | "pi_agent")
+    }
+
     fn emit_scan_session(
         agent_slug: &str,
         external_id: Option<&str>,
@@ -21831,10 +20752,7 @@ pub mod persist {
         let bytes = std::fs::metadata(source_path)
             .map(|meta| meta.len())
             .unwrap_or(0);
-        // Ticket 02: a Pi line also carries the uncovered diagnostics for
-        // that one conversation. A refused Pi conversation counts zero, and
-        // no other connector's line gains a field.
-        if agent_slug == "pi_agent" {
+        if reports_recall_uncovered(agent_slug) {
             let empty = BTreeMap::new();
             let uncovered = match outcome {
                 ScanSessionOutcome::Error => &empty,
@@ -23106,7 +22024,7 @@ pub mod persist {
             let Some(prepared) = convs.get(*index) else {
                 continue;
             };
-            let uncovered = (prepared.conv.agent_slug == "pi_agent"
+            let uncovered = (reports_recall_uncovered(&prepared.conv.agent_slug)
                 && *result != ScanSessionOutcome::Error)
                 .then_some(&prepared.recall_uncovered_by_reason);
             if let Some(uncovered) = uncovered {
@@ -24718,7 +23636,6 @@ pub mod persist {
                 embedder: "fnv1a-384".to_string(),
                 progress: None,
                 watch_interval_secs: 30,
-                source_safety_config: None,
             }
         }
 
@@ -26440,7 +25357,6 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
         run_index(opts, None)?;
 
@@ -26819,7 +25735,7 @@ mod tests {
             // criterion plays no part here.
             watermark: None,
             file_states: std::collections::HashMap::new(),
-            source_evidence: HashSet::new(),
+            legacy_unfinished_source_locators: HashSet::new(),
             ownership: None,
         };
         let connector = SilentDiscoveryConnector {
@@ -26849,8 +25765,6 @@ mod tests {
                 parsed.push(conversation.source_path.clone());
                 Ok(())
             },
-            None,
-            None,
         );
 
         assert!(
@@ -26938,7 +25852,7 @@ mod tests {
                 .iter()
                 .map(|(relative, size, mtime)| ((*relative).to_string(), (*size, *mtime)))
                 .collect(),
-            source_evidence: HashSet::new(),
+            legacy_unfinished_source_locators: HashSet::new(),
             ownership: None,
         }
     }
@@ -27024,8 +25938,6 @@ mod tests {
             &[],
             &active_filter,
             &mut |_root, _meta, _conversation| Ok(()),
-            None,
-            None,
         );
         assert!(
             fatal.is_none(),
@@ -28109,7 +27021,6 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let mutations = run_batch_index_with_connector_factories(
@@ -28123,7 +27034,6 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
-            None,
         )
         .expect("failed scan should not abort batch indexing");
         *FAILING_EXPLICIT_FILE_ROOT
@@ -33090,7 +32000,6 @@ mod tests {
                 progress: None,
                 watch_once_paths: None,
                 watch_interval_secs: 30,
-                source_safety_config: None,
             },
             None,
         );
@@ -33180,7 +32089,6 @@ mod tests {
                 progress: None,
                 watch_once_paths: None,
                 watch_interval_secs: 30,
-                source_safety_config: None,
             },
             None,
         );
@@ -33239,7 +32147,6 @@ mod tests {
                 embedder: "fastembed".to_string(),
                 progress: Some(std::sync::Arc::clone(&progress)),
                 watch_interval_secs: 30,
-                source_safety_config: None,
             },
             None,
         );
@@ -33302,7 +32209,6 @@ mod tests {
                 progress: None,
                 watch_once_paths: None,
                 watch_interval_secs: 30,
-                source_safety_config: None,
             },
             None,
         );
@@ -33370,7 +32276,6 @@ mod tests {
                 progress: None,
                 watch_once_paths: None,
                 watch_interval_secs: 30,
-                source_safety_config: None,
             },
             None,
         );
@@ -33444,7 +32349,6 @@ mod tests {
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
         // `run_index(watch=true)` blocks forever inside `watch_sources`'s
         // long-lived loop if the startup-scan failure does NOT short-circuit
@@ -33526,7 +32430,6 @@ mod tests {
                 progress: None,
                 watch_once_paths: None,
                 watch_interval_secs: 30,
-                source_safety_config: None,
             },
             None,
         );
@@ -33606,7 +32509,6 @@ mod tests {
                 progress: None,
                 watch_once_paths: None,
                 watch_interval_secs: 30,
-                source_safety_config: None,
             },
             None,
         )
@@ -35067,7 +33969,6 @@ mod tests {
                 full_scan_source_ids: Arc::new(HashSet::new()),
                 local_root_plans: Arc::new(HashMap::new()),
                 scan_roots_meta: Arc::new(crate::indexer::scan_root_meta::ScanRootMetaIndex::new()),
-                source_safety: None,
                 progress: Some(progress.clone()),
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
@@ -35136,7 +34037,6 @@ mod tests {
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let mutations = run_streaming_index_with_connector_factories(
@@ -35154,7 +34054,6 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
-            None,
         )
         .context(
             "configured remote roots should scan from the root despite the global watermark",
@@ -35223,7 +34122,6 @@ mod tests {
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let mutations = run_streaming_index_with_connector_factories(
@@ -35237,7 +34135,6 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
-            None,
         )
         .context("configured local roots should keep the connector incremental watermark")?;
 
@@ -35271,7 +34168,6 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let error = run_streaming_index_with_connector_factories(
@@ -35285,7 +34181,6 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
-            None,
         )
         .expect_err("producer panic should abort streaming indexing");
         let message = error.to_string();
@@ -35337,7 +34232,6 @@ mod tests {
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let mutations = run_batch_index_with_connector_factories(
@@ -35355,7 +34249,6 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
-            None,
         )
         .context(
             "configured remote roots should scan from the root despite the global watermark",
@@ -35425,7 +34318,6 @@ mod tests {
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let mutations = run_batch_index_with_connector_factories(
@@ -35439,7 +34331,6 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
-            None,
         )
         .context("configured local roots should keep the connector incremental watermark")?;
 
@@ -35481,7 +34372,6 @@ mod tests {
                 embedder: String::from("fastembed"),
                 progress: Some(progress.clone()),
                 watch_interval_secs: 30,
-                source_safety_config: None,
             };
 
             let mutations = run_batch_index_with_connector_factories(
@@ -35495,7 +34385,6 @@ mod tests {
                 FrankenStorage::now_millis(),
                 None,
                 &SharedActiveSessionSourceSkips::default(),
-                None,
             )?;
 
             assert_eq!(
@@ -35566,7 +34455,6 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let mutations = run_batch_index_with_connector_factories(
@@ -35580,7 +34468,6 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
-            None,
         )
         // W2-6 Task丙续: message updated to the DB-domain framing (see the
         // sibling streaming test's rationale).
@@ -35657,7 +34544,6 @@ mod tests {
                 full_scan_source_ids: Arc::new(HashSet::new()),
                 local_root_plans: Arc::new(HashMap::new()),
                 scan_roots_meta: Arc::new(crate::indexer::scan_root_meta::ScanRootMetaIndex::new()),
-                source_safety: None,
                 progress: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
@@ -35729,7 +34615,6 @@ mod tests {
                 full_scan_source_ids: Arc::new(HashSet::new()),
                 local_root_plans: Arc::new(HashMap::new()),
                 scan_roots_meta: Arc::new(crate::indexer::scan_root_meta::ScanRootMetaIndex::new()),
-                source_safety: None,
                 progress: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
@@ -36839,7 +35724,6 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         }
     }
 
@@ -37426,7 +36310,6 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
         let state = Mutex::new(HashMap::new());
@@ -37500,7 +36383,6 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
         let storage = FrankenStorage::open(&data_dir.join("agent_search.db")).unwrap();
         let state = Mutex::new(HashMap::new());
@@ -37587,7 +36469,6 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         run_index(opts(&data_dir, &session), None).unwrap();
@@ -37661,7 +36542,6 @@ normalization="l2"
             embedder: "watch-test".to_string(),
             progress: Some(progress),
             watch_interval_secs: 30,
-            source_safety_config: None,
         }
     }
 
@@ -37730,7 +36610,6 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
         run_index(seed_opts, None)?;
 
@@ -37793,7 +36672,6 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
         run_index(force_rebuild_opts, None)?;
 
@@ -37901,7 +36779,6 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
         run_index(seed_opts, None)?;
 
@@ -37936,7 +36813,6 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
         run_index(full_opts, None)?;
 
@@ -38015,7 +36891,6 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
         run_index(seed_opts, None)?;
 
@@ -38053,7 +36928,6 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
         run_index(full_opts, None)?;
 
@@ -38466,7 +37340,6 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         // Manually set up dependencies for reindex_paths
@@ -38555,7 +37428,6 @@ normalization="l2"
             progress: Some(progress.clone()),
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -38641,7 +37513,6 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -38710,7 +37581,6 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -38836,7 +37706,6 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -38949,7 +37818,6 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -39028,7 +37896,6 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -39111,7 +37978,6 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -39200,7 +38066,6 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -39291,7 +38156,6 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -39440,7 +38304,6 @@ normalization="l2"
             progress: Some(progress.clone()),
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -39514,7 +38377,6 @@ normalization="l2"
             progress: None,
             watch_once_paths: Some(vec![amp_file.clone()]),
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -39608,7 +38470,6 @@ normalization="l2"
             progress: None,
             watch_once_paths: Some(vec![amp_file.clone()]),
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -39693,7 +38554,6 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -39820,7 +38680,6 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -39935,7 +38794,6 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -39990,7 +38848,6 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -40076,7 +38933,6 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -40146,7 +39002,6 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -40219,7 +39074,6 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -40245,7 +39099,6 @@ normalization="l2"
                 &opts,
                 &guard,
                 &[(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))],
-                false,
             )
             .unwrap()
         };
@@ -40266,7 +39119,6 @@ normalization="l2"
                 &opts,
                 &guard,
                 &[(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))],
-                false,
             )
             .unwrap()
         };
@@ -40277,7 +39129,7 @@ normalization="l2"
 
         let startup_skip = {
             let guard = storage.lock().unwrap();
-            can_skip_unchanged_explicit_watch_once_index_run(&opts, &guard, false).unwrap()
+            can_skip_unchanged_explicit_watch_once_index_run(&opts, &guard).unwrap()
         };
         assert!(
             startup_skip,
@@ -40343,7 +39195,6 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -41899,6 +40750,288 @@ normalization="l2"
         let (_hits, codex_idx0_user_total, event_align_failed) = last_index_run_counters_snapshot();
         assert_eq!(event_align_failed, 0, "a connector with no exclusion-judgment support must not count as an alignment failure");
         assert_eq!(codex_idx0_user_total, 0, "non-codex sessions must not bump the codex-specific denominator");
+    }
+
+    #[test]
+    fn judge_reparsed_blob_events_applies_recall_v2_for_claude_bash_codex_exec_and_multiline_json() {
+        use crate::connectors::{
+            Connector, ScanContext, ScanRoot,
+            claude_code::ClaudeCodeConnector, codex::CodexConnector,
+        };
+        use franken_agent_detection::NormalizedInvocation;
+        use crate::indexer::exclusion::blob_events_from_blob;
+
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let envelope = crate::recall_output::encode(
+            crate::recall_output::RecallTool::Search,
+            &serde_json::json!({
+                "hits": [{
+                    "source_id": "local",
+                    "source_path": "/tmp/prior.jsonl",
+                    "line_number": 7,
+                    "snippet": "sentinel-plan-a-v2-body"
+                }]
+            }),
+        )
+        .unwrap();
+
+        // 1) Claude Bash direct CLI recall + object-form toolUseResult.stdout
+        let dir = TempDir::new().unwrap();
+        let claude_proj = dir.path().join(".claude").join("projects").join("p1");
+        std::fs::create_dir_all(&claude_proj).unwrap();
+        let claude_bash = claude_proj.join("bash-recall.jsonl");
+        let call_line = serde_json::json!({
+            "uuid": "c-1",
+            "type": "assistant",
+            "timestamp": "2026-11-22T01:00:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "tu-bash",
+                    "name": "Bash",
+                    "input": {"command": "cass search \"alpha\" --json"}
+                }]
+            }
+        });
+        let result_line = serde_json::json!({
+            "uuid": "c-2",
+            "type": "user",
+            "timestamp": "2026-11-22T01:00:01Z",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tu-bash",
+                    "content": envelope
+                }]
+            },
+            "toolUseResult": {
+                "stdout": envelope,
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false
+            }
+        });
+        std::fs::write(&claude_bash, format!("{call_line}\n{result_line}\n")).unwrap();
+        let ctx = ScanContext::with_roots(
+            dir.path().join(".claude"),
+            vec![ScanRoot::local(claude_bash.clone())],
+            None,
+        );
+        let mut conv = ClaudeCodeConnector::new().scan(&ctx).unwrap().remove(0);
+        let events = blob_events_from_blob("claude_code", &claude_bash);
+        assert_eq!(events.len(), conv.messages.len());
+        let (markers, uncovered) = judge_reparsed_blob_events_with_redaction(
+            &mut conv,
+            &events,
+            "blobs/blake3/ab/bash.raw",
+            &paths_cfg,
+            true,
+        );
+        let marker = markers[1].as_ref().expect("Claude Bash CLI recall must be excluded under v2");
+        assert_eq!(marker.rule_version, 2);
+        assert!(uncovered.is_empty());
+        assert!(conv.messages[1].content.is_empty());
+        assert_eq!(conv.messages[1].extra["toolUseResult"]["stdout"]["redacted"], true);
+        assert_eq!(conv.messages[1].extra["toolUseResult"]["interrupted"], false);
+        assert!(
+            !serde_json::to_string(&conv.messages[1].extra)
+                .unwrap()
+                .contains("sentinel-plan-a-v2-body")
+        );
+
+        // 2) Codex exec custom_tool_call recall via BlobEvent.raw_record + bare cass_search uncovered diagnostic
+        let codex_dir = dir.path().join("sessions").join("2026").join("11").join("22");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let codex_file = codex_dir.join("rollout-2026-11-22T01-00-00-exec.jsonl");
+        let exec_app = serde_json::json!({
+            "exit_code": 0,
+            "output": envelope,
+            "wall_time_seconds": 0.25,
+            "chunk_id": "c1"
+        });
+        let codex_lines = [
+            serde_json::json!({
+                "timestamp": "2026-11-22T01:00:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "call-exec-1",
+                    "name": "exec",
+                    "input": "text(await tools.exec_command({\"cmd\":\"cass search \\\"alpha\\\" --recall\"}));"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-11-22T01:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-exec-1",
+                    "output": [
+                        {"type": "input_text", "text": "Script completed\nWall time 0.25 seconds\nOutput:"},
+                        {"type": "input_text", "text": exec_app.to_string()}
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-11-22T01:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "call-bare-1",
+                    "name": "cass_search",
+                    "arguments": "{\"query\":\"plain\"}"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-11-22T01:00:03Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-bare-1",
+                    "output": "{\"hits\":[{\"source_id\":\"local\",\"source_path\":\"/tmp/x.jsonl\"}]}"
+                }
+            }),
+        ];
+        std::fs::write(
+            &codex_file,
+            codex_lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let codex_ctx = ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![ScanRoot::local(codex_file.clone())],
+            None,
+        );
+        let mut codex_conv = CodexConnector::new().scan(&codex_ctx).unwrap().remove(0);
+        let codex_events = blob_events_from_blob("codex", &codex_file);
+        assert_eq!(codex_events.len(), codex_conv.messages.len());
+        let (codex_markers, codex_uncovered) = judge_reparsed_blob_events_with_redaction(
+            &mut codex_conv,
+            &codex_events,
+            "blobs/blake3/ab/codex.raw",
+            &paths_cfg,
+            true,
+        );
+        let exec_marker = codex_markers[1].as_ref().expect("Codex exec recall must be excluded under v2");
+        assert_eq!(exec_marker.rule_version, 2);
+        assert!(codex_conv.messages[1].content.is_empty());
+        assert!(
+            !serde_json::to_string(&codex_conv.messages[1].extra)
+                .unwrap()
+                .contains("sentinel-plan-a-v2-body")
+        );
+        assert!(codex_markers[3].is_none(), "bare cass_search without C04 envelope must be preserved under v2");
+        assert_eq!(codex_uncovered.get("ambiguous_tool_identity").copied(), Some(1));
+
+        // 3) Multi-line .json Claude session recall cleaned in both content and extra
+        let claude_json = claude_proj.join("multiline-recall.json");
+        let pretty = serde_json::to_string_pretty(&serde_json::json!({
+            "sessionId": "multiline-json-recall",
+            "messages": [
+                {
+                    "id": "jm0",
+                    "role": "tool_call",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "tu-json",
+                        "name": "mcp__cass-mcp__cass_search",
+                        "input": {"query": "alpha"}
+                    }]
+                },
+                {
+                    "id": "jm1",
+                    "role": "tool_result",
+                    "tool_call_id": "tu-json",
+                    "content": envelope
+                }
+            ]
+        }))
+        .unwrap();
+        std::fs::write(&claude_json, pretty).unwrap();
+        let json_ctx = ScanContext::with_roots(
+            dir.path().join(".claude"),
+            vec![ScanRoot::local(claude_json.clone())],
+            None,
+        );
+        let mut json_conv = ClaudeCodeConnector::new().scan(&json_ctx).unwrap().remove(0);
+        // Ensure invocation carries the call_id cleanly for pairing
+        assert_eq!(
+            json_conv.messages[0].invocations.first(),
+            Some(&NormalizedInvocation {
+                kind: "tool".to_string(),
+                name: "mcp__cass-mcp__cass_search".to_string(),
+                raw_name: None,
+                call_id: Some("tu-json".to_string()),
+                arguments: Some(serde_json::json!({"query": "alpha"})),
+            })
+        );
+        let json_events = blob_events_from_blob("claude_code", &claude_json);
+        assert_eq!(json_events.len(), json_conv.messages.len());
+        let (json_markers, _) = judge_reparsed_blob_events_with_redaction(
+            &mut json_conv,
+            &json_events,
+            "blobs/blake3/ab/json.raw",
+            &paths_cfg,
+            true,
+        );
+        let json_marker = json_markers[1].as_ref().expect("multi-line .json Claude recall must be excluded");
+        assert_eq!(json_marker.rule_version, 2);
+        assert!(json_conv.messages[1].content.is_empty());
+        assert_eq!(json_conv.messages[1].extra["content"]["redacted"], true);
+        assert!(
+            !serde_json::to_string(&json_conv.messages[1].extra)
+                .unwrap()
+                .contains("sentinel-plan-a-v2-body")
+        );
+    }
+
+    #[test]
+    fn reports_recall_uncovered_folds_claude_codex_and_pi_and_skips_other_agents() {
+        use crate::indexer::exclusion::PreparedConversation;
+
+        assert!(persist::reports_recall_uncovered("claude_code"));
+        assert!(persist::reports_recall_uncovered("codex"));
+        assert!(persist::reports_recall_uncovered("pi_agent"));
+        assert!(!persist::reports_recall_uncovered("opencode"));
+        assert!(!persist::reports_recall_uncovered("gemini"));
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("uncovered.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        let make_prepared = |agent: &str, ext: &str, reason: &str, count: u64| {
+            let mut conv = norm_conv(Some(ext), vec![norm_msg(0, 100)]);
+            conv.agent_slug = agent.to_string();
+            let mut map = BTreeMap::new();
+            map.insert(reason.to_string(), count);
+            PreparedConversation {
+                conv,
+                excluded: vec![None],
+                recall_uncovered_by_reason: map,
+            }
+        };
+
+        let batch = vec![
+            make_prepared("claude_code", "cc-1", "unsupported_shell", 2),
+            make_prepared("codex", "cx-1", "ambiguous_tool_identity", 3),
+            make_prepared("pi_agent", "pi-1", "invalid_recall_format", 1),
+            make_prepared("opencode", "oc-1", "unpaired_result", 5),
+        ];
+
+        let outcome = persist::persist_conversations_batched_with_raw_mirror_links(
+            &storage,
+            dir.path(),
+            &batch,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+        )
+        .unwrap();
+        assert_eq!(outcome.recall_uncovered_by_reason.get("unsupported_shell").copied(), Some(2));
+        assert_eq!(outcome.recall_uncovered_by_reason.get("ambiguous_tool_identity").copied(), Some(3));
+        assert_eq!(outcome.recall_uncovered_by_reason.get("invalid_recall_format").copied(), Some(1));
+        assert_eq!(outcome.recall_uncovered_by_reason.get("unpaired_result"), None);
     }
 
     #[test]
@@ -43804,327 +42937,14 @@ normalization="l2"
     /// what the streaming producer's `deliver_source_input` does -- and the
     /// root must come back failed, with the disconnect as the fatal error and
     /// no file claimed as handed over.
-    #[test]
-    fn source_root_scan_stops_when_the_consumer_is_gone() {
-        let temp = TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("data");
-        std::fs::create_dir_all(&data_dir).expect("mkdir data");
-        let projects = temp.path().join("home/.claude/projects/proj");
-        std::fs::create_dir_all(&projects).expect("mkdir projects");
-        let session = projects.join("session.jsonl");
-        let body = format!(
-            "{}\n{}\n",
-            serde_json::json!({
-                "parentUuid": null,
-                "cwd": "/synthetic/project",
-                "sessionId": "sess-disconnect",
-                "version": "2.0.37",
-                "type": "user",
-                "message": {"role": "user", "content": "synthetic disconnect question"},
-                "uuid": "sess-disconnect-user",
-                "timestamp": "2026-01-01T00:00:00.000Z"
-            }),
-            serde_json::json!({
-                "parentUuid": "sess-disconnect-user",
-                "cwd": "/synthetic/project",
-                "sessionId": "sess-disconnect",
-                "version": "2.0.37",
-                "type": "assistant",
-                "message": {
-                    "model": "claude-opus-4",
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "synthetic disconnect answer"}]
-                },
-                "uuid": "sess-disconnect-assistant",
-                "timestamp": "2026-01-01T00:00:01.000Z"
-            })
-        );
-        std::fs::write(&session, body).expect("write session");
-
-        let copy = temp.path().join("fixed-safety.toml");
-        std::fs::write(
-            &copy,
-            include_bytes!("../../config/excluded_context_paths.toml"),
-        )
-        .expect("write the fixed safety copy");
-        let safety = Arc::new(
-            source_ingest::load_fixed_safety_config(&copy).expect("load the fixed copy"),
-        );
-
-        let projects_root = temp.path().join("home/.claude/projects");
-        let root = ScanRoot::local(projects_root.clone());
-        let plan = LocalRootPlan {
-            root: root.clone(),
-            meta: scan_root_meta::ScanRootMeta {
-                root_id: scan_root_meta::home_root_id("claude", &projects_root),
-                origin_host: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
-                readonly: false,
-                canonical_path: projects_root,
-                source_name: scan_root_meta::HOME_SOURCE_NAME.to_string(),
-                watermarks_enabled: true,
-                mirror_root: false,
-            },
-            // No watermark: the whole root is enumerated, so a candidate is
-            // always handed over and the sink is always reached.
-            watermark: None,
-            file_states: HashMap::new(),
-            source_evidence: HashSet::new(),
-            ownership: None,
-        };
-
-        let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
-        let (tx, rx) = bounded::<IndexMessage>(STREAMING_CHANNEL_SIZE);
-        drop(rx);
-        let mut sink = |job: source_ingest::SourceInputJob| -> Result<()> {
-            tx.send(IndexMessage::SourceInput {
-                connector_name: "claude",
-                job: Box::new(job),
-                byte_reservation: 0,
-            })
-            .map_err(|_| {
-                anyhow::Error::new(StreamingConsumerDisconnected { connector_name: "claude" })
-            })
-        };
-
-        let filter = ActiveSessionSourceFilter::default();
-        let (outcome, fatal) = run_local_root_scan(
-            &connector,
-            "claude",
-            &data_dir,
-            &plan,
-            &[],
-            &filter,
-            &mut |_root, _meta, _conversation| Ok(()),
-            Some(&safety),
-            Some(&mut sink),
-        );
-
-        assert!(
-            !outcome.succeeded,
-            "a root whose consumer is gone is not a clean scan: {outcome:?}"
-        );
-        let fatal = fatal.expect("the disconnect is the callback's fatal error");
-        assert!(
-            is_streaming_consumer_disconnected(&fatal),
-            "the fatal error is the consumer disconnect itself: {fatal:?}"
-        );
-        assert!(
-            outcome.files.is_empty() && outcome.discovered_paths.is_empty(),
-            "a failed root claims neither a file list nor a complete enumeration: {outcome:?}"
-        );
-        assert!(
-            outcome.watermarks_enabled,
-            "the wrapper still stamps the root's own watermark flag: {outcome:?}"
-        );
-    }
-
-    /// Sorted manifest file names in `data_dir`'s raw mirror. A capture under a
-    /// different session key produces a *different* manifest id, so comparing
-    /// these is a claim about identity rather than about a count.
-    fn mirror_manifest_ids(data_dir: &Path) -> Vec<String> {
-        let manifest_root = data_dir.join("raw-mirror/v1/manifests");
-        let Ok(entries) = std::fs::read_dir(&manifest_root) else {
-            return Vec::new();
-        };
-        let mut ids: Vec<String> = entries
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .collect();
-        ids.sort();
-        ids
-    }
-
-    /// A synthetic Claude Code session, the smallest one the connector parses
-    /// into a conversation.
-    fn synthetic_claude_session(id: &str, question: &str, answer: &str) -> String {
-        format!(
-            "{}\n{}\n",
-            serde_json::json!({
-                "parentUuid": null,
-                "cwd": "/synthetic/project",
-                "sessionId": id,
-                "version": "2.0.37",
-                "type": "user",
-                "message": {"role": "user", "content": question},
-                "uuid": format!("{id}-user"),
-                "timestamp": "2026-01-01T00:00:00.000Z"
-            }),
-            serde_json::json!({
-                "parentUuid": format!("{id}-user"),
-                "cwd": "/synthetic/project",
-                "sessionId": id,
-                "version": "2.0.37",
-                "type": "assistant",
-                "message": {
-                    "model": "claude-opus-4",
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": answer}]
-                },
-                "uuid": format!("{id}-assistant"),
-                "timestamp": "2026-01-01T00:00:01.000Z"
-            })
-        )
-    }
-
-    /// R3 (ruling fe72d5a7, 原料捕获身份): the reverse direction is clean too.
-    ///
-    /// `run_local_root_scan` has two branches -- the source-aware one that
-    /// seals and proves an input, and the legacy one that projects a
-    /// conversation and captures the file before parsing it. A tree the source
-    /// branch has already sealed must survive a pass through the legacy branch
-    /// unchanged, because both capture a file under the *same* raw-mirror
-    /// session identity: the legacy constant, not the declaration's namespace.
-    /// Were they different, the second pass would refuse the capture
-    /// (`E-MANIFEST-SESSION-KEY-CONFLICT`) instead of merging it.
-    ///
-    /// The legacy pass here is the real one -- `(None, None)`: no safety
-    /// configuration and no source sink -- over the same root the source pass
-    /// just sealed, so its own scan and its own pre-parse capture both run.
-    /// This is the second half of r3, which used to drive a second CLI process
-    /// for it; it lives here because what it pins is the two branches of this
-    /// function, not a CLI contract.
-    #[test]
-    fn source_then_legacy_capture_identity_stays() {
-        let temp = TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("data");
-        std::fs::create_dir_all(&data_dir).expect("mkdir data");
-        let projects_root = temp.path().join("home/.claude/projects");
-        let session = projects_root.join("proj/session.jsonl");
-        std::fs::create_dir_all(session.parent().expect("session parent"))
-            .expect("mkdir session dir");
-        std::fs::write(
-            &session,
-            synthetic_claude_session("sess-reverse", "the reverse question", "the reverse answer"),
-        )
-        .expect("write session");
-
-        let copy = temp.path().join("fixed-safety.toml");
-        std::fs::write(
-            &copy,
-            include_bytes!("../../config/excluded_context_paths.toml"),
-        )
-        .expect("write the fixed safety copy");
-        let safety = Arc::new(
-            source_ingest::load_fixed_safety_config(&copy).expect("load the fixed copy"),
-        );
-
-        let root = ScanRoot::local(projects_root.clone());
-        let plan = LocalRootPlan {
-            root: root.clone(),
-            meta: scan_root_meta::ScanRootMeta {
-                root_id: scan_root_meta::home_root_id("claude", &projects_root),
-                origin_host: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
-                readonly: false,
-                canonical_path: projects_root,
-                source_name: scan_root_meta::HOME_SOURCE_NAME.to_string(),
-                watermarks_enabled: true,
-                mirror_root: false,
-            },
-            // No watermark, so the whole root is enumerated and the
-            // changed-file criterion plays no part in either pass.
-            watermark: None,
-            file_states: HashMap::new(),
-            source_evidence: HashSet::new(),
-            ownership: None,
-        };
-
-        let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
-        let filter = ActiveSessionSourceFilter::default();
-
-        // 1) The real source path seals the input.
-        let mut sealed = 0usize;
-        let mut sink = |_job: source_ingest::SourceInputJob| -> Result<()> {
-            sealed += 1;
-            Ok(())
-        };
-        let (outcome, fatal) = run_local_root_scan(
-            &connector,
-            "claude",
-            &data_dir,
-            &plan,
-            &[],
-            &filter,
-            &mut |_root, _meta, _conversation| Ok(()),
-            Some(&safety),
-            Some(&mut sink),
-        );
-        assert!(
-            fatal.is_none(),
-            "the source pass has no fatal error: {fatal:?}"
-        );
-        assert!(
-            outcome.succeeded,
-            "the source pass seals the session: {outcome:?}"
-        );
-        assert_eq!(sealed, 1, "the source pass sealed exactly one input");
-        let sealed_manifests = mirror_manifest_ids(&data_dir);
-        assert_eq!(
-            sealed_manifests.len(),
-            1,
-            "the source pass captured the session exactly once: {sealed_manifests:?}"
-        );
-
-        // 2) The legacy branch over the same, already-sealed root.
-        let mut parsed: Vec<std::path::PathBuf> = Vec::new();
-        let (legacy, fatal) = run_local_root_scan(
-            &connector,
-            "claude",
-            &data_dir,
-            &plan,
-            &[],
-            &filter,
-            &mut |_root, _meta, conversation| {
-                parsed.push(conversation.source_path.clone());
-                Ok(())
-            },
-            None,
-            None,
-        );
-        assert!(
-            fatal.is_none(),
-            "the legacy pass has no fatal error: {fatal:?}"
-        );
-        assert!(
-            legacy.succeeded,
-            "the legacy pass scans the root cleanly: {legacy:?}"
-        );
-        assert!(
-            parsed.iter().any(|path| path == &session),
-            "the legacy pass really parsed the synthetic session instead of \
-             scanning nothing: {parsed:?}"
-        );
-        assert_eq!(
-            mirror_manifest_ids(&data_dir),
-            sealed_manifests,
-            "the legacy capture merged into the source capture and relabelled none"
-        );
-        assert_eq!(
-            count_files_under(&data_dir.join("raw-mirror/v1/blobs")),
-            1,
-            "one unchanged file keeps one blob across both passes"
-        );
-    }
-
     mod ordinary_ownership_tests {
         use super::*;
         use crate::connectors::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext};
 
         // These counters belong only to this module. All four tests share the
         // repository serial_test lock with the existing environment tests.
-        static SCANS: AtomicUsize = AtomicUsize::new(0);
         static GOOD_DISCOVERIES: AtomicUsize = AtomicUsize::new(0);
         static BAD_DISCOVERIES: AtomicUsize = AtomicUsize::new(0);
-        struct EmptyHome;
-        impl Connector for EmptyHome {
-            fn detect(&self) -> DetectionResult {
-                DetectionResult { detected: true, evidence: Vec::new(), root_paths: Vec::new() }
-            }
-            fn scan(&self, _: &ScanContext) -> Result<Vec<NormalizedConversation>> {
-                SCANS.fetch_add(1, Ordering::SeqCst);
-                Ok(Vec::new())
-            }
-        }
-        fn empty_factory() -> Box<dyn Connector + Send> { Box::new(EmptyHome) }
         struct Discovery { fails: bool }
         impl Connector for Discovery {
             fn detect(&self) -> DetectionResult { DetectionResult::not_found() }
@@ -44142,60 +42962,6 @@ normalization="l2"
         }
         fn good_factory() -> Box<dyn Connector + Send> { Box::new(Discovery { fails: false }) }
         fn bad_factory() -> Box<dyn Connector + Send> { Box::new(Discovery { fails: true }) }
-
-        fn safety(temp: &TempDir) -> Arc<source_ingest::FixedSafetyConfig> {
-            let path = temp.path().join("safety.toml");
-            std::fs::write(&path, include_bytes!("../../config/excluded_context_paths.toml")).unwrap();
-            Arc::new(source_ingest::load_fixed_safety_config(&path).unwrap())
-        }
-
-        #[test]
-        #[serial]
-        fn e1_empty_home_plans_never_use_legacy_writers() {
-            let temp = TempDir::new().unwrap();
-            let home = temp.path().join("empty-home");
-            std::fs::create_dir_all(&home).unwrap();
-            let _home = set_env_var("HOME", home.to_str().unwrap());
-            let _xdg = set_env_var("XDG_CONFIG_HOME", home.to_str().unwrap());
-            let _codex = set_env_var("CODEX_HOME", home.join(".codex").to_str().unwrap());
-            let _claude = unset_env_var("CLAUDE_CONFIG_DIR");
-            let _exclude = unset_env_var("CASS_EXCLUDE_PATHS");
-            let _ = safety(&temp);
-            for streaming in [false, true] {
-                for name in ["claude", "codex"] {
-                    for enabled in [false, true] {
-                        let data = temp.path().join(format!("{streaming}-{name}-{enabled}"));
-                        std::fs::create_dir_all(&data).unwrap();
-                        let db_path = data.join("db.sqlite");
-                        let storage = FrankenStorage::open(&db_path).unwrap();
-                        ensure_fts_schema(&storage);
-                        let opts = IndexOptions {
-                            no_ingest: false, full: false, force_rebuild: false, watch: false,
-                            watch_once_paths: None, db_path, data_dir: data.clone(), semantic: false,
-                            embedder: "fastembed".into(), progress: Some(Arc::new(IndexingProgress::default())),
-                            watch_interval_secs: 30,
-                            model_api: None,
-                            source_safety_config: enabled.then(|| temp.path().join("safety.toml")),
-                        };
-                        let runner = if streaming { run_streaming_index_with_connector_factories } else { run_batch_index_with_connector_factories };
-                        // Task 19: the factory consumes the prepared object; this
-                        // low-level dispatch test loads the explicit copy it set
-                        // on the options, exactly as the production wrapper did.
-                        let source_safety = load_source_safety(&opts).unwrap();
-                        let before = SCANS.load(Ordering::SeqCst);
-                        runner(&storage, &opts, None, LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
-                            Vec::new(), vec![(name, empty_factory as ConnectorFactory)],
-                            &scan_root_meta::ScanRootMetaIndex::new(), FrankenStorage::now_millis(), None,
-                            &SharedActiveSessionSourceSkips::default(), source_safety).unwrap();
-                        assert_eq!(SCANS.load(Ordering::SeqCst) - before, usize::from(!enabled));
-                        for table in ["conversations", "messages", "source_inputs"] {
-                            assert_eq!(storage.raw().query_row_map(&format!("SELECT COUNT(*) FROM {table}"), &[], |r| r.get_typed::<i64>(0)).unwrap(), 0);
-                        }
-                        assert!(crate::raw_mirror::manifest_views(&data).unwrap().is_empty());
-                    }
-                }
-            }
-        }
 
         #[test]
         #[serial]
@@ -44249,11 +43015,10 @@ normalization="l2"
             let root = ScanRoot::remote(root_path.clone(), Origin::remote("one"), Some(Platform::Linux));
             let other = ScanRoot::remote(root_path.clone(), Origin::remote("two"), Some(Platform::Linux));
             let storage = FrankenStorage::open(&temp.path().join("db.sqlite")).unwrap();
-            let config = safety(&temp);
             let factories = [("claude", good_factory as ConnectorFactory)];
             let mut index = scan_root_meta::ScanRootMetaIndex::new();
             let build = |index: &scan_root_meta::ScanRootMetaIndex, enabled| build_connector_root_plans(
-                &storage, &factories, &[root.clone(), other.clone()], index, Some(&config), enabled, temp.path()).unwrap();
+                &storage, &factories, &[root.clone(), other.clone()], index, enabled, temp.path()).unwrap();
             let old = build(&index, false);
             assert!(old["claude"].configured_for(&root).is_none());
             let plans = build(&index, true);
@@ -44345,101 +43110,6 @@ mod task35_watch_routing_tests {
         Task35Env { key, previous }
     }
 
-    /// A synthetic Claude Code session in the shape the connector parses.
-    fn task35_claude_jsonl(uuid: &str) -> String {
-        let lines = [
-            serde_json::json!({
-                "parentUuid": null,
-                "cwd": "/synthetic/project",
-                "sessionId": uuid,
-                "version": "2.0.37",
-                "type": "user",
-                "message": {"role": "user", "content": "rework claude question"},
-                "uuid": format!("{uuid}-user"),
-                "timestamp": "2026-01-01T00:00:00.000Z"
-            }),
-            serde_json::json!({
-                "parentUuid": format!("{uuid}-user"),
-                "cwd": "/synthetic/project",
-                "sessionId": uuid,
-                "version": "2.0.37",
-                "type": "assistant",
-                "message": {
-                    "model": "claude-opus-4",
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "rework claude answer"}]
-                },
-                "uuid": format!("{uuid}-assistant"),
-                "timestamp": "2026-01-01T00:00:01.000Z"
-            }),
-        ];
-        let mut body = lines
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        body.push('\n');
-        body
-    }
-
-    /// The buffer a test-thread tracing subscriber writes into.
-    #[derive(Clone, Default)]
-    struct Task35LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Task35LogBuffer {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .expect("log buffer lock")
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// One `key=value` field's value from a rendered log line, with the quotes
-    /// a string field may carry stripped. Mirrors the existing trigger-line
-    /// parser: the field's semantic value is what a test asserts, not whether
-    /// the formatter quoted it.
-    fn task35_log_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-        let needle = format!("{key}=");
-        let start = line.find(&needle)? + needle.len();
-        let rest = &line[start..];
-        let end = rest.find(' ').unwrap_or(rest.len());
-        Some(rest[..end].trim_matches('"'))
-    }
-
-    /// Run `f` under a current-thread subscriber and return its result plus the
-    /// WARN-and-above log text. This is the existing `tracing_subscriber`
-    /// mechanism the module's other tests use; nothing here changes production.
-    fn task35_capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
-        let writer = Task35LogBuffer::default();
-        let drain = writer.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let result = tracing::subscriber::with_default(subscriber, f);
-        let bytes = drain.0.lock().expect("log buffer lock").clone();
-        (result, String::from_utf8_lossy(&bytes).to_string())
-    }
-
-    /// A synthetic Gemini session in the frozen fixture's own shape.
-    fn task35_gemini_json(session_id: &str, body: &str) -> Vec<u8> {
-        let mut value: serde_json::Value = serde_json::from_slice(include_bytes!(
-            "../../tests/fixtures/gemini/hash123/chats/session-test.json"
-        ))
-        .expect("the frozen Gemini fixture parses");
-        value["sessionId"] = serde_json::Value::String(session_id.to_string());
-        value["messages"][0]["content"] = serde_json::Value::String(body.to_string());
-        serde_json::to_vec_pretty(&value).expect("serialize the Gemini session")
-    }
-
     fn write_fixture(path: &Path, body: &str) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("fixture parent");
@@ -44483,7 +43153,7 @@ mod task35_watch_routing_tests {
             meta: declared_meta(path, root_id, source_id),
             watermark: None,
             file_states: std::collections::HashMap::new(),
-            source_evidence: std::collections::HashSet::new(),
+            legacy_unfinished_source_locators: std::collections::HashSet::new(),
             ownership: Some(ownership),
         }
     }
@@ -44548,17 +43218,20 @@ mod task35_watch_routing_tests {
             route.rejections.is_empty(),
             "the codex rollout is a clean ownership decision"
         );
-        assert_eq!(route.units.len(), 1, "exactly the owner's unit is built");
-        let unit = &route.units[0];
-        assert_eq!(unit.connector, "codex", "the declaration's owner overrides the hint");
-        assert_eq!(unit.plan.meta.root_id, "u1-decl", "the declaration identity is kept");
-        assert_eq!(unit.plan.root.origin.source_id, "u1-source");
+        assert_eq!(route.legacy.len(), 1, "exactly the owner's trigger is built");
+        let trigger = &route.legacy[0];
+        assert_eq!(trigger.kind, ConnectorKind::Codex, "the declaration's owner overrides the hint");
         assert_eq!(
-            unit.selection.as_deref(),
-            Some(rollout.as_path()),
+            trigger.meta.as_ref().map(|m| m.root_id.as_str()),
+            Some("u1-decl"),
+            "the declaration identity is kept"
+        );
+        assert_eq!(trigger.root.origin.source_id, "u1-source");
+        assert_eq!(
+            trigger.root.path.as_path(),
+            rollout.as_path(),
             "the explicit selection is carried, not the whole root"
         );
-        assert!(unit.source_aware, "codex supports the sealed kernel");
         assert!(
             route.uncovered.is_empty(),
             "a declared path is never handed back to the legacy classifier"
@@ -44692,10 +43365,10 @@ mod task35_watch_routing_tests {
             assert!(rejection.relative_sha256.is_some());
         }
 
-        let connectors: Vec<&str> = route.units.iter().map(|u| u.connector).collect();
+        let kinds: Vec<ConnectorKind> = route.legacy.iter().map(|t| t.kind).collect();
         assert!(
-            connectors.contains(&"codex") && connectors.contains(&"claude"),
-            "healthy units of both kinds are routed although a sibling was refused: {connectors:?}"
+            kinds.contains(&ConnectorKind::Codex) && kinds.contains(&ConnectorKind::Claude),
+            "healthy units of both kinds are routed although a sibling was refused: {kinds:?}"
         );
 
         let mut holdback: std::collections::HashMap<ConnectorKind, bool> =
@@ -44708,174 +43381,6 @@ mod task35_watch_routing_tests {
             "the refused declaration's kind is held back"
         );
 
-        // Rework R1-F1, part two: a runtime rejection inside a fixed-mode
-        // explicit watch-once must reach the caller after the healthy unit has
-        // already landed. The after-capture hook creates a new, valid Gemini
-        // session after routing has fixed this cycle's descriptors, so the
-        // legacy directory scan produces a source the unit never verified.
-        let temp = TempDir::new().expect("tempdir");
-        let home = temp.path().join("home");
-        let xdg = temp.path().join("xdg-config");
-        let data_dir = temp.path().join("data");
-        for dir in [&home, &xdg, &data_dir] {
-            std::fs::create_dir_all(dir).expect("mkdir isolated dir");
-        }
-        let _home = task35_set_env("HOME", home.to_str().expect("utf-8 home"));
-        let _xdg_config =
-            task35_set_env("XDG_CONFIG_HOME", xdg.to_str().expect("utf-8 xdg config"));
-        let _xdg_data = task35_set_env(
-            "XDG_DATA_HOME",
-            home.join(".local/share").to_str().expect("utf-8 xdg data"),
-        );
-        let _codex_home =
-            task35_set_env("CODEX_HOME", home.join(".codex").to_str().expect("utf-8 codex"));
-        let _claude_config = task35_set_env(
-            "CLAUDE_CONFIG_DIR",
-            home.join(".claude").to_str().expect("utf-8 claude"),
-        );
-        let _ignore_sources = task35_set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
-
-        let root = temp.path().join("declared");
-        let claude_file = root.join("projects/p/one.jsonl");
-        write_fixture(&claude_file, &task35_claude_jsonl("sess-rework-claude"));
-        let gemini_file = root.join("hash/chats/session-one.json");
-        write_fixture(
-            &gemini_file,
-            &String::from_utf8(task35_gemini_json("sess-rework-gemini", "rework gemini body"))
-                .expect("utf-8 gemini body"),
-        );
-
-        let late_path = root.join("hash/chats/session-late.json");
-        let late_body = task35_gemini_json("sess-rework-late", "rework late body");
-        let hook_path = late_path.clone();
-        let _hook = crate::indexer::source_ingest::test_hooks::arm_after_capture(
-            move |_captured: &Path| {
-                std::fs::create_dir_all(hook_path.parent().expect("late parent"))
-                    .expect("mkdir late dir");
-                std::fs::write(&hook_path, &late_body).expect("write the late gemini session");
-            },
-        );
-
-        let db_path = data_dir.join("agent_search.db");
-        let storage = FrankenStorage::open(&db_path).expect("open storage");
-        let mut source = crate::sources::provenance::Source::remote("rework", "host-rework");
-        source.kind = crate::sources::provenance::SourceKind::Local;
-        source.config_json = Some(serde_json::json!({
-            "paths": [root.to_str().expect("utf-8 root")]
-        }));
-        storage.upsert_source(&source).expect("register the declaration");
-        let safety_copy = temp.path().join("fixed-safety.toml");
-        std::fs::write(
-            &safety_copy,
-            include_str!("../../config/excluded_context_paths.toml"),
-        )
-        .expect("write the fixed safety copy");
-
-        let opts = IndexOptions {
-            full: false,
-            force_rebuild: false,
-            watch: false,
-            watch_once_paths: Some(vec![root.clone()]),
-            db_path: db_path.clone(),
-            data_dir: data_dir.clone(),
-            semantic: false,
-            no_ingest: false,
-            embedder: "infinity".to_string(),
-            progress: None,
-            watch_interval_secs: 30,
-            model_api: None,
-            source_safety_config: Some(safety_copy),
-        };
-        let state = Mutex::new(std::collections::HashMap::new());
-        let storage = Mutex::new(storage);
-        let (result, logs) = task35_capture_logs(|| {
-            reindex_paths_with_semantic_delta_and_safety(
-                &opts,
-                vec![root.clone()],
-                &[],
-                &state,
-                &storage,
-                false,
-                None,
-                None,
-            )
-        });
-
-        assert!(
-            crate::indexer::source_ingest::test_hooks::hits()
-                .iter()
-                .any(|hit| *hit == "after_capture"),
-            "the after-capture hook must have fired"
-        );
-        assert!(late_path.exists(), "the hook created the late session");
-        let storage = storage.into_inner().expect("storage lock");
-        let count = |sql: &str| {
-            storage
-                .raw()
-                .query_row_map(sql, &[], |row| row.get_typed::<i64>(0))
-                .unwrap_or_else(|error| panic!("{sql}: {error}"))
-        };
-        assert_eq!(
-            count("SELECT COUNT(*) FROM source_inputs WHERE connector='claude_code' AND state='complete'"),
-            1,
-            "the healthy Claude input still lands"
-        );
-        assert_eq!(
-            count("SELECT COUNT(*) FROM messages WHERE content LIKE '%rework late body%'"),
-            0,
-            "the unverified late file is never written"
-        );
-        assert!(
-            result.is_err(),
-            "a fixed-mode explicit watch-once with a runtime rejection must return Err, got {result:?}"
-        );
-
-        // Rework R2-F1: the new member-rejection diagnostic carries the
-        // declaration identity, the connector and a stable reason code, and
-        // names no original path or body.
-        let root_text = root.to_str().expect("utf-8 root");
-        let late_text = late_path.to_str().expect("utf-8 late");
-        let event_lines: Vec<&str> = logs
-            .lines()
-            .filter(|line| {
-                line.contains("fixed watch unit produced a source outside its verified descriptors")
-            })
-            .collect();
-        assert!(
-            !event_lines.is_empty(),
-            "the member-rejection event must be logged: {logs}"
-        );
-        for line in event_lines {
-            assert_eq!(
-                task35_log_field(line, "reason"),
-                Some("source_outside_verified_descriptors"),
-                "the event carries its stable reason code: {line}"
-            );
-            assert!(
-                task35_log_field(line, "connector").is_some(),
-                "the event names its connector: {line}"
-            );
-            assert!(
-                task35_log_field(line, "root_id").is_some(),
-                "the event names its declaration identity: {line}"
-            );
-            assert!(
-                !line.contains(root_text),
-                "the diagnostic must not print the declaration directory: {line}"
-            );
-            assert!(
-                !line.contains(late_text),
-                "the diagnostic must not print the late file path: {line}"
-            );
-            assert!(
-                !line.contains("scan_root="),
-                "the diagnostic must not print a scan root: {line}"
-            );
-            assert!(
-                !line.contains("rework late body"),
-                "the diagnostic must not print the body: {line}"
-            );
-        }
     }
 
     /// U3: a forced rebuild may drop the old per-root state, but a refused
@@ -44906,12 +43411,6 @@ mod task35_watch_routing_tests {
         let root_path = temp.path().join("declared");
         let rejected = root_path.join("notes.json");
         write_fixture(&rejected, "{}\n");
-        let safety_copy = temp.path().join("fixed-safety.toml");
-        std::fs::write(
-            &safety_copy,
-            include_str!("../../config/excluded_context_paths.toml"),
-        )
-        .expect("write the fixed safety copy");
 
         let db_path = data_dir.join("agent_search.db");
         let storage = FrankenStorage::open(&db_path).expect("open storage");
@@ -44944,7 +43443,6 @@ mod task35_watch_routing_tests {
             progress: None,
             watch_interval_secs: 30,
             model_api: None,
-            source_safety_config: Some(safety_copy.clone()),
         };
         let roots = vec![(ConnectorKind::Claude, ScanRoot::local(root_path.clone()))];
         let state = Mutex::new(std::collections::HashMap::from([(
@@ -44952,9 +43450,6 @@ mod task35_watch_routing_tests {
             999,
         )]));
         let storage = Mutex::new(storage);
-        let safety = load_source_safety(&opts)
-            .expect("load the fixed safety copy")
-            .expect("a fixed safety copy was supplied");
         let detector = StaleDetector::from_env();
 
         let indexed = run_watch_rebuild_cycle(
@@ -44962,7 +43457,6 @@ mod task35_watch_routing_tests {
             &roots,
             &state,
             &storage,
-            Some(&safety),
             &detector,
         );
         assert_eq!(indexed, 0, "the refused unit indexed nothing");
@@ -44993,7 +43487,7 @@ mod task35_watch_routing_tests {
             storage
                 .raw()
                 .query_row_map(
-                    "SELECT COUNT(*) FROM source_inputs",
+                    "SELECT COUNT(*) FROM conversations",
                     &[],
                     |row| row.get_typed::<i64>(0),
                 )
@@ -45001,5 +43495,48 @@ mod task35_watch_routing_tests {
             0,
             "no writer ran for the refused declaration"
         );
+    }
+
+    /// R2-B4: when multiple files under the same declared root arrive in one
+    /// resident watch debounce batch, `route_fixed_watch` must merge `min_ts`
+    /// and `max_ts` across every file regardless of input order so older-mtime
+    /// files are never skipped by `since_ts` and watermarks advance to the max.
+    #[test]
+    fn task35_declared_root_multi_file_merges_min_and_max_ts() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let root_path = temp.path().join("declared-multi");
+        let newer = root_path.join("projects/p/a_newer.jsonl");
+        let older = root_path.join("projects/p/z_older.jsonl");
+        write_fixture(&newer, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"new\"}}\n");
+        write_fixture(&older, "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"old\"}}\n");
+
+        let now = std::time::SystemTime::now();
+        let older_time = now - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .expect("open older")
+            .set_modified(older_time)
+            .expect("backdate older");
+        let newer_ms = path_modified_ms(&newer).expect("newer mtime");
+        let older_ms = path_modified_ms(&older).expect("older mtime");
+        assert!(older_ms < newer_ms, "older mtime must strictly precede newer");
+
+        let plan = declared_plan(&data_dir, &root_path, "r2-b4-src", "r2-b4-decl");
+        let mut plans = std::collections::HashMap::new();
+        insert_plan(&mut plans, "claude", &plan);
+
+        for batch in [
+            vec![newer.clone(), older.clone()],
+            vec![older.clone(), newer.clone()],
+        ] {
+            let route = route_fixed_watch(batch, &plans, false);
+            assert!(route.rejections.is_empty(), "clean claude batch must not reject");
+            assert_eq!(route.legacy.len(), 1, "same declared root collapses into 1 trigger");
+            assert_eq!(route.legacy[0].min_ts, Some(older_ms), "min_ts must track oldest file in batch");
+            assert_eq!(route.legacy[0].max_ts, Some(newer_ms), "max_ts must track newest file in batch");
+        }
     }
 }

@@ -25,6 +25,12 @@ use std::path::{Component, Path, PathBuf};
 const CLAUDE: &str = "claude";
 const CODEX: &str = "codex";
 
+/// Whether `name` is one of the connectors whose discovered paths participate
+/// in unique source-ownership arbitration on shared roots.
+pub(crate) fn is_arbitrated_connector(name: &str) -> bool {
+    matches!(name, CLAUDE | CODEX)
+}
+
 /// Connector slug whose native chat layout is path evidence in its own right.
 const GEMINI_FOR_PATH_EVIDENCE: &str = "gemini";
 

@@ -102,7 +102,6 @@ fn bench_index_full(c: &mut Criterion) {
         embedder: "fastembed".to_string(),
         progress: None,
         watch_interval_secs: 30,
-        source_safety_config: None,
     };
 
     // create empty index dir so Tantivy opens cleanly
@@ -170,7 +169,6 @@ fn bench_streaming_vs_batch(c: &mut Criterion) {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         // Benchmark batch mode
@@ -239,7 +237,6 @@ fn bench_channel_overhead(c: &mut Criterion) {
         embedder: "fastembed".to_string(),
         progress: None,
         watch_interval_secs: 30,
-        source_safety_config: None,
     };
 
     // Enable streaming mode for this benchmark
@@ -352,7 +349,6 @@ fn bench_ingest_with_responsiveness(c: &mut Criterion) {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         // SAFETY: Criterion benches run single-threaded.
@@ -425,7 +421,6 @@ fn bench_card_defaults_ab(c: &mut Criterion) {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
-            source_safety_config: None,
         };
 
         // SAFETY: criterion benches are single-threaded per-fn.
