@@ -34,6 +34,10 @@ pub(crate) fn is_arbitrated_connector(name: &str) -> bool {
 /// Connector slug whose native chat layout is path evidence in its own right.
 const GEMINI_FOR_PATH_EVIDENCE: &str = "gemini";
 
+/// Connector slug whose `.system_generated/logs/transcript*.jsonl` layout is
+/// path evidence in its own right.
+const ANTIGRAVITY_FOR_PATH_EVIDENCE: &str = "antigravity";
+
 /// Aliases of the `claude` slug that must never be accepted, so an alias can
 /// not slip past the ownership decision as an unregistered-but-harmless name.
 const REJECTED_ALIASES: [&str; 2] = ["claude_code", "claude-code"];
@@ -319,6 +323,9 @@ fn native_path_evidence(root: &Path, relative: &Path) -> BTreeSet<&'static str> 
     if gemini_path_evidence(relative) {
         owners.insert(GEMINI_FOR_PATH_EVIDENCE);
     }
+    if antigravity_path_evidence(&relative_names, &root_names) {
+        owners.insert(ANTIGRAVITY_FOR_PATH_EVIDENCE);
+    }
     owners
 }
 
@@ -385,6 +392,31 @@ fn gemini_path_evidence(relative: &Path) -> bool {
         .and_then(|parent| parent.to_str())
         == Some("chats");
     parent_is_chats && name.starts_with("session-") && extension_matches(relative, &["json"], true)
+}
+
+/// Antigravity CLI owns strictly `<...>/<uuid>/.system_generated/logs/transcript.jsonl`
+/// and `transcript_full.jsonl`. Never matches a bare `antigravity-cli` directory
+/// segment alone, so `~/.claude/projects/antigravity-cli/s.jsonl` remains unambiguously
+/// owned by Claude.
+fn antigravity_path_evidence(
+    relative_names: &[Option<&str>],
+    root_names: &[Option<&str>],
+) -> bool {
+    let Some(Some(file_name)) = relative_names.last() else {
+        return false;
+    };
+    if !matches!(*file_name, "transcript.jsonl" | "transcript_full.jsonl") {
+        return false;
+    }
+    let dir_chain: Vec<Option<&str>> = root_names
+        .iter()
+        .copied()
+        .chain(relative_names[..relative_names.len() - 1].iter().copied())
+        .collect();
+    matches!(
+        dir_chain.as_slice(),
+        [.., Some(".system_generated"), Some("logs")]
+    )
 }
 
 /// The connector slugs the running build publishes. Reading the registry
@@ -1351,6 +1383,31 @@ mod partition_tests {
         assert_eq!(
             again, partition,
             "declaration order must not change the result"
+        );
+    }
+
+    #[test]
+    fn antigravity_path_evidence_matches_transcript_and_keeps_claude_dir_unambiguous() {
+        let root = Path::new("/synthetic");
+        let full_transcript = "/synthetic/.gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555/.system_generated/logs/transcript_full.jsonl";
+        let compact_transcript = "/synthetic/.gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555/.system_generated/logs/transcript.jsonl";
+        let claude_same_dir_name = "/synthetic/.claude/projects/antigravity-cli/session.jsonl";
+        let claims = vec![
+            claim("claude", full_transcript),
+            claim("antigravity", full_transcript),
+            claim("claude", compact_transcript),
+            claim("antigravity", compact_transcript),
+            claim("claude", claude_same_dir_name),
+        ];
+
+        let partition =
+            partition_source_ownership(root, None, &claims).expect("valid antigravity claims");
+        assert_eq!(decide(&partition, full_transcript), owner("antigravity"));
+        assert_eq!(decide(&partition, compact_transcript), owner("antigravity"));
+        assert_eq!(
+            decide(&partition, claude_same_dir_name),
+            owner("claude"),
+            "bare antigravity-cli directory under .claude/projects must stay owned by claude"
         );
     }
 }

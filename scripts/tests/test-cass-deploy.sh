@@ -20,7 +20,7 @@ KEY_VALUE='sk-SYNTHETIC-t02-0123456789abcdef=='
 KEY_ENV=CASS_TEST_API_KEY
 # The connector set of the baseline binary (src/indexer connectors, e5f0fa43).
 ALL_CONNECTORS='aider amp antigravity chatgpt claude_code clawdbot cline codex copilot copilot_cli crush cursor factory gemini hermes kimi openclaw opencode openhands pi_agent qwen vibe'
-DISABLED='aider amp antigravity chatgpt clawdbot cline copilot copilot_cli crush cursor factory gemini hermes kimi openclaw opencode openhands qwen vibe'
+DISABLED='aider amp chatgpt clawdbot cline copilot copilot_cli crush cursor factory gemini hermes kimi openclaw opencode openhands qwen vibe'
 PASS=0; FAIL=0
 printf 'sandbox=%s source_bundle=%s installer=%s\n' "$SANDBOX" "$SRC" "$INSTALLER"
 
@@ -66,6 +66,7 @@ SH
   # Agent roots that the real binary detects, for the onboarding check.
   local h="$dir/home"
   mkdir -p "$h/.claude/projects/p" "$h/.codex/sessions" "$h/.pi/agent/sessions" "$h/.gemini/tmp" \
+    "$h/.gemini/antigravity-cli/brain" \
     "$h/.aider" "$h/.cursor" "$h/.local/share/opencode" "$h/.openclaw" "$h/.qwen" "$h/.factory"
   printf '{}\n' > "$h/.claude/projects/p/s.jsonl"
   printf '%s\n' "$KEY_VALUE" > "$dir/key"
@@ -416,7 +417,7 @@ SH
 import json, sys
 report = json.load(open(sys.argv[1]))
 active = sorted(p["name"] for p in report["providers"] if p["readiness"] != "excluded")
-assert active == ["claude", "codex", "pi_agent"], active
+assert active == ["antigravity", "claude", "codex", "pi_agent"], active
 disabled = set(sys.argv[2].split())
 excluded = report["excluded_providers"]
 assert excluded and set(excluded) <= disabled, excluded

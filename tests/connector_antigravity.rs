@@ -49,8 +49,10 @@ fn antigravity_scans_fixture_into_one_conversation() {
     assert_eq!(c.agent_slug, "antigravity");
     assert_eq!(c.external_id.as_deref(), Some(FIXTURE_UUID));
     assert!(
-        c.source_path.to_string_lossy().contains("transcript.jsonl"),
-        "source_path should be the transcript we parse"
+        c.source_path
+            .to_string_lossy()
+            .ends_with("transcript_full.jsonl"),
+        "source_path should prefer transcript_full.jsonl when present"
     );
 }
 
@@ -73,12 +75,23 @@ fn antigravity_maps_all_roles() {
     let c = only_conversation();
     assert!(c.messages.iter().any(|m| m.role == "user"));
     assert!(c.messages.iter().any(|m| m.role == "assistant"));
-    assert!(c.messages.iter().any(|m| m.role == "tool"));
+    assert!(c.messages.iter().any(|m| m.role == "reasoning"));
+    assert!(c.messages.iter().any(|m| m.role == "tool_call"));
+    assert!(c.messages.iter().any(|m| m.role == "tool_result"));
     assert!(c.messages.iter().any(|m| m.role == "system"));
-    // CONVERSATION_HISTORY (null content) is dropped; the other 7 records map.
-    assert_eq!(c.messages.len(), 7);
+    // CONVERSATION_HISTORY (null content) is dropped; PLANNER_RESPONSE with
+    // thinking+content splits into reasoning+assistant, and RUN_COMMAND with
+    // tool_calls splits into tool_call+tool_result -> 9 canonical messages.
+    assert_eq!(c.messages.len(), 9);
     for (i, m) in c.messages.iter().enumerate() {
         assert_eq!(m.idx, i64::try_from(i).unwrap());
+        assert!(
+            m.extra
+                .get("raw_role")
+                .and_then(|v| v.as_str())
+                .is_some_and(|r| !r.is_empty()),
+            "every message must carry non-empty raw_role"
+        );
     }
 }
 
@@ -99,47 +112,55 @@ fn antigravity_unwraps_user_request_and_keeps_settings() {
 #[test]
 fn antigravity_preserves_thinking_on_planner_response() {
     let c = only_conversation();
-    let planner = c
+    let reasoning = c
         .messages
         .iter()
-        .find(|m| m.role == "assistant" && m.extra.get("thinking").is_some())
-        .expect("a planner response carrying thinking");
-    assert!(
-        planner.extra["thinking"]
-            .as_str()
-            .unwrap()
-            .contains("grep_search")
+        .find(|m| m.role == "reasoning")
+        .expect("a reasoning message emitted from PLANNER_RESPONSE.thinking");
+    assert!(reasoning.content.contains("grep_search"));
+    assert_eq!(
+        reasoning.extra.get("raw_role").and_then(|v| v.as_str()),
+        Some("assistant")
     );
 }
 
 #[test]
 fn antigravity_tool_steps_carry_invocations() {
     let c = only_conversation();
-    // VIEW_FILE -> synthesized "view_file" invocation, result content present.
+    // VIEW_FILE without tool_calls -> unpaired tool_result with synthesized author.
     let view = c
         .messages
         .iter()
         .find(|m| m.extra.get("agy_type").and_then(|v| v.as_str()) == Some("VIEW_FILE"))
         .expect("VIEW_FILE message");
-    assert_eq!(view.role, "tool");
-    assert_eq!(view.invocations[0].name, "view_file");
+    assert_eq!(view.role, "tool_result");
+    assert_eq!(view.author.as_deref(), Some("view_file"));
+    assert_eq!(view.extra.get("unpaired").and_then(|v| v.as_bool()), Some(true));
     assert!(view.content.contains("FLYWHEEL"));
 
-    // RUN_COMMAND -> structured grep_search invocation with its query argument.
-    let run = c
+    // RUN_COMMAND -> structured grep_search tool_call + paired tool_result.
+    let run_call = c
         .messages
         .iter()
-        .find(|m| m.invocations.iter().any(|i| i.name == "grep_search"))
-        .expect("grep_search invocation");
-    assert_eq!(run.role, "tool");
+        .find(|m| m.role == "tool_call" && m.invocations.iter().any(|i| i.name == "grep_search"))
+        .expect("grep_search tool_call");
     assert_eq!(
-        run.invocations[0]
+        run_call.invocations[0]
             .arguments
             .as_ref()
             .and_then(|a| a.get("query"))
             .and_then(|v| v.as_str()),
         Some("FLYWHEEL")
     );
+    let run_result = c
+        .messages
+        .iter()
+        .find(|m| {
+            m.role == "tool_result"
+                && m.extra.get("tool_call_id").and_then(|v| v.as_str()) == Some("call_grep_01")
+        })
+        .expect("paired grep_search tool_result");
+    assert!(run_result.content.contains("FLYWHEEL"));
 }
 
 /// The content cass's FTS would index must contain the searchable marker — this
@@ -167,12 +188,18 @@ fn antigravity_discovers_transcript_and_db_sources() {
         .discover_source_files(&fixture_ctx())
         .expect("discover");
     assert!(discovered.iter().all(|d| d.provider_slug == "antigravity"));
+    let primaries: Vec<_> = discovered
+        .iter()
+        .filter(|d| d.role == DiscoveredSourceRole::PrimarySessionLog)
+        .collect();
+    assert_eq!(
+        primaries.len(),
+        1,
+        "directory discovery emits only the sole primary transcript"
+    );
     assert!(
-        discovered
-            .iter()
-            .any(|d| d.source_path.ends_with("transcript.jsonl")
-                && d.role == DiscoveredSourceRole::PrimarySessionLog
-                && d.required_for_reconstruction)
+        primaries[0].source_path.ends_with("transcript_full.jsonl")
+            && primaries[0].required_for_reconstruction
     );
     assert!(
         discovered

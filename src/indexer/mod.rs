@@ -17887,6 +17887,8 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
         Some(ConnectorKind::Codex)
     } else if has_pair(".claude", "projects") {
         Some(ConnectorKind::Claude)
+    } else if has_pair(".gemini", "antigravity-cli") {
+        Some(ConnectorKind::Antigravity)
     } else if has_pair(".gemini", "tmp") {
         Some(ConnectorKind::Gemini)
     } else {
@@ -43631,5 +43633,28 @@ mod task35_watch_routing_tests {
             assert_eq!(route.legacy[0].min_ts, Some(older_ms), "min_ts must track oldest file in batch");
             assert_eq!(route.legacy[0].max_ts, Some(newer_ms), "max_ts must track newest file in batch");
         }
+    }
+
+    #[test]
+    fn explicit_watch_once_connector_hint_recognizes_antigravity_cli() {
+        let agy_full = Path::new(
+            "/tmp/sandbox/.gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555/.system_generated/logs/transcript_full.jsonl",
+        );
+        let agy_compact = Path::new(
+            "/tmp/sandbox/.gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555/.system_generated/logs/transcript.jsonl",
+        );
+        let gemini = Path::new("/tmp/sandbox/.gemini/tmp/deadbeef/chats/session-1.json");
+        assert_eq!(
+            explicit_watch_once_connector_hint(agy_full),
+            Some(ConnectorKind::Antigravity)
+        );
+        assert_eq!(
+            explicit_watch_once_connector_hint(agy_compact),
+            Some(ConnectorKind::Antigravity)
+        );
+        assert_eq!(
+            explicit_watch_once_connector_hint(gemini),
+            Some(ConnectorKind::Gemini)
+        );
     }
 }

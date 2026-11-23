@@ -78281,6 +78281,34 @@ mod cli_read_db_tests {
     }
 
     #[test]
+    fn extract_antigravity_conversation_id_supports_transcript_full_jsonl() {
+        let uuid = "22222222-3333-4444-5555-666666666666";
+        let full = PathBuf::from(format!(
+            "/tmp/sandbox/.gemini/antigravity-cli/brain/{uuid}/.system_generated/logs/transcript_full.jsonl"
+        ));
+        assert_eq!(
+            extract_antigravity_conversation_id(&full).expect("extract uuid"),
+            uuid
+        );
+        let target = resolve_resume_target(&full, None).expect("resolve without --agent");
+        assert_eq!(target.agent, "antigravity");
+        assert_eq!(target.argv, vec!["agy", "--conversation", uuid]);
+    }
+
+    #[test]
+    fn infer_followup_agent_prefers_antigravity_over_gemini() {
+        let agy_path = Path::new(
+            "/tmp/sandbox/.gemini/antigravity-cli/brain/33333333-4444-5555-6666-777777777777/.system_generated/logs/transcript_full.jsonl",
+        );
+        let (agent, _) = infer_followup_agent_and_workspace(agy_path);
+        assert_eq!(agent.as_deref(), Some("antigravity"));
+
+        let gemini_path = Path::new("/tmp/sandbox/.gemini/tmp/deadbeef/chats/session-1.json");
+        let (gemini_agent, _) = infer_followup_agent_and_workspace(gemini_path);
+        assert_eq!(gemini_agent.as_deref(), Some("gemini"));
+    }
+
+    #[test]
     fn resume_honors_explicit_agent_override() {
         // Claude path, but we force codex detection — legal alias handling.
         let path = PathBuf::from("/tmp/unknown/abc-123.jsonl");
@@ -90355,6 +90383,8 @@ fn infer_followup_agent_and_workspace(path: &Path) -> (Option<String>, Option<St
         (".claude", "claude_code"),
         (".codex", "codex"),
         ("cursor", "cursor"),
+        (".gemini/antigravity-cli", "antigravity"),
+        ("antigravity-cli", "antigravity"),
         (".config/gemini", "gemini"),
         (".gemini", "gemini"),
         (".vibe", "vibe"),
@@ -93869,6 +93899,8 @@ fn run_export_html(
             agent_name = Some("codex".to_string());
         } else if path_lower.contains("cursor") {
             agent_name = Some("cursor".to_string());
+        } else if path_lower.contains("antigravity-cli") {
+            agent_name = Some("antigravity".to_string());
         } else if path_lower.contains(".gemini") {
             agent_name = Some("gemini".to_string());
         } else if path_lower.contains(".vibe") {
