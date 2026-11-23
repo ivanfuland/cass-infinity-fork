@@ -10063,12 +10063,6 @@ fn normalize_excluded_blob_reference(raw_blob: &str, mirror_root: &Path) -> Stri
     {
         return tail.to_string();
     }
-    if let Some((_, tail)) = normalized_slashes.rsplit_once("/blobs/blake3/") {
-        let rel = format!("blobs/blake3/{tail}");
-        if doctor_raw_mirror_validate_relative_path(&rel).is_ok() {
-            return rel;
-        }
-    }
     trimmed.to_string()
 }
 

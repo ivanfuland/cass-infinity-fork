@@ -23,7 +23,7 @@ one_case() (
   home="$dir/home"; project="$dir/project"; prefix="$home/.local/lib/cass-mcp"
   cp -- "$ENTRY" "$project/cass"
   printf '/.build/\n/dist/\n' > "$project/.gitignore"
-  printf '[dependencies]\nfranken-agent-detection = { git = "https://example.invalid/fad", rev = "d630c819be47d023dddcb42f0e1339e387c0a46b" }\n' > "$project/Cargo.toml"
+  printf '[dependencies]\nfranken-agent-detection = { git = "https://example.invalid/fad", rev = "ac82c8a59cab7c380bb700acba9696bc6d587314" }\n' > "$project/Cargo.toml"
   git -C "$project" init -q
   git -C "$project" add cass Cargo.toml .gitignore
   git -C "$project" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm fixture
@@ -65,7 +65,7 @@ SH
       [ ! -e "$project/.build" ] ;;
     missing-pin|invalid-pin)
       if [ "$kind" = missing-pin ]; then printf '[dependencies]\n' > "$project/Cargo.toml";
-      else sed -i 's/d630c819be47d023dddcb42f0e1339e387c0a46b/invalid/' "$project/Cargo.toml"; fi
+      else sed -i 's/ac82c8a59cab7c380bb700acba9696bc6d587314/invalid/' "$project/Cargo.toml"; fi
       git -C "$project" add Cargo.toml
       git -C "$project" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm changed-fixture
       reject release

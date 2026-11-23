@@ -9799,15 +9799,9 @@ fn configured_local_root_plan(
 /// streaming producers own no database handle, and the batch scan runs inside
 /// rayon.
 ///
-/// A configured root the contract leaves without watermarks (`full_scan`) gets
-/// a plan only when the run asked for the source-aware path (SRC05B-08): that
-/// path is what covers it, and without it the root keeps the baseline
-/// full-root scan `explicit_scan_root_since_ts` selects. So the roots and the
-/// selection of a run that did not pass `--source-safety-config` are exactly
-/// what they were.
-///
-/// Ownership preparation is a run-level choice. Source completion evidence
-/// remains a connector capability: legacy readers never require a receipt.
+/// Build per-root scan plans using `source_ownership` arbitration so configured
+/// roots never cross-hijack another connector's session files, while keeping
+/// baseline incremental/full-root scan watermark behavior intact.
 fn build_connector_root_plans(
     storage: &FrankenStorage,
     connector_factories: &[(&'static str, ConnectorFactory)],
@@ -19360,16 +19354,17 @@ fn build_pairing_candidates_with_events(
 /// Run v2 recall + R2/R3 judgment and redaction over every message in `conv`
 /// using `events` (message-position-aligned [`BlobEvent`]s carrying each
 /// message's structural facts and original parsed JSON record). Returns the
-/// per-message markers and bounded `recall_uncovered_by_reason` counts,
-/// mutating `conv.messages` in place via `recall_v2::apply_with_redaction` and
-/// `exclusion::apply_sibling`.
+/// per-message markers, bounded `recall_uncovered_by_reason` counts, and a flag
+/// indicating whether any unsplit `user` message had embedded `tool_result`
+/// blocks redacted in `extra` (requiring `sync_capture_durable` even when
+/// `markers` are all `None`).
 fn judge_and_redact_reparsed(
     conv: &mut NormalizedConversation,
     events: &[crate::indexer::exclusion::BlobEvent],
     blob_relative_path: &str,
     paths_cfg: &crate::sources::config::ExcludedContextPaths,
     redaction_enabled: bool,
-) -> (Vec<Option<crate::indexer::exclusion::ExcludedMarker>>, BTreeMap<String, u64>) {
+) -> (Vec<Option<crate::indexer::exclusion::ExcludedMarker>>, BTreeMap<String, u64>, bool) {
     use crate::indexer::exclusion::{PairingContext, apply_sibling, field_map_for};
     use crate::indexer::recall_v2::{Outcome, apply_with_redaction, decide_for_record};
 
@@ -19380,6 +19375,7 @@ fn judge_and_redact_reparsed(
 
     let mut markers: Vec<Option<crate::indexer::exclusion::ExcludedMarker>> = vec![None; conv.messages.len()];
     let mut recall_uncovered: BTreeMap<String, u64> = BTreeMap::new();
+    let mut embedded_redacted = false;
     let mut hits: Vec<(usize, crate::indexer::exclusion::ExcludedMarker)> = Vec::new();
     for idx in 0..conv.messages.len() {
         let Some(blob_event) = events.get(idx) else { continue };
@@ -19499,6 +19495,7 @@ fn judge_and_redact_reparsed(
                         &blk_body,
                         field_map,
                     );
+                    embedded_redacted = true;
                 }
                 Outcome::Preserve(Some(reason)) => {
                     *recall_uncovered.entry(reason.as_str().to_string()).or_insert(0) += 1;
@@ -19507,32 +19504,33 @@ fn judge_and_redact_reparsed(
             }
         }
     }
-    (markers, recall_uncovered)
+    (markers, recall_uncovered, embedded_redacted)
 }
 
 /// Shared by [`prepare_conversation_for_ingest`] and
 /// [`prepare_conversation_for_restore`]: runs the alignment guard and v2
-/// judgment over [`BlobEvent`]s, returning both exclusion markers and bounded
-/// uncovered-recall diagnostics.
+/// judgment over [`BlobEvent`]s, returning exclusion markers, bounded
+/// uncovered-recall diagnostics, and whether embedded `tool_result` redaction
+/// occurred in unsplit `user` messages.
 pub(crate) fn judge_reparsed_blob_events_with_redaction(
     conv: &mut NormalizedConversation,
     events: &[crate::indexer::exclusion::BlobEvent],
     blob_relative_path: &str,
     paths_cfg: &crate::sources::config::ExcludedContextPaths,
     redaction_enabled: bool,
-) -> (Vec<Option<crate::indexer::exclusion::ExcludedMarker>>, BTreeMap<String, u64>) {
+) -> (Vec<Option<crate::indexer::exclusion::ExcludedMarker>>, BTreeMap<String, u64>, bool) {
     if conv.agent_slug == "codex" && conv.messages.first().map(|m| m.role.as_str()) == Some("user") {
         record_codex_idx0_user_candidate();
     }
     if !crate::indexer::exclusion::structural_facts_available(&conv.agent_slug) {
-        return (vec![None; conv.messages.len()], BTreeMap::new());
+        return (vec![None; conv.messages.len()], BTreeMap::new(), false);
     }
     if events.len() == conv.messages.len() {
         judge_and_redact_reparsed(conv, events, blob_relative_path, paths_cfg, redaction_enabled)
     } else {
         record_event_align_failed();
         record_event_align_failure(conv, events.len());
-        (vec![None; conv.messages.len()], BTreeMap::new())
+        (vec![None; conv.messages.len()], BTreeMap::new(), false)
     }
 }
 
@@ -19900,12 +19898,12 @@ fn prepare_conversation_for_ingest(
         let paths_cfg = crate::sources::config::ExcludedContextPaths::load().map_err(|e| {
             PrepareError(format!("excluded_context_paths.toml 加载失败（不回退内置默认清单）: {e:#}"))
         })?;
-        // Ticket 02 (`cass-alien-fresh-ingest`): only `pi_agent` switches to
-        // its own full-cleanup judgment, and its input is the materialized
-        // capture blob -- never the live `source_path`. Every other connector
-        // keeps the unchanged legacy judgment. The config load above still
-        // runs first for both, so a broken config fails the same way.
-        let markers = if reparsed.agent_slug == "pi_agent" {
+        // Plan A unified `recall_v2` cleanup: `pi_agent` runs its lossless JSON
+        // parser over the materialized capture blob while Claude Code, Codex,
+        // and other connectors run `judge_reparsed_blob_events_with_redaction`
+        // over the same materialized capture blob. `ExcludedContextPaths::load`
+        // runs first for all paths so a broken config always fails closed.
+        let (markers, embedded_redacted) = if reparsed.agent_slug == "pi_agent" {
             let outcome = crate::indexer::pi_recall::cleanup_pi_conversation(
                 &materialized,
                 &mut reparsed,
@@ -19917,11 +19915,11 @@ fn prepare_conversation_for_ingest(
                 record_event_align_failed();
                 record_event_align_failure(&reparsed, outcome.event_count);
             }
-            outcome.excluded
+            (outcome.excluded, false)
         } else {
             let events =
                 crate::indexer::exclusion::blob_events_from_blob(&reparsed.agent_slug, &materialized);
-            let (markers, uncovered) = judge_reparsed_blob_events_with_redaction(
+            let (markers, uncovered, embedded_redacted) = judge_reparsed_blob_events_with_redaction(
                 &mut reparsed,
                 &events,
                 &record.blob_relative_path,
@@ -19929,7 +19927,7 @@ fn prepare_conversation_for_ingest(
                 crate::indexer::redact_secrets::redaction_enabled(),
             );
             recall_uncovered = uncovered;
-            markers
+            (markers, embedded_redacted)
         };
 
         conv = reparsed;
@@ -19944,7 +19942,7 @@ fn prepare_conversation_for_ingest(
         // stale for every normal (non-restore) ingest.
         attach_raw_mirror_metadata(&mut conv, record);
 
-        if excluded.iter().any(Option::is_some) {
+        if excluded.iter().any(Option::is_some) || embedded_redacted {
             invoke_prepare_fault_hook(PrepareStage::BeforeDurableSync, &original_source_path);
             crate::raw_mirror::sync_capture_durable(data_dir, record).map_err(|e| {
                 // N09 (#131): the capture-failure exit on either side of this
@@ -20038,13 +20036,14 @@ pub(crate) fn prepare_conversation_for_restore(
             PrepareError(format!("excluded_context_paths.toml 加载失败（不回退内置默认清单）: {e:#}"))
         })?;
         let events = crate::indexer::exclusion::blob_events_from_blob(&conv.agent_slug, materialized);
-        judge_reparsed_blob_events_with_redaction(
+        let (markers, uncovered, _embedded_redacted) = judge_reparsed_blob_events_with_redaction(
             &mut conv,
             &events,
             &consumed_manifest.blob_relative_path,
             &paths_cfg,
             crate::indexer::redact_secrets::redaction_enabled(),
-        )
+        );
+        (markers, uncovered)
     };
 
     compact_large_connector_extras_for_size(connector_name, &mut conv, Some(sealed_source_size_bytes));
@@ -40822,7 +40821,7 @@ normalization="l2"
         let mut conv = ClaudeCodeConnector::new().scan(&ctx).unwrap().remove(0);
         let events = blob_events_from_blob("claude_code", &claude_bash);
         assert_eq!(events.len(), conv.messages.len());
-        let (markers, uncovered) = judge_reparsed_blob_events_with_redaction(
+        let (markers, uncovered, _) = judge_reparsed_blob_events_with_redaction(
             &mut conv,
             &events,
             "blobs/blake3/ab/bash.raw",
@@ -40907,7 +40906,7 @@ normalization="l2"
         let mut codex_conv = CodexConnector::new().scan(&codex_ctx).unwrap().remove(0);
         let codex_events = blob_events_from_blob("codex", &codex_file);
         assert_eq!(codex_events.len(), codex_conv.messages.len());
-        let (codex_markers, codex_uncovered) = judge_reparsed_blob_events_with_redaction(
+        let (codex_markers, codex_uncovered, _) = judge_reparsed_blob_events_with_redaction(
             &mut codex_conv,
             &codex_events,
             "blobs/blake3/ab/codex.raw",
@@ -40969,7 +40968,7 @@ normalization="l2"
         );
         let json_events = blob_events_from_blob("claude_code", &claude_json);
         assert_eq!(json_events.len(), json_conv.messages.len());
-        let (json_markers, _) = judge_reparsed_blob_events_with_redaction(
+        let (json_markers, _, _) = judge_reparsed_blob_events_with_redaction(
             &mut json_conv,
             &json_events,
             "blobs/blake3/ab/json.raw",
@@ -40984,6 +40983,100 @@ normalization="l2"
             !serde_json::to_string(&json_conv.messages[1].extra)
                 .unwrap()
                 .contains("sentinel-plan-a-v2-body")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_embedded_user_tool_result_triggers_durable_sync_without_message_marker() {
+        use crate::connectors::claude_code::ClaudeCodeConnector;
+        use crate::connectors::{Connector, ScanContext, ScanRoot};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let claude_json = dir.path().join(".claude/projects/p/embedded-durable.json");
+        std::fs::create_dir_all(claude_json.parent().unwrap()).unwrap();
+        let body = serde_json::to_string_pretty(&serde_json::json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "tu-embed-sync",
+                        "name": "mcp__cass-mcp__cass_search",
+                        "input": {"query": "durable-sync-check"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu-embed-sync",
+                            "content": "<cass_recall>embedded-secret-sentinel-sync</cass_recall>"
+                        },
+                        {
+                            "type": "text",
+                            "text": "User prose must stay visible after embedded redaction."
+                        }
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        std::fs::write(&claude_json, body).unwrap();
+
+        let connector = ClaudeCodeConnector::new();
+        let scan_ctx = ScanContext::with_roots(
+            dir.path().join(".claude"),
+            vec![ScanRoot::local(claude_json.clone())],
+            None,
+        );
+        let conv = connector.scan(&scan_ctx).unwrap().remove(0);
+
+        let saw_durable_sync = Arc::new(AtomicBool::new(false));
+        let saw_clone = Arc::clone(&saw_durable_sync);
+        let target_path = claude_json.clone();
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeDurableSync && path == target_path.as_path() {
+                saw_clone.store(true, Ordering::SeqCst);
+            }
+        })));
+        let prepared = prepare_conversation_for_ingest(
+            &data_dir,
+            "claude_code",
+            &connector,
+            &Origin::local(),
+            &IngestIdentity::local(),
+            None,
+            CaptureSourceKind::File(claude_json.clone()),
+            conv,
+        );
+        set_prepare_fault_hook(None);
+
+        let prepared = prepared.expect("prepare_conversation_for_ingest must succeed");
+        assert!(
+            prepared.excluded.iter().all(Option::is_none),
+            "unsplit user message keeps excluded=None so user prose remains searchable"
+        );
+        assert!(
+            saw_durable_sync.load(Ordering::SeqCst),
+            "embedded tool_result redaction in unsplit user message must trigger sync_capture_durable"
+        );
+        assert!(
+            prepared.conv.messages[1]
+                .content
+                .contains("User prose must stay visible"),
+            "user prose must remain intact"
+        );
+        assert!(
+            !serde_json::to_string(&prepared.conv.messages[1].extra)
+                .unwrap()
+                .contains("embedded-secret-sentinel-sync"),
+            "embedded recall payload must be redacted from extra"
         );
     }
 

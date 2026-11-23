@@ -652,7 +652,9 @@ fn schema9_legacy_mirror_prune_protects_absolute_excluded_and_staged_blobs() {
 
     let data_dir_str = fixture.data_dir().to_string_lossy().into_owned();
 
-    // Dry-run must succeed and keep all files untouched.
+    // Dry-run must succeed, report zero missing referenced blobs, pin BOTH protected
+    // blobs (legacy absolute path + staged source_inputs), plan ONLY the orphan for
+    // deletion, and keep all files untouched on disk.
     let dry_out = fixture.run_cass(&[
         "mirror",
         "prune",
@@ -670,6 +672,37 @@ fn schema9_legacy_mirror_prune_protects_absolute_excluded_and_staged_blobs() {
         "mirror prune dry-run failed: stderr={}",
         String::from_utf8_lossy(&dry_out.stderr)
     );
+    let dry_envelope: serde_json::Value = serde_json::from_slice(&dry_out.stdout)
+        .expect("mirror prune dry-run --json must emit valid JSON");
+    assert_eq!(dry_envelope["success"], json!(true));
+    let dry_report = &dry_envelope["prune"];
+    assert_eq!(dry_report["mode"], json!("dry-run"));
+    assert_eq!(
+        dry_report["missing_referenced_blobs"],
+        json!([]),
+        "legacy absolute path must normalize cleanly without missing_referenced_blobs: {dry_report}"
+    );
+    assert_eq!(
+        dry_report["pinned_blob_count"],
+        json!(2),
+        "both legacy absolute-path and staged source_inputs blobs must be pinned in dry-run: {dry_report}"
+    );
+    assert_eq!(
+        dry_report["pinned_manifest_count"],
+        json!(2),
+        "both protected manifests must be pinned in dry-run: {dry_report}"
+    );
+    assert_eq!(
+        dry_report["planned_blob_count"],
+        json!(1),
+        "exactly the single unreferenced orphan blob must be planned for deletion: {dry_report}"
+    );
+    assert_eq!(
+        dry_report["planned_manifest_count"],
+        json!(1),
+        "exactly the single unreferenced orphan manifest must be planned for deletion: {dry_report}"
+    );
+    assert_eq!(dry_report["applied_blob_count"], json!(0));
     assert!(abs_blob_disk.is_file());
     assert!(staged_blob_disk.is_file());
     assert!(orphan_blob_disk.is_file());
@@ -694,6 +727,14 @@ fn schema9_legacy_mirror_prune_protects_absolute_excluded_and_staged_blobs() {
         "mirror prune --apply failed: stderr={}",
         String::from_utf8_lossy(&apply_out.stderr)
     );
+    let apply_envelope: serde_json::Value = serde_json::from_slice(&apply_out.stdout)
+        .expect("mirror prune --apply --json must emit valid JSON");
+    assert_eq!(apply_envelope["success"], json!(true));
+    let apply_report = &apply_envelope["prune"];
+    assert_eq!(apply_report["mode"], json!("apply"));
+    assert_eq!(apply_report["missing_referenced_blobs"], json!([]));
+    assert_eq!(apply_report["pinned_blob_count"], json!(2));
+    assert_eq!(apply_report["applied_blob_count"], json!(1));
     assert!(
         abs_blob_disk.is_file(),
         "legacy absolute-path messages.excluded.raw.blob must be protected from prune"
@@ -705,6 +746,123 @@ fn schema9_legacy_mirror_prune_protects_absolute_excluded_and_staged_blobs() {
     assert!(
         !orphan_blob_disk.exists(),
         "unreferenced old orphan blob must be pruned so the protection test is non-vacuous"
+    );
+}
+
+#[test]
+fn schema9_mirror_prune_refuses_external_blobs_blake3_path_fail_closed() {
+    let fixture = LegacyFixture::new();
+    let storage = FrankenStorage::open(&fixture.db_path()).expect("open schema 9 db");
+    let agent_id = storage
+        .ensure_agent(&Agent {
+            id: None,
+            slug: "claude_code".to_string(),
+            name: "Claude Code".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })
+        .expect("ensure agent");
+
+    let src_real = fixture.home().join("sessions/real.jsonl");
+    std::fs::create_dir_all(src_real.parent().unwrap()).expect("create sessions dir");
+    std::fs::write(&src_real, "{\"msg\":\"real-mirror-blob\"}\n").expect("write real session");
+    let cap_real = capture_source_file(RawMirrorCaptureInput {
+        data_dir: &fixture.data_dir(),
+        provider: "claude_code",
+        source_id: "local",
+        origin_kind: "local",
+        origin_host: Some("local"),
+        source_path: &src_real,
+        db_links: &[],
+    })
+    .expect("capture real blob");
+
+    let mirror_root = fixture.data_dir().join("raw-mirror/v1");
+    let real_blob_disk = mirror_root.join(&cap_real.blob_relative_path);
+    assert!(real_blob_disk.is_file());
+
+    // Stamp an unrelated outside absolute path that happens to share the same
+    // `/blobs/blake3/<2hex>/<digest>` suffix: it must NOT normalize into `mirror_root`
+    // and must trigger R9 fail-closed refusal instead.
+    let unrelated_outside_path = format!(
+        "/tmp/unrelated-outside-archive/{}",
+        cap_real.blob_relative_path
+    );
+    let (_conv_id, msg_id) = seed_conversation(
+        &storage,
+        agent_id,
+        "external-blobs-blake3-ref",
+        &src_real,
+        "",
+    );
+    let outside_excluded = json!({
+        "reason": "cass_recall",
+        "rule_version": 2,
+        "raw": {
+            "blob": unrelated_outside_path
+        }
+    })
+    .to_string();
+    storage
+        .raw()
+        .execute(
+            "UPDATE messages SET excluded = jsonb(?1) WHERE id = ?2",
+            &[SqlValue::Text(outside_excluded), SqlValue::Integer(msg_id)],
+        )
+        .expect("stamp unrelated external excluded marker");
+    drop(storage);
+
+    backdate_mirror_manifests(&mirror_root, Duration::from_secs(10 * 24 * 3600));
+    let data_dir_str = fixture.data_dir().to_string_lossy().into_owned();
+
+    let dry_out = fixture.run_cass(&[
+        "mirror",
+        "prune",
+        "--data-dir",
+        &data_dir_str,
+        "--older-than",
+        "1d",
+        "--safety-hold-down",
+        "0s",
+        "--json",
+    ]);
+    assert_eq!(
+        dry_out.status.code(),
+        Some(0),
+        "mirror prune dry-run should report missing outside ref in JSON: stderr={}",
+        String::from_utf8_lossy(&dry_out.stderr)
+    );
+    let dry_envelope: serde_json::Value = serde_json::from_slice(&dry_out.stdout)
+        .expect("dry-run JSON output");
+    let dry_report = &dry_envelope["prune"];
+    let missing = dry_report["missing_referenced_blobs"]
+        .as_array()
+        .expect("missing_referenced_blobs array");
+    assert!(
+        missing.iter().any(|v| v.as_str() == Some(unrelated_outside_path.as_str())),
+        "unrelated outside /blobs/blake3 path must stay unnormalized and appear in missing_referenced_blobs: {dry_report}"
+    );
+
+    let apply_out = fixture.run_cass(&[
+        "mirror",
+        "prune",
+        "--data-dir",
+        &data_dir_str,
+        "--older-than",
+        "1d",
+        "--safety-hold-down",
+        "0s",
+        "--apply",
+        "--json",
+    ]);
+    assert_ne!(
+        apply_out.status.code(),
+        Some(0),
+        "R9 fail-closed must refuse --apply when an outside /blobs/blake3 path is referenced"
+    );
+    assert!(
+        real_blob_disk.is_file(),
+        "R9 refusal must leave mirror blobs untouched"
     );
 }
 

@@ -6466,10 +6466,9 @@ impl FrankenStorage {
     /// disk are untouched, and so is the raw mirror: the §14.5 deletion is
     /// DB-only on both sides.
     ///
-    /// The agent's source copies leave in the same transaction. Their
-    /// selection is the connector, not the conversations table, so a purge
-    /// that matches no canonical conversation still removes the copies this
-    /// agent owns.
+    /// For pre-existing Schema 9 archives carrying legacy `source_message_links`,
+    /// `delete_messages_ordered_in_tx` detaches those links inside the same
+    /// transaction before deleting canonical message rows.
     pub fn purge_agent_archive_data(&self, agent_slug: &str) -> Result<AgentArchivePurgeResult> {
         let normalized = agent_slug.trim().to_ascii_lowercase();
         if normalized.is_empty() {
