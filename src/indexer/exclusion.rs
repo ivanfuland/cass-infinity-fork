@@ -229,6 +229,7 @@ pub(crate) fn blob_events_from_blob(agent_slug: &str, blob_path: &Path) -> Vec<B
     match agent_slug {
         "claude_code" => claude_code_blob_events_from_blob(blob_path).unwrap_or_default(),
         "codex" => codex_blob_events_from_blob(blob_path).unwrap_or_default(),
+        "antigravity" => antigravity_blob_events_from_blob(blob_path).unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -247,7 +248,7 @@ pub(crate) fn events_from_blob(agent_slug: &str, blob_path: &Path) -> Vec<RawEve
 /// 只对有 `tool_name`/结构字段的连接器启用), not the alignment *failure* the
 /// caller's `event_align_failed` counter is meant to track.
 pub(crate) fn structural_facts_available(agent_slug: &str) -> bool {
-    matches!(agent_slug, "claude_code" | "codex")
+    matches!(agent_slug, "claude_code" | "codex" | "antigravity")
 }
 
 /// Mirrors `franken_agent_detection::connectors::claude_code`'s content-block
@@ -845,6 +846,475 @@ fn codex_blob_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<BlobEven
     Ok(events)
 }
 
+/// Mirrors `franken_agent_detection::connectors::antigravity` (pinned FAD
+/// `04ef3f08`, `src/connectors/antigravity.rs`) 1-to-1: 100 MiB streaming cap,
+/// `\u{feff}` UTF-8 BOM strip, mid-read I/O full discard, `step_index` sort,
+/// boilerplate template filtering, exact-count turn-window pairing, and 6-role
+/// message emission.
+fn antigravity_blob_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<BlobEvent>> {
+    use std::io::{BufRead, BufReader, Read};
+
+    const MAX_TRANSCRIPT_BYTES: u64 = 100 * 1024 * 1024;
+
+    if std::fs::metadata(blob_path)?.len() > MAX_TRANSCRIPT_BYTES {
+        return Ok(Vec::new());
+    }
+
+    let file = std::fs::File::open(blob_path)?;
+    let mut reader = BufReader::new(file.take(MAX_TRANSCRIPT_BYTES + 1));
+    let mut records: Vec<(usize, serde_json::Value)> = Vec::new();
+    let mut buf = String::new();
+    let mut total_bytes: u64 = 0;
+    let mut lineno: usize = 0;
+
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                lineno += 1;
+                total_bytes = total_bytes.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+                if total_bytes > MAX_TRANSCRIPT_BYTES {
+                    return Ok(Vec::new());
+                }
+                let trimmed = buf.trim_start_matches('\u{feff}').trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+                    && value.is_object()
+                {
+                    records.push((lineno, value));
+                }
+            }
+            Err(_) => return Ok(Vec::new()),
+        }
+    }
+
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    records.sort_by_key(|(_, r)| {
+        r.get("step_index")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(i64::MAX)
+    });
+
+    fn extract_tagged_blocks(content: &str, tag: &str) -> Vec<String> {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let mut out = Vec::new();
+        let mut rest = content;
+        while let Some(start) = rest.find(&open) {
+            let after = &rest[start + open.len()..];
+            let Some(end) = after.find(&close) else {
+                break;
+            };
+            out.push(after[..end].trim().to_string());
+            rest = &after[end + close.len()..];
+        }
+        out
+    }
+
+    fn extract_user_body(content: &str) -> String {
+        let requests = extract_tagged_blocks(content, "USER_REQUEST");
+        if requests.is_empty() {
+            content.trim().to_string()
+        } else {
+            requests.join("\n\n")
+        }
+    }
+
+    fn is_boilerplate_system(content: &str) -> bool {
+        (content.contains("The following system message was injected by a PreInvocation hook:")
+            && content.contains("<agent-contract-source "))
+            || (content.contains("Reminder: work efficiently.")
+                && content.contains("<SYSTEM_MESSAGE>"))
+    }
+
+    fn extract_error_text(rec: &serde_json::Value) -> Option<String> {
+        let val = rec.get("error").filter(|v| !v.is_null())?;
+        let text = match val {
+            serde_json::Value::String(s) => s.trim().to_string(),
+            other => other.to_string(),
+        };
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn merge_content_and_error(content: &str, error_text: Option<&str>) -> String {
+        let c = content.trim();
+        match (
+            c.is_empty(),
+            error_text.map(str::trim).filter(|e| !e.is_empty()),
+        ) {
+            (false, Some(err)) if c != err => format!("{c}\n{err}"),
+            (false, _) => content.to_string(),
+            (true, Some(err)) => err.to_string(),
+            (true, None) => String::new(),
+        }
+    }
+
+    struct AgyCall {
+        name: String,
+        call_id: Option<String>,
+        args: Option<serde_json::Value>,
+    }
+
+    fn parse_calls(arr: &[serde_json::Value], fallback_name: &str) -> Vec<AgyCall> {
+        arr.iter()
+            .map(|tc| {
+                let name = tc
+                    .get("name")
+                    .or_else(|| tc.get("tool_name"))
+                    .or_else(|| tc.pointer("/function/name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(|| fallback_name.to_string(), str::to_string);
+                let call_id = tc
+                    .get("id")
+                    .or_else(|| tc.get("call_id"))
+                    .or_else(|| tc.get("tool_call_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let args = tc
+                    .get("arguments")
+                    .or_else(|| tc.get("args"))
+                    .or_else(|| tc.get("input"))
+                    .or_else(|| tc.pointer("/function/arguments"))
+                    .map(parse_tool_args_value);
+                AgyCall { name, call_id, args }
+            })
+            .collect()
+    }
+
+    fn step_label(rec: &serde_json::Value, pos: usize) -> String {
+        rec.get("step_index")
+            .and_then(serde_json::Value::as_i64)
+            .map_or_else(|| format!("pos{pos}"), |idx| idx.to_string())
+    }
+
+    // Precompute exact-count turn-window pairings matching FAD `compute_turn_pairings`.
+    let mut planner_calls: HashMap<usize, Vec<(AgyCall, Option<String>)>> = HashMap::new();
+    let mut generic_matches: HashMap<usize, (String, String)> = HashMap::new();
+
+    for (pos, (_, rec)) in records.iter().enumerate() {
+        if rec.get("type").and_then(serde_json::Value::as_str) != Some("PLANNER_RESPONSE") {
+            continue;
+        }
+        let Some(raw_calls) = rec
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .filter(|a| !a.is_empty())
+        else {
+            continue;
+        };
+        let parsed = parse_calls(raw_calls, "unknown");
+        let mut generic_positions = Vec::new();
+        for (j, (_, next_rec)) in records.iter().enumerate().skip(pos + 1) {
+            let next_type = next_rec
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let next_source = next_rec
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            match next_type {
+                "PLANNER_RESPONSE" | "USER_INPUT" | "CHECKPOINT" => break,
+                "GENERIC" if next_source == "MODEL" => generic_positions.push(j),
+                _ => {}
+            }
+        }
+        if generic_positions.len() == parsed.len() {
+            let label = step_label(rec, pos);
+            let mut entries = Vec::with_capacity(parsed.len());
+            for (k, (tc, gen_pos)) in parsed.into_iter().zip(generic_positions).enumerate() {
+                let pair_id = tc
+                    .call_id
+                    .clone()
+                    .unwrap_or_else(|| format!("agy:step{label}:call{k}"));
+                generic_matches.insert(gen_pos, (pair_id.clone(), tc.name.clone()));
+                entries.push((tc, Some(pair_id)));
+            }
+            planner_calls.insert(pos, entries);
+        } else {
+            let entries = parsed.into_iter().map(|tc| (tc, None)).collect();
+            planner_calls.insert(pos, entries);
+        }
+    }
+
+    let mut events = Vec::new();
+    for (pos, (raw_lineno, rec)) in records.iter().enumerate() {
+        // FAD's `add_raw_role` skips any record whose raw object contains reserved `raw_role`.
+        if rec
+            .as_object()
+            .is_some_and(|obj| obj.contains_key("raw_role"))
+        {
+            continue;
+        }
+        let event_key = format!("line:{raw_lineno}");
+        let source = rec
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let step_type = rec
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let content = rec
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        let push_block = |events: &mut Vec<BlobEvent>, block: RawBlock| {
+            events.push(BlobEvent {
+                event: RawEvent {
+                    event_key: event_key.clone(),
+                    blocks: vec![block],
+                },
+                raw_record: rec.clone(),
+            });
+        };
+
+        match step_type {
+            "USER_INPUT" => {
+                if !extract_user_body(content).trim().is_empty() {
+                    push_block(
+                        &mut events,
+                        RawBlock {
+                            index: 0,
+                            kind: BlockKind::Text,
+                            tool_use_id: None,
+                            tool_name: None,
+                            args: None,
+                        },
+                    );
+                }
+            }
+            "PLANNER_RESPONSE" => {
+                if rec
+                    .get("thinking")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty())
+                {
+                    push_block(
+                        &mut events,
+                        RawBlock {
+                            index: 0,
+                            kind: BlockKind::Text,
+                            tool_use_id: None,
+                            tool_name: None,
+                            args: None,
+                        },
+                    );
+                }
+                if !content.trim().is_empty() {
+                    push_block(
+                        &mut events,
+                        RawBlock {
+                            index: 0,
+                            kind: BlockKind::Text,
+                            tool_use_id: None,
+                            tool_name: None,
+                            args: None,
+                        },
+                    );
+                }
+                if let Some(calls) = planner_calls.get(&pos) {
+                    for (tc, pair_id) in calls {
+                        push_block(
+                            &mut events,
+                            RawBlock {
+                                index: 0,
+                                kind: BlockKind::ToolUse,
+                                tool_use_id: pair_id.clone(),
+                                tool_name: Some(tc.name.clone()),
+                                args: tc.args.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+            "GENERIC" if source == "MODEL" => {
+                let matched = generic_matches.get(&pos);
+                let error_text = extract_error_text(rec);
+                let media = rec.get("media").filter(|v| !v.is_null());
+                let body = if content.trim().is_empty() {
+                    error_text.unwrap_or_default()
+                } else {
+                    content.to_string()
+                };
+                if body.trim().is_empty() && media.is_none() && matched.is_none() {
+                    continue;
+                }
+                push_block(
+                    &mut events,
+                    RawBlock {
+                        index: 0,
+                        kind: BlockKind::ToolResult,
+                        tool_use_id: matched.map(|(id, _)| id.clone()),
+                        tool_name: matched.map(|(_, name)| name.clone()),
+                        args: None,
+                    },
+                );
+            }
+            "CONVERSATION_HISTORY" => {}
+            "ERROR_MESSAGE" => {
+                let error_text = extract_error_text(rec);
+                if !merge_content_and_error(content, error_text.as_deref())
+                    .trim()
+                    .is_empty()
+                {
+                    push_block(
+                        &mut events,
+                        RawBlock {
+                            index: 0,
+                            kind: BlockKind::Text,
+                            tool_use_id: None,
+                            tool_name: None,
+                            args: None,
+                        },
+                    );
+                }
+            }
+            "CHECKPOINT" => {
+                if !content.trim().is_empty() {
+                    push_block(
+                        &mut events,
+                        RawBlock {
+                            index: 0,
+                            kind: BlockKind::Text,
+                            tool_use_id: None,
+                            tool_name: None,
+                            args: None,
+                        },
+                    );
+                }
+            }
+            "EPHEMERAL_MESSAGE" | "SYSTEM_MESSAGE" => {
+                if !content.trim().is_empty() && !is_boilerplate_system(content) {
+                    push_block(
+                        &mut events,
+                        RawBlock {
+                            index: 0,
+                            kind: BlockKind::Text,
+                            tool_use_id: None,
+                            tool_name: None,
+                            args: None,
+                        },
+                    );
+                }
+            }
+            _ if source == "MODEL" => {
+                let error_text = extract_error_text(rec);
+                let body = merge_content_and_error(content, error_text.as_deref());
+                let has_thinking = rec
+                    .get("thinking")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| !s.trim().is_empty());
+                let fallback_name = if step_type.trim().is_empty() {
+                    "unknown".to_string()
+                } else {
+                    step_type.trim().to_ascii_lowercase()
+                };
+                if let Some(raw_calls) = rec
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|a| !a.is_empty())
+                {
+                    let calls = parse_calls(raw_calls, &fallback_name);
+                    if calls.len() == 1 {
+                        let tc = &calls[0];
+                        let label = step_label(rec, pos);
+                        let pair_id = tc
+                            .call_id
+                            .clone()
+                            .unwrap_or_else(|| format!("agy:step{label}:call0"));
+                        push_block(
+                            &mut events,
+                            RawBlock {
+                                index: 0,
+                                kind: BlockKind::ToolUse,
+                                tool_use_id: Some(pair_id.clone()),
+                                tool_name: Some(tc.name.clone()),
+                                args: tc.args.clone(),
+                            },
+                        );
+                        push_block(
+                            &mut events,
+                            RawBlock {
+                                index: 0,
+                                kind: BlockKind::ToolResult,
+                                tool_use_id: Some(pair_id),
+                                tool_name: Some(tc.name.clone()),
+                                args: None,
+                            },
+                        );
+                    } else {
+                        for tc in &calls {
+                            push_block(
+                                &mut events,
+                                RawBlock {
+                                    index: 0,
+                                    kind: BlockKind::ToolUse,
+                                    tool_use_id: None,
+                                    tool_name: Some(tc.name.clone()),
+                                    args: tc.args.clone(),
+                                },
+                            );
+                        }
+                        push_block(
+                            &mut events,
+                            RawBlock {
+                                index: 0,
+                                kind: BlockKind::ToolResult,
+                                tool_use_id: None,
+                                tool_name: Some(fallback_name),
+                                args: None,
+                            },
+                        );
+                    }
+                } else if !body.trim().is_empty() || has_thinking {
+                    push_block(
+                        &mut events,
+                        RawBlock {
+                            index: 0,
+                            kind: BlockKind::ToolResult,
+                            tool_use_id: None,
+                            tool_name: Some(fallback_name),
+                            args: None,
+                        },
+                    );
+                }
+            }
+            _ => {
+                let error_text = extract_error_text(rec);
+                if !merge_content_and_error(content, error_text.as_deref())
+                    .trim()
+                    .is_empty()
+                {
+                    push_block(
+                        &mut events,
+                        RawBlock {
+                            index: 0,
+                            kind: BlockKind::Text,
+                            tool_use_id: None,
+                            tool_name: None,
+                            args: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(events)
+}
+
 // ============================================================================
 // T2b: prepare-pipeline carrier types.
 // ============================================================================
@@ -1063,27 +1533,35 @@ fn is_cass_recall_tool(tool_name: &str, agent_slug: &str) -> bool {
 
 struct ReadToolIdentities {
     read: Option<&'static str>,
-    project_read: &'static str,
+    read_arg_keys: &'static [&'static str],
+    project_read: Option<&'static str>,
     bash: &'static str,
-    bash_arg_key: &'static str,
+    bash_arg_keys: &'static [&'static str],
 }
 
-/// R11 alias table. Only `claude_code`/`codex` are populated (T1b backfilled
-/// these two; other connectors have zero镜像 coverage and stay
-/// "不启用" -- see `docs/excluded-rules.md` R7/R11).
+/// R11 alias table for R2 context-file read exclusion.
 fn read_tool_identities(agent_slug: &str) -> Option<ReadToolIdentities> {
     match agent_slug {
         "claude_code" => Some(ReadToolIdentities {
             read: Some("Read"),
-            project_read: "mcp__ccw-control-plane__project_read",
+            read_arg_keys: &["file_path"],
+            project_read: Some("mcp__ccw-control-plane__project_read"),
             bash: "Bash",
-            bash_arg_key: "command",
+            bash_arg_keys: &["command"],
         }),
         "codex" => Some(ReadToolIdentities {
             read: None,
-            project_read: "project_read",
+            read_arg_keys: &[],
+            project_read: Some("project_read"),
             bash: "exec_command",
-            bash_arg_key: "cmd",
+            bash_arg_keys: &["cmd"],
+        }),
+        "antigravity" => Some(ReadToolIdentities {
+            read: Some("read_file"),
+            read_arg_keys: &["Path", "file_path"],
+            project_read: None,
+            bash: "run_command",
+            bash_arg_keys: &["CommandLine", "command"],
         }),
         _ => None,
     }
@@ -1429,7 +1907,10 @@ fn decide_r1_r2_for_call(call: &PairedTool, event: &RawEvent, agent_slug: &str, 
     }
 
     if identities.read == Some(tool_name) {
-        let file_path = args.get("file_path")?.as_str()?;
+        let file_path = identities
+            .read_arg_keys
+            .iter()
+            .find_map(|key| args.get(*key).and_then(serde_json::Value::as_str))?;
         if !predicate_p(file_path, paths_cfg) {
             return None;
         }
@@ -1450,7 +1931,7 @@ fn decide_r1_r2_for_call(call: &PairedTool, event: &RawEvent, agent_slug: &str, 
         );
     }
 
-    if identities.project_read == tool_name {
+    if identities.project_read == Some(tool_name) {
         let document = args.get("document")?.as_str()?;
         if !predicate_p_project_read_document(document, paths_cfg) {
             return None;
@@ -1464,7 +1945,10 @@ fn decide_r1_r2_for_call(call: &PairedTool, event: &RawEvent, agent_slug: &str, 
     }
 
     if identities.bash == tool_name {
-        let command = args.get(identities.bash_arg_key)?.as_str()?;
+        let command = identities
+            .bash_arg_keys
+            .iter()
+            .find_map(|key| args.get(*key).and_then(serde_json::Value::as_str))?;
         let bash_paths = bash_readonly_paths(command)?;
         if bash_paths.is_empty() || !bash_paths.iter().all(|p| predicate_p(p, paths_cfg)) {
             return None;
@@ -1574,6 +2058,7 @@ pub const EXTRA_FIELD_MAP: &[(&str, &[&str])] = &[
             "content[*].text",
         ],
     ),
+    ("antigravity", &["content", "error"]),
 ];
 
 /// Resolved per-connector path list -- what `apply`/`apply_sibling` actually
@@ -4462,5 +4947,83 @@ mod tests {
         assert_eq!(msg.extra["content"]["sha256"], marker.sha256);
         assert_eq!(msg.extra["id"], "m3");
         assert!(!serde_json::to_string(&msg.extra).unwrap().contains("sentinel-json-doc-body"));
+    }
+
+    #[test]
+    fn antigravity_blob_events_strips_bom_pairs_exact_and_supports_r2_tools() {
+        let lines = [
+            serde_json::json!({
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": "2026-11-22T10:00:00Z",
+                "content": "Read the policy doc"
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-22T10:00:01Z",
+                "thinking": "Let me read it",
+                "content": "Checking file",
+                "tool_calls": [
+                    {"name": "read_file", "arguments": {"Path": "/tmp/cc-workspace/CLAUDE.md"}}
+                ]
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "created_at": "2026-11-22T10:00:02Z",
+                "content": "Created At: 2026-11-22T10:00:01Z\nCompleted At: 2026-11-22T10:00:02Z\npolicy body"
+            }),
+        ];
+        let mut raw = String::from("\u{feff}");
+        for line in &lines {
+            raw.push_str(&serde_json::to_string(line).unwrap());
+            raw.push('\n');
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("transcript_full.jsonl");
+        std::fs::write(&path, raw.as_bytes()).unwrap();
+
+        let events = blob_events_from_blob("antigravity", &path);
+        assert_eq!(events.len(), 5, "user + reasoning + assistant + tool_call + tool_result");
+        assert_eq!(events[3].event.blocks[0].tool_use_id.as_deref(), Some("agy:step1:call0"));
+        assert_eq!(events[4].event.blocks[0].tool_use_id.as_deref(), Some("agy:step1:call0"));
+
+        // Verify R2 read_file(Path/file_path) and run_command(CommandLine/command) match excluded paths.
+        let paths = paths_cfg();
+        for key in ["Path", "file_path"] {
+            let ctx_read = ctx_from(&[
+                PairingCandidate::ToolCall(PairedTool {
+                    tool_call_id: Some("agy:step1:call0".into()),
+                    tool_name: "read_file".into(),
+                    args: Some(serde_json::json!({ key: "/tmp/cc-workspace/CLAUDE.md" })),
+                }),
+                PairingCandidate::ToolResult {
+                    tool_call_id: Some("agy:step1:call0".into()),
+                },
+            ]);
+            let decision = decide(&msg("tool_result", "policy body"), 1, &events[4].event, &ctx_read, "antigravity", &paths)
+                .unwrap_or_else(|| panic!("antigravity read_file({key}) must match R2"));
+            assert_eq!(decision.reason, ExclusionReason::ContextFileRead);
+        }
+
+        for key in ["CommandLine", "command"] {
+            let ctx_shell = ctx_from(&[
+                PairingCandidate::ToolCall(PairedTool {
+                    tool_call_id: Some("agy:step1:call0".into()),
+                    tool_name: "run_command".into(),
+                    args: Some(serde_json::json!({ key: "cat /tmp/cc-workspace/CLAUDE.md" })),
+                }),
+                PairingCandidate::ToolResult {
+                    tool_call_id: Some("agy:step1:call0".into()),
+                },
+            ]);
+            let decision = decide(&msg("tool_result", "policy body"), 1, &events[4].event, &ctx_shell, "antigravity", &paths)
+                .unwrap_or_else(|| panic!("antigravity run_command({key}) must match R2"));
+            assert_eq!(decision.reason, ExclusionReason::ContextFileRead);
+        }
     }
 }

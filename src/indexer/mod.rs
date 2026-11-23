@@ -19284,7 +19284,31 @@ fn build_pairing_candidates_with_events(
             match m.role.as_str() {
                 "user" => PairingCandidate::TurnBoundary,
                 "tool_call" => {
-                    if !m.invocations.is_empty() {
+                    let explicitly_unpaired =
+                        m.extra.get("unpaired").and_then(serde_json::Value::as_bool) == Some(true);
+                    let has_explicit_call_id = m
+                        .invocations
+                        .iter()
+                        .any(|inv| inv.call_id.as_deref().is_some_and(|id| !id.is_empty()))
+                        || m.extra
+                            .get("tool_call_id")
+                            .or_else(|| m.extra.get("call_id"))
+                            .or_else(|| m.extra.get("tool_use_id"))
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|id| !id.is_empty());
+                    if conv.agent_slug == "antigravity"
+                        && explicitly_unpaired
+                        && !has_explicit_call_id
+                    {
+                        // Block mismatched antigravity tool_calls from entering
+                        // PairingContext::build's id-less `unpaired.len() == 1`
+                        // cross-step fallback.
+                        PairingCandidate::ToolResult {
+                            tool_call_id: Some(format!(
+                                "__cass_explicitly_unpaired_call_{idx}__"
+                            )),
+                        }
+                    } else if !m.invocations.is_empty() {
                         merge_invocations_with_event(&m.invocations, blob_event)
                     } else {
                         // Whole-document Codex `.json` `items[]` entries with
@@ -19335,16 +19359,25 @@ fn build_pairing_candidates_with_events(
                         }
                     }
                 }
-                "tool_result" => PairingCandidate::ToolResult {
-                    tool_call_id: m
+                "tool_result" => {
+                    let explicitly_unpaired =
+                        m.extra.get("unpaired").and_then(serde_json::Value::as_bool) == Some(true);
+                    let explicit_id = m
                         .extra
                         .get("tool_call_id")
                         .or_else(|| m.extra.get("tool_use_id"))
                         .or_else(|| m.extra.get("call_id"))
                         .and_then(|v| v.as_str())
                         .map(str::to_string)
-                        .or_else(|| blob_event.and_then(event_tool_result_id)),
-                },
+                        .or_else(|| blob_event.and_then(event_tool_result_id));
+                    PairingCandidate::ToolResult {
+                        tool_call_id: if explicitly_unpaired && explicit_id.is_none() {
+                            Some(format!("__cass_explicitly_unpaired_{idx}__"))
+                        } else {
+                            explicit_id
+                        },
+                    }
+                }
                 _ => PairingCandidate::ToolResult {
                     tool_call_id: Some(format!("__cass_pairing_neutral_{idx}__")),
                 },
@@ -19704,6 +19737,29 @@ fn prepare_conversation_for_ingest(
         .pointer("/cass/workspace_original")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    // Preserve first-parse sidecar metadata (e.g. Antigravity's read-only
+    // `conversation_summaries.db` title/subagent enrichment) across scratch
+    // single-file reparse, where sibling sidecar DBs are absent.
+    let original_title = conv.title.clone();
+    let original_title_source = conv
+        .metadata
+        .get("title_source")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let original_parent_conversation_id = conv
+        .metadata
+        .get("parent_conversation_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let original_agent_name = conv
+        .metadata
+        .get("agent_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let original_nesting_depth = conv
+        .metadata
+        .get("nesting_depth")
+        .and_then(serde_json::Value::as_i64);
 
     let record = match source_kind {
         CaptureSourceKind::Logical => {
@@ -19861,6 +19917,49 @@ fn prepare_conversation_for_ingest(
         // parse's FINAL value, not whatever the connector derived scanning
         // the scratch copy.
         reparsed.workspace = original_workspace.clone();
+        // Carry forward first-parse sidecar summary DB metadata (title when
+        // sourced from summary_db, plus subagent hierarchy fields) lost during
+        // isolated scratch-file reparse.
+        if original_title_source.as_deref() == Some("summary_db") {
+            if let Some(title) = &original_title {
+                reparsed.title = Some(title.clone());
+            }
+        }
+        if original_title_source.is_some()
+            || original_parent_conversation_id.is_some()
+            || original_agent_name.is_some()
+            || original_nesting_depth.is_some()
+        {
+            if !reparsed.metadata.is_object() {
+                reparsed.metadata = serde_json::json!({});
+            }
+            if let Some(obj) = reparsed.metadata.as_object_mut() {
+                if let Some(src) = &original_title_source {
+                    obj.insert(
+                        "title_source".to_string(),
+                        serde_json::Value::String(src.clone()),
+                    );
+                }
+                if let Some(parent_id) = &original_parent_conversation_id {
+                    obj.insert(
+                        "parent_conversation_id".to_string(),
+                        serde_json::Value::String(parent_id.clone()),
+                    );
+                }
+                if let Some(agent_name) = &original_agent_name {
+                    obj.insert(
+                        "agent_name".to_string(),
+                        serde_json::Value::String(agent_name.clone()),
+                    );
+                }
+                if let Some(depth) = original_nesting_depth {
+                    obj.insert(
+                        "nesting_depth".to_string(),
+                        serde_json::Value::from(depth),
+                    );
+                }
+            }
+        }
         // Same identity as the first parse: the reparse of a captured copy is
         // the same session from the same root, never a second identity.
         inject_provenance(&mut reparsed, origin, identity);
@@ -20740,7 +20839,7 @@ pub mod persist {
     /// bounded `recall_uncovered_by_reason` diagnostics on both batch and
     /// resident scan_session outputs.
     pub(super) fn reports_recall_uncovered(agent_slug: &str) -> bool {
-        matches!(agent_slug, "claude_code" | "codex" | "pi_agent")
+        matches!(agent_slug, "claude_code" | "codex" | "pi_agent" | "antigravity")
     }
 
     fn emit_scan_session(
