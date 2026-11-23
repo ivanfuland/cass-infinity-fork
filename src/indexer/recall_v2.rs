@@ -88,7 +88,7 @@ enum CandidateKind {
 }
 
 fn cass_supported_agent(agent_slug: &str) -> bool {
-    matches!(agent_slug, "claude_code" | "codex")
+    matches!(agent_slug, "claude_code" | "codex" | "antigravity")
 }
 
 fn full_name_tool(name: &str) -> Option<RecallTool> {
@@ -597,15 +597,88 @@ pub(crate) fn parse_cli(command: &str) -> Result<Option<CliInvocation>, Uncovere
     parse_subcommand(tool, args)
 }
 
-/// Which captured argument key holds the shell command for this
-/// connector/tool pair. Exact names only: a shared suffix or another
-/// connector's tool name proves nothing.
-fn shell_command_key(tool_name: &str, agent_slug: &str) -> Option<&'static str> {
+/// Which captured argument keys hold the shell command for this
+/// connector/tool pair (checked in order; first non-empty string wins).
+/// Exact names only: a shared suffix or another connector's tool name proves nothing.
+fn shell_command_keys(tool_name: &str, agent_slug: &str) -> &'static [&'static str] {
     match (agent_slug, tool_name) {
-        ("claude_code", "Bash") => Some("command"),
-        ("codex", "exec_command") => Some("cmd"),
-        _ => None,
+        ("claude_code", "Bash") => &["command"],
+        ("codex", "exec_command") => &["cmd"],
+        ("antigravity", "run_command") => &["CommandLine", "command"],
+        _ => &[],
     }
+}
+
+/// Deterministic prefix-only framing stripper for Antigravity CLI `agy 1.5.14`
+/// `GENERIC` tool outputs. Strips up to two leading `Created At:` /
+/// `Completed At:` line pairs, and when `is_shell == true`, also strips the
+/// fixed `Command exited with code <N>.\n\nCommand output:\n` header.
+/// Never searches inside the body payload.
+pub(crate) fn strip_antigravity_generic_framing(content: &str, is_shell: bool) -> &str {
+    let mut rest = content;
+    for _ in 0..2 {
+        let Some(after_created) = rest.strip_prefix("Created At:") else {
+            break;
+        };
+        let Some(nl) = after_created.find('\n') else {
+            return rest;
+        };
+        let mut next = &after_created[nl + 1..];
+        if let Some(after_completed) = next.strip_prefix("Completed At:")
+            && let Some(nl2) = after_completed.find('\n')
+        {
+            next = &after_completed[nl2 + 1..];
+        }
+        rest = next;
+    }
+
+    if is_shell {
+        let candidate = rest.trim_start_matches(['\r', '\n']);
+        if let Some(after_exit) = candidate.strip_prefix("Command exited with code ")
+            && let Some(nl) = after_exit.find('\n')
+        {
+            let code_line = after_exit[..nl].trim_end_matches('\r');
+            if let Some(num) = code_line.strip_suffix('.')
+                && !num.is_empty()
+                && num
+                    .strip_prefix('-')
+                    .unwrap_or(num)
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+            {
+                let after_code_line = &after_exit[nl + 1..];
+                let after_blank = after_code_line.trim_start_matches(['\r', '\n']);
+                if let Some(after_hdr) = after_blank.strip_prefix("Command output:")
+                    && let Some(nl3) = after_hdr.find('\n')
+                    && after_hdr[..nl3].trim().is_empty()
+                {
+                    return &after_hdr[nl3 + 1..];
+                }
+            }
+        }
+    }
+
+    rest
+}
+
+/// Recognize Antigravity's lazy-loaded MCP dispatcher:
+/// `call_mcp_tool(ServerName="cass-mcp", ToolName="cass_*", Arguments=...)`.
+/// Any other `ServerName` returns `None` and stays untouched.
+fn classify_antigravity_mcp_dispatcher(call: &PairedTool) -> Option<(RecallTool, Value)> {
+    if call.tool_name != "call_mcp_tool" {
+        return None;
+    }
+    let args_obj = call.args.as_ref()?.as_object()?;
+    if args_obj.get("ServerName").and_then(Value::as_str) != Some("cass-mcp") {
+        return None;
+    }
+    let inner_tool_name = args_obj.get("ToolName").and_then(Value::as_str)?;
+    let tool = bare_name_tool(inner_tool_name).or_else(|| full_name_tool(inner_tool_name))?;
+    let inner_args = args_obj
+        .get("Arguments")
+        .map(exclusion::parse_tool_args_value)
+        .unwrap_or_else(|| serde_json::json!({}));
+    Some((tool, inner_args))
 }
 
 /// True when the raw text contains any `cass_recall` opening tag. Used only
@@ -683,6 +756,15 @@ pub(crate) fn judge_direct_tool_result(
     call: &PairedTool,
     category: DirectToolCategory,
 ) -> Outcome {
+    judge_direct_tool_result_with_body(&msg.content, event, call, category)
+}
+
+fn judge_direct_tool_result_with_body(
+    body: &str,
+    event: &RawEvent,
+    call: &PairedTool,
+    category: DirectToolCategory,
+) -> Outcome {
     let target_blocks = exclusion::tool_result_block_indices(event, call.tool_call_id.as_deref());
     if target_blocks.is_empty() {
         return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
@@ -707,7 +789,7 @@ pub(crate) fn judge_direct_tool_result(
             // absent, so nothing is defaulted or invented.
             let absent = Value::Null;
             let args = call.args.as_ref().unwrap_or(&absent);
-            let (src, parse_error) = match parse_result(tool, &msg.content, args) {
+            let (src, parse_error) = match parse_result(tool, body, args) {
                 Ok(src) => (Some(src), None),
                 Err(reason) => (None, Some(reason.to_string())),
             };
@@ -724,7 +806,7 @@ pub(crate) fn judge_direct_tool_result(
             // absent, so an expand invents no source.
             let absent = Value::Null;
             let args = call.args.as_ref().unwrap_or(&absent);
-            match recall_output::decode(&msg.content, tool) {
+            match recall_output::decode(body, tool) {
                 Ok(value) => {
                     let src = extract_source(tool, &value, args);
                     Outcome::Exclude(Exclusion {
@@ -733,7 +815,7 @@ pub(crate) fn judge_direct_tool_result(
                         parse_error: None,
                     })
                 }
-                Err(_) if looks_like_recall_wrapper(&msg.content) => {
+                Err(_) if looks_like_recall_wrapper(body) => {
                     Outcome::Preserve(Some(UncoveredReason::InvalidRecallFormat))
                 }
                 Err(_) => Outcome::Preserve(Some(UncoveredReason::AmbiguousToolIdentity)),
@@ -790,11 +872,15 @@ pub(crate) fn decide(
         };
     };
 
-    if let Some(command_key) = shell_command_key(&call.tool_name, agent_slug) {
+    let command_keys = shell_command_keys(&call.tool_name, agent_slug);
+    if !command_keys.is_empty() {
         let Some(args) = call.args.as_ref() else {
             return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
         };
-        let Some(command) = args.get(command_key).and_then(Value::as_str) else {
+        let Some(command) = command_keys
+            .iter()
+            .find_map(|key| args.get(*key).and_then(Value::as_str).filter(|s| !s.trim().is_empty()))
+        else {
             return legacy_outcome(msg, idx, event, ctx, agent_slug, paths_cfg);
         };
         match parse_cli(command) {
@@ -818,14 +904,36 @@ pub(crate) fn decide(
                     event_key: event.event_key.clone(),
                     target_blocks,
                 };
-                let (src, parse_error) =
-                    match parse_result(invocation.tool, &msg.content, &invocation.args) {
-                        Ok(src) => (Some(src), None),
-                        Err(reason) => (None, Some(reason.to_string())),
-                    };
+                let body = if agent_slug == "antigravity" {
+                    strip_antigravity_generic_framing(&msg.content, true)
+                } else {
+                    msg.content.as_str()
+                };
+                let (src, parse_error) = match parse_result(invocation.tool, body, &invocation.args)
+                {
+                    Ok(src) => (Some(src), None),
+                    Err(reason) => (None, Some(reason.to_string())),
+                };
                 return Outcome::Exclude(Exclusion { decision, src, parse_error });
             }
         }
+    }
+
+    if agent_slug == "antigravity"
+        && let Some((tool, inner_args)) = classify_antigravity_mcp_dispatcher(call)
+    {
+        let dispatched_call = PairedTool {
+            tool_call_id: call.tool_call_id.clone(),
+            tool_name: call.tool_name.clone(),
+            args: Some(inner_args),
+        };
+        let body = strip_antigravity_generic_framing(&msg.content, false);
+        return judge_direct_tool_result_with_body(
+            body,
+            event,
+            &dispatched_call,
+            DirectToolCategory::Strong(tool),
+        );
     }
 
     let Some(kind) = classify_tool(&call.tool_name, agent_slug) else {
@@ -840,7 +948,12 @@ pub(crate) fn decide(
         CandidateKind::Strong(tool) => DirectToolCategory::Strong(tool),
         CandidateKind::Bare(tool) => DirectToolCategory::Bare(tool),
     };
-    judge_direct_tool_result(msg, event, call, category)
+    let body = if agent_slug == "antigravity" {
+        strip_antigravity_generic_framing(&msg.content, false)
+    } else {
+        msg.content.as_str()
+    };
+    judge_direct_tool_result_with_body(body, event, call, category)
 }
 
 // ============================================================================
@@ -6563,5 +6676,140 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn antigravity_strip_generic_framing_handles_all_variants() {
+        let payload = "<cass_recall version=\"1\" tool=\"cass_search\">{\"hits\":[]}</cass_recall>";
+
+        // Non-shell single timestamp header.
+        let framed_non_shell = format!(
+            "Created At: 2026-11-22T10:00:00Z\nCompleted At: 2026-11-22T10:00:01Z\n{payload}"
+        );
+        assert_eq!(strip_antigravity_generic_framing(&framed_non_shell, false), payload);
+
+        // Shell double header (timestamps + Command exited + Command output).
+        let framed_shell = format!(
+            "Created At: 2026-11-22T10:00:00Z\nCompleted At: 2026-11-22T10:00:01Z\n\
+             Command exited with code 0.\n\nCommand output:\n{payload}"
+        );
+        assert_eq!(strip_antigravity_generic_framing(&framed_shell, true), payload);
+
+        // Bare/MCP non-shell path MUST NOT strip `Command exited...` shell framing.
+        assert_eq!(
+            strip_antigravity_generic_framing(&framed_shell, false),
+            format!("Command exited with code 0.\n\nCommand output:\n{payload}")
+        );
+
+        // Mid-body `Created At:` is never stripped.
+        let mid_body = "plain output\nCreated At: 2026-11-22T10:00:00Z\nmore text";
+        assert_eq!(strip_antigravity_generic_framing(mid_body, true), mid_body);
+
+        // Empty shell output header leaves empty string without panicking.
+        let empty_shell = "Command exited with code 0.\n\nCommand output:\n";
+        assert_eq!(strip_antigravity_generic_framing(empty_shell, true), "");
+    }
+
+    #[test]
+    fn antigravity_decide_covers_call_mcp_tool_bare_framed_cli_and_negative_controls() {
+        let wrapped = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let framed = format!(
+            "Created At: 2026-11-22T10:00:00Z\nCompleted At: 2026-11-22T10:00:01Z\n{wrapped}"
+        );
+
+        // 1. call_mcp_tool dispatcher with ServerName="cass-mcp" -> Strong exclude.
+        let (msg, event, ctx) = fixture(
+            "call_mcp_tool",
+            json!({
+                "ServerName": "cass-mcp",
+                "ToolName": "cass_search",
+                "Arguments": {"query": "test"}
+            }),
+            &framed,
+        );
+        let Outcome::Exclude(judged) =
+            decide(&msg, 1, &event, &ctx, "antigravity", &paths_cfg())
+        else {
+            panic!("call_mcp_tool(cass-mcp, cass_search) must be excluded");
+        };
+        assert_eq!(
+            judged.src.unwrap().sessions,
+            vec!["/srv/sessions/a.jsonl", "/srv/sessions/b.jsonl"]
+        );
+
+        // 2. Bare cass_search with framed C04 wrapper -> Bare exclude (after framing strip!).
+        let (msg, event, ctx) = fixture("cass_search", json!({"query": "test"}), &framed);
+        let Outcome::Exclude(judged) =
+            decide(&msg, 1, &event, &ctx, "antigravity", &paths_cfg())
+        else {
+            panic!("antigravity bare cass_search with framed C04 wrapper must be excluded");
+        };
+        assert_eq!(
+            judged.src.unwrap().sessions,
+            vec!["/srv/sessions/a.jsonl", "/srv/sessions/b.jsonl"]
+        );
+
+        // 3. run_command with CommandLine (1.5.14) and command (1.0.7) -> CLI exclude.
+        let cli_json = r#"{"hits":[{"source_id":"local","source_path":"/srv/sessions/cli.jsonl","line_number":9}]}"#;
+        let shell_framed = format!(
+            "Created At: 2026-11-22T10:00:00Z\nCompleted At: 2026-11-22T10:00:01Z\n\
+             Command exited with code 0.\n\nCommand output:\n{cli_json}"
+        );
+        for key in ["CommandLine", "command"] {
+            let (msg, event, ctx) = fixture(
+                "run_command",
+                json!({ key: "cass search 'hello' --robot" }),
+                &shell_framed,
+            );
+            let Outcome::Exclude(judged) =
+                decide(&msg, 1, &event, &ctx, "antigravity", &paths_cfg())
+            else {
+                panic!("antigravity run_command({key}) must be excluded");
+            };
+            assert_eq!(judged.src.unwrap().sessions, vec!["/srv/sessions/cli.jsonl"]);
+        }
+
+        // 4. Negative control: non-cass-mcp call_mcp_tool is preserved untouched.
+        let (msg, event, ctx) = fixture(
+            "call_mcp_tool",
+            json!({
+                "ServerName": "webfetch",
+                "ToolName": "web_fetch",
+                "Arguments": {"url": "https://example.invalid"}
+            }),
+            &framed,
+        );
+        assert_eq!(
+            decide(&msg, 1, &event, &ctx, "antigravity", &paths_cfg()),
+            Outcome::Preserve(None)
+        );
+
+        // 5. CASS-R2-NB1: call_mcp_tool(cass_expand) with JSON-string Arguments still preserves RecallSrc.
+        let expand_wrapped = recall_output::encode(
+            RecallTool::Expand,
+            &json!([{"line": 7, "is_target": true, "content": "expanded line"}]),
+        )
+        .unwrap();
+        let expand_framed = format!(
+            "Created At: 2026-11-22T10:00:00Z\nCompleted At: 2026-11-22T10:00:01Z\n{expand_wrapped}"
+        );
+        let (msg, event, ctx) = fixture(
+            "call_mcp_tool",
+            json!({
+                "ServerName": "cass-mcp",
+                "ToolName": "cass_expand",
+                "Arguments": "{\"source_id\":\"local\",\"source_path\":\"/srv/sessions/exp.jsonl\",\"line\":7}"
+            }),
+            &expand_framed,
+        );
+        let Outcome::Exclude(judged) =
+            decide(&msg, 1, &event, &ctx, "antigravity", &paths_cfg())
+        else {
+            panic!("call_mcp_tool(cass-mcp, cass_expand) with string Arguments must exclude");
+        };
+        let src = judged.src.expect("RecallSrc must be extracted from string Arguments");
+        assert_eq!(src.sessions, vec!["/srv/sessions/exp.jsonl"]);
+        assert_eq!(src.hits.len(), 1);
+        assert_eq!(src.hits[0].line_number, Some(7));
     }
 }

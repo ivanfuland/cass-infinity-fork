@@ -2955,3 +2955,213 @@ fn mcp_activate_v2_r2_round5_regressions() {
         "leading empty text block must remain empty string: {f2_extra}"
     );
 }
+
+#[test]
+fn mcp_activate_v2_r2_claude_and_codex_jsonl_idless_single_candidate_pairing() {
+    // CASS-R2-B2 regression: Claude Code and Codex JSONL parsers mark id-less
+    // `tool_result` entries with `extra["unpaired"] = true` (P8 contract).
+    // The Antigravity cross-step unpaired sentinel in `mod.rs` MUST stay scoped
+    // strictly to `antigravity` so Claude Code and Codex JSONL sessions retain
+    // R4 single-candidate id-less pairing for BOTH R2 context-file reads and
+    // `recall_v2` C04 recall results.
+    const CLAUDE_R2_SECRET: &str = "r2-b2-claude-jsonl-idless-claude-md-secret";
+    const CLAUDE_RECALL_SECRET: &str = "r2-b2-claude-jsonl-idless-recall-secret";
+    const CODEX_R2_SECRET: &str = "r2-b2-codex-jsonl-idless-agents-md-secret";
+    const CODEX_RECALL_SECRET: &str = "r2-b2-codex-jsonl-idless-recall-secret";
+
+    let fixture = Fixture::new();
+
+    // 1. Claude Code JSONL with id-less R2 Read(CLAUDE.md) + id-less C04 recall.
+    let claude_recall_body = recall_output::encode(
+        RecallTool::Search,
+        &json!({
+            "hits": [{
+                "source_id": "local",
+                "source_path": "/srv/r2b2/claude-hit.jsonl",
+                "line_number": 3,
+                "snippet": CLAUDE_RECALL_SECRET
+            }]
+        }),
+    )
+    .expect("encode claude recall");
+    let claude_lines = vec![
+        json!({
+            "type": "user",
+            "timestamp": "2026-11-22T10:00:00Z",
+            "message": {"role": "user", "content": "Read project rules"}
+        }),
+        json!({
+            "type": "assistant",
+            "timestamp": "2026-11-22T10:00:01Z",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "name": "Read",
+                    "input": {"file_path": "/tmp/cc-workspace/CLAUDE.md"}
+                }]
+            }
+        }),
+        json!({
+            "type": "user",
+            "timestamp": "2026-11-22T10:00:02Z",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "content": CLAUDE_R2_SECRET
+                }]
+            }
+        }),
+        json!({
+            "type": "user",
+            "timestamp": "2026-11-22T10:01:00Z",
+            "message": {"role": "user", "content": "Search past notes"}
+        }),
+        json!({
+            "type": "assistant",
+            "timestamp": "2026-11-22T10:01:01Z",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "name": "mcp__cass-mcp__cass_search",
+                    "input": {"query": "past notes"}
+                }]
+            }
+        }),
+        json!({
+            "type": "user",
+            "timestamp": "2026-11-22T10:01:02Z",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "content": claude_recall_body
+                }]
+            }
+        }),
+    ];
+    let claude_dir = fixture.home().join(".claude/projects/r2b2");
+    std::fs::create_dir_all(&claude_dir).expect("mkdir claude dir");
+    std::fs::write(claude_dir.join("idless_r4.jsonl"), jsonl(&claude_lines))
+        .expect("write claude jsonl");
+
+    // 2. Codex JSONL with id-less R2 exec_command(cat AGENTS.md) + id-less C04 recall.
+    let codex_recall_body = recall_output::encode(
+        RecallTool::Search,
+        &json!({
+            "hits": [{
+                "source_id": "local",
+                "source_path": "/srv/r2b2/codex-hit.jsonl",
+                "line_number": 5,
+                "snippet": CODEX_RECALL_SECRET
+            }]
+        }),
+    )
+    .expect("encode codex recall");
+    let codex_lines = vec![
+        json!({
+            "timestamp": "2026-11-22T10:02:00Z",
+            "type": "session_meta",
+            "payload": {"id": "codex-idless-r4", "cwd": "/tmp/cc-workspace"}
+        }),
+        json!({
+            "timestamp": "2026-11-22T10:02:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Read AGENTS.md"}]
+            }
+        }),
+        json!({
+            "timestamp": "2026-11-22T10:02:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"cat /tmp/cc-workspace/AGENTS.md\"}"
+            }
+        }),
+        json!({
+            "timestamp": "2026-11-22T10:02:03Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "output": CODEX_R2_SECRET
+            }
+        }),
+        json!({
+            "timestamp": "2026-11-22T10:03:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Run cass recall"}]
+            }
+        }),
+        json!({
+            "timestamp": "2026-11-22T10:03:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "mcp__cass-mcp__cass_search",
+                "arguments": "{\"query\":\"codex r4\"}"
+            }
+        }),
+        json!({
+            "timestamp": "2026-11-22T10:03:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "output": codex_recall_body
+            }
+        }),
+    ];
+    let codex_dir = fixture.home().join(".codex/sessions/2026/11/22");
+    std::fs::create_dir_all(&codex_dir).expect("mkdir codex dir");
+    std::fs::write(codex_dir.join("rollout-r2b2-idless.jsonl"), jsonl(&codex_lines))
+        .expect("write codex jsonl");
+
+    let output = fixture.index(&["--full"], &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "index failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("index json");
+    assert_eq!(report["success"], json!(true), "report={report}");
+    assert_eq!(report["indexing_stats"]["event_align_failed"], json!(0), "report={report}");
+    assert_eq!(report["recall_uncovered_total"], json!(0), "report={report}");
+
+    let db = fixture.open_db();
+    assert_eq!(
+        marker_rule_versions(&db).len(),
+        4,
+        "all 4 id-less R4 single-candidate results (Claude R2+R1, Codex R2+R1) must be excluded"
+    );
+    assert_excluded_rows_clean(
+        &db,
+        &[
+            CLAUDE_R2_SECRET,
+            CLAUDE_RECALL_SECRET,
+            CODEX_R2_SECRET,
+            CODEX_RECALL_SECRET,
+        ],
+        "r2-b2-idless-jsonl-r4",
+    );
+    let all_contents = message_contents(&db);
+    for secret in [
+        CLAUDE_R2_SECRET,
+        CLAUDE_RECALL_SECRET,
+        CODEX_R2_SECRET,
+        CODEX_RECALL_SECRET,
+    ] {
+        assert!(
+            !all_contents.iter().any(|c| c.contains(secret)),
+            "secret {secret:?} leaked into messages.content"
+        );
+    }
+}

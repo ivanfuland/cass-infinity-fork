@@ -869,23 +869,32 @@ fn extract_agent_from_line(line: &str) -> Option<String> {
     // Match patterns like "Scanning ~/.claude/projects" or "Scanning claude_code"
     if let Some(idx) = line.find("Scanning") {
         let rest = &line[idx + 8..].trim();
-        // Extract first word or path segment, stripping leading dots from hidden dirs
-        let agent = rest
+        let segments: Vec<&str> = rest
             .split(|c: char| c.is_whitespace() || c == '/')
             .filter(|s| !s.is_empty() && *s != "~" && *s != ".")
             .map(|s| s.trim_start_matches('.'))
-            .find(|s| !s.is_empty())?;
+            .filter(|s| !s.is_empty())
+            .collect();
+        if segments.windows(2).any(|w| {
+            w[0].trim_end_matches('.') == "gemini"
+                && w[1].trim_end_matches('.') == "antigravity-cli"
+        }) {
+            return Some("antigravity".to_string());
+        }
+        let first = *segments.first()?;
+        let first_clean = first.trim_end_matches('.');
 
         // Map path components to agent names
-        let agent_name = match agent {
+        let agent_name = match first_clean {
             "claude" => "claude_code",
             "codex" => "codex",
             "cursor" => "cursor",
+            "antigravity-cli" | "antigravity" => "antigravity",
             "gemini" => "gemini",
             "aider" => "aider",
             "goose" => "goose",
             "continue" => "continue",
-            _ => agent,
+            _ => first,
         };
 
         return Some(agent_name.to_string());
@@ -995,6 +1004,22 @@ mod tests {
         assert_eq!(
             extract_agent_from_line("Scanning cursor data..."),
             Some("cursor".into())
+        );
+        assert_eq!(
+            extract_agent_from_line("Scanning ~/.gemini/antigravity-cli/brain..."),
+            Some("antigravity".into())
+        );
+        assert_eq!(
+            extract_agent_from_line("Scanning ~/.gemini/antigravity-cli..."),
+            Some("antigravity".into())
+        );
+        assert_eq!(
+            extract_agent_from_line("Scanning /tmp/sandbox/.gemini/antigravity-cli/brain..."),
+            Some("antigravity".into())
+        );
+        assert_eq!(
+            extract_agent_from_line("Scanning ~/.gemini/tmp/hash/chats..."),
+            Some("gemini".into())
         );
         assert_eq!(extract_agent_from_line("Some other line"), None);
     }

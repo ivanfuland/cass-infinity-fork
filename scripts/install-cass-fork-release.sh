@@ -380,7 +380,7 @@ done
 
 if [ "$DEPLOY" -eq 1 ]; then
   [ ! -e "$PREFIX/current" ] || [ -L "$PREFIX/current" ] || die "current exists and is not a symbolic link: $PREFIX/current"
-  # disabled_agents: every connector of this binary except the three kept ones.
+  # disabled_agents: every connector of this binary except the four kept ones.
   # The bundle binary is verified above and is byte-identical to the published
   # one, so this runs before anything is written. Every non-empty line of the
   # list must be one name matching [a-z0-9_]; anything else is refused.
@@ -392,7 +392,7 @@ if [ "$DEPLOY" -eq 1 ]; then
   [ "$lines" -eq "${#CONNECTORS[@]}" ] \
     || die "connector list of $BUNDLE/cass has $lines entries but only ${#CONNECTORS[@]} valid names"
   mapfile -t CONNECTORS < <(printf '%s\n' "${CONNECTORS[@]}" | LC_ALL=C sort -u)
-  declare -A KEEP=([claude_code]=0 [codex]=0 [pi_agent]=0)
+  declare -A KEEP=([antigravity]=0 [claude_code]=0 [codex]=0 [pi_agent]=0)
   DISABLED=()
   for name in "${CONNECTORS[@]}"; do
     if [ -n "${KEEP[$name]+present}" ]; then KEEP[$name]=1; else DISABLED+=("$name"); fi

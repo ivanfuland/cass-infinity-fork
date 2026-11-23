@@ -16390,7 +16390,8 @@ fn route_fixed_watch(
             // declaration the event belongs to. Both consume the declaration's
             // own decision table, never the event path as a new root.
             let scope = explicit_watch_once.then_some((selected.as_path(), selection_is_dir));
-            let mut decisions = Vec::new();
+            let mut decisions: Vec<(crate::connectors::DiscoveredSourceFile, SourceOwnershipDecision)> =
+                Vec::new();
             for source in sources {
                 if let Some((scope_path, scope_is_dir)) = scope
                     && !selection_contains(scope_path, scope_is_dir, &source.source_path)
@@ -16398,7 +16399,58 @@ fn route_fixed_watch(
                     continue;
                 }
                 if let Some(decision) = partition.decisions.get(&source.source_path) {
-                    decisions.push((source, decision.clone()));
+                    decisions.push((source.clone(), decision.clone()));
+                }
+            }
+            // CASS-R2-B1: When `--watch-once` explicitly targets a compact
+            // `<logs>/transcript.jsonl` inside a configured root whose sibling
+            // `transcript_full.jsonl` is owned by `antigravity`, directory-level
+            // discovery intentionally listed only the primary `transcript_full.jsonl`.
+            // If `selected` is not rejected by ownership (`Unresolved`/`Ambiguous`)
+            // and `antigravity` owns the sibling `transcript_full.jsonl`, run
+            // single-file discovery on `selected` so watch-once routes cleanly.
+            if explicit_watch_once
+                && !selection_is_dir
+                && name == "antigravity"
+                && decisions.is_empty()
+                && selected.file_name().and_then(std::ffi::OsStr::to_str)
+                    == Some("transcript.jsonl")
+                && let Some(parent) = selected.parent()
+            {
+                let sibling_full = parent.join("transcript_full.jsonl");
+                let selected_allowed = match partition.decisions.get(&selected) {
+                    None | Some(SourceOwnershipDecision::LegacyUnchanged) => true,
+                    Some(SourceOwnershipDecision::Owner(owner)) => owner == name,
+                    Some(SourceOwnershipDecision::Unresolved | SourceOwnershipDecision::Ambiguous) => {
+                        false
+                    }
+                };
+                let sibling_owned = sources.iter().any(|s| s.source_path == sibling_full)
+                    && (matches!(
+                        partition.decisions.get(&sibling_full),
+                        Some(SourceOwnershipDecision::LegacyUnchanged)
+                    ) || matches!(
+                        partition.decisions.get(&sibling_full),
+                        Some(SourceOwnershipDecision::Owner(owner)) if owner == name
+                    ));
+                if selected_allowed
+                    && sibling_owned
+                    && let Ok(single_sources) = ConnectorKind::Antigravity
+                        .create_connector()
+                        .discover_source_files(&crate::connectors::ScanContext::with_roots(
+                            plan.root.path.clone(),
+                            vec![plan.root.with_path(selected.clone())],
+                            None,
+                        ))
+                {
+                    for source in single_sources {
+                        if source.source_path == selected {
+                            decisions.push((
+                                source,
+                                SourceOwnershipDecision::Owner(name.to_string()),
+                            ));
+                        }
+                    }
                 }
             }
             if decisions.is_empty() {
@@ -16412,7 +16464,7 @@ fn route_fixed_watch(
                 match decision {
                     SourceOwnershipDecision::Owner(owner) if owner == name => {
                         owned_here = true;
-                        accepted_sources.push((*source).clone());
+                        accepted_sources.push(source.clone());
                     }
                     SourceOwnershipDecision::Owner(owner) => {
                         if ConnectorKind::from_slug(owner).is_none() {
@@ -16446,7 +16498,7 @@ fn route_fixed_watch(
                     }
                     SourceOwnershipDecision::LegacyUnchanged => {
                         owned_here = true;
-                        accepted_sources.push((*source).clone());
+                        accepted_sources.push(source.clone());
                     }
                     SourceOwnershipDecision::Unresolved | SourceOwnershipDecision::Ambiguous => {
                         covered = true;
@@ -17887,6 +17939,8 @@ fn explicit_watch_once_connector_hint(path: &Path) -> Option<ConnectorKind> {
         Some(ConnectorKind::Codex)
     } else if has_pair(".claude", "projects") {
         Some(ConnectorKind::Claude)
+    } else if has_pair(".gemini", "antigravity-cli") {
+        Some(ConnectorKind::Antigravity)
     } else if has_pair(".gemini", "tmp") {
         Some(ConnectorKind::Gemini)
     } else {
@@ -19282,7 +19336,31 @@ fn build_pairing_candidates_with_events(
             match m.role.as_str() {
                 "user" => PairingCandidate::TurnBoundary,
                 "tool_call" => {
-                    if !m.invocations.is_empty() {
+                    let explicitly_unpaired =
+                        m.extra.get("unpaired").and_then(serde_json::Value::as_bool) == Some(true);
+                    let has_explicit_call_id = m
+                        .invocations
+                        .iter()
+                        .any(|inv| inv.call_id.as_deref().is_some_and(|id| !id.is_empty()))
+                        || m.extra
+                            .get("tool_call_id")
+                            .or_else(|| m.extra.get("call_id"))
+                            .or_else(|| m.extra.get("tool_use_id"))
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|id| !id.is_empty());
+                    if conv.agent_slug == "antigravity"
+                        && explicitly_unpaired
+                        && !has_explicit_call_id
+                    {
+                        // Block mismatched antigravity tool_calls from entering
+                        // PairingContext::build's id-less `unpaired.len() == 1`
+                        // cross-step fallback.
+                        PairingCandidate::ToolResult {
+                            tool_call_id: Some(format!(
+                                "__cass_explicitly_unpaired_call_{idx}__"
+                            )),
+                        }
+                    } else if !m.invocations.is_empty() {
                         merge_invocations_with_event(&m.invocations, blob_event)
                     } else {
                         // Whole-document Codex `.json` `items[]` entries with
@@ -19333,16 +19411,28 @@ fn build_pairing_candidates_with_events(
                         }
                     }
                 }
-                "tool_result" => PairingCandidate::ToolResult {
-                    tool_call_id: m
+                "tool_result" => {
+                    let explicitly_unpaired =
+                        m.extra.get("unpaired").and_then(serde_json::Value::as_bool) == Some(true);
+                    let explicit_id = m
                         .extra
                         .get("tool_call_id")
                         .or_else(|| m.extra.get("tool_use_id"))
                         .or_else(|| m.extra.get("call_id"))
                         .and_then(|v| v.as_str())
                         .map(str::to_string)
-                        .or_else(|| blob_event.and_then(event_tool_result_id)),
-                },
+                        .or_else(|| blob_event.and_then(event_tool_result_id));
+                    PairingCandidate::ToolResult {
+                        tool_call_id: if conv.agent_slug == "antigravity"
+                            && explicitly_unpaired
+                            && explicit_id.is_none()
+                        {
+                            Some(format!("__cass_explicitly_unpaired_{idx}__"))
+                        } else {
+                            explicit_id
+                        },
+                    }
+                }
                 _ => PairingCandidate::ToolResult {
                     tool_call_id: Some(format!("__cass_pairing_neutral_{idx}__")),
                 },
@@ -19702,6 +19792,29 @@ fn prepare_conversation_for_ingest(
         .pointer("/cass/workspace_original")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    // Preserve first-parse sidecar metadata (e.g. Antigravity's read-only
+    // `conversation_summaries.db` title/subagent enrichment) across scratch
+    // single-file reparse, where sibling sidecar DBs are absent.
+    let original_title = conv.title.clone();
+    let original_title_source = conv
+        .metadata
+        .get("title_source")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let original_parent_conversation_id = conv
+        .metadata
+        .get("parent_conversation_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let original_agent_name = conv
+        .metadata
+        .get("agent_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let original_nesting_depth = conv
+        .metadata
+        .get("nesting_depth")
+        .and_then(serde_json::Value::as_i64);
 
     let record = match source_kind {
         CaptureSourceKind::Logical => {
@@ -19859,6 +19972,49 @@ fn prepare_conversation_for_ingest(
         // parse's FINAL value, not whatever the connector derived scanning
         // the scratch copy.
         reparsed.workspace = original_workspace.clone();
+        // Carry forward first-parse sidecar summary DB metadata (title when
+        // sourced from summary_db, plus subagent hierarchy fields) lost during
+        // isolated scratch-file reparse.
+        if original_title_source.as_deref() == Some("summary_db") {
+            if let Some(title) = &original_title {
+                reparsed.title = Some(title.clone());
+            }
+        }
+        if original_title_source.is_some()
+            || original_parent_conversation_id.is_some()
+            || original_agent_name.is_some()
+            || original_nesting_depth.is_some()
+        {
+            if !reparsed.metadata.is_object() {
+                reparsed.metadata = serde_json::json!({});
+            }
+            if let Some(obj) = reparsed.metadata.as_object_mut() {
+                if let Some(src) = &original_title_source {
+                    obj.insert(
+                        "title_source".to_string(),
+                        serde_json::Value::String(src.clone()),
+                    );
+                }
+                if let Some(parent_id) = &original_parent_conversation_id {
+                    obj.insert(
+                        "parent_conversation_id".to_string(),
+                        serde_json::Value::String(parent_id.clone()),
+                    );
+                }
+                if let Some(agent_name) = &original_agent_name {
+                    obj.insert(
+                        "agent_name".to_string(),
+                        serde_json::Value::String(agent_name.clone()),
+                    );
+                }
+                if let Some(depth) = original_nesting_depth {
+                    obj.insert(
+                        "nesting_depth".to_string(),
+                        serde_json::Value::from(depth),
+                    );
+                }
+            }
+        }
         // Same identity as the first parse: the reparse of a captured copy is
         // the same session from the same root, never a second identity.
         inject_provenance(&mut reparsed, origin, identity);
@@ -20738,7 +20894,7 @@ pub mod persist {
     /// bounded `recall_uncovered_by_reason` diagnostics on both batch and
     /// resident scan_session outputs.
     pub(super) fn reports_recall_uncovered(agent_slug: &str) -> bool {
-        matches!(agent_slug, "claude_code" | "codex" | "pi_agent")
+        matches!(agent_slug, "claude_code" | "codex" | "pi_agent" | "antigravity")
     }
 
     fn emit_scan_session(
@@ -41087,6 +41243,7 @@ normalization="l2"
         assert!(persist::reports_recall_uncovered("claude_code"));
         assert!(persist::reports_recall_uncovered("codex"));
         assert!(persist::reports_recall_uncovered("pi_agent"));
+        assert!(persist::reports_recall_uncovered("antigravity"));
         assert!(!persist::reports_recall_uncovered("opencode"));
         assert!(!persist::reports_recall_uncovered("gemini"));
 
@@ -41110,7 +41267,8 @@ normalization="l2"
             make_prepared("claude_code", "cc-1", "unsupported_shell", 2),
             make_prepared("codex", "cx-1", "ambiguous_tool_identity", 3),
             make_prepared("pi_agent", "pi-1", "invalid_recall_format", 1),
-            make_prepared("opencode", "oc-1", "unpaired_result", 5),
+            make_prepared("antigravity", "ag-1", "unpaired_result", 4),
+            make_prepared("opencode", "oc-1", "unsupported_shell", 5),
         ];
 
         let outcome = persist::persist_conversations_batched_with_raw_mirror_links(
@@ -41124,7 +41282,7 @@ normalization="l2"
         assert_eq!(outcome.recall_uncovered_by_reason.get("unsupported_shell").copied(), Some(2));
         assert_eq!(outcome.recall_uncovered_by_reason.get("ambiguous_tool_identity").copied(), Some(3));
         assert_eq!(outcome.recall_uncovered_by_reason.get("invalid_recall_format").copied(), Some(1));
-        assert_eq!(outcome.recall_uncovered_by_reason.get("unpaired_result"), None);
+        assert_eq!(outcome.recall_uncovered_by_reason.get("unpaired_result").copied(), Some(4));
     }
 
     #[test]
@@ -43631,5 +43789,28 @@ mod task35_watch_routing_tests {
             assert_eq!(route.legacy[0].min_ts, Some(older_ms), "min_ts must track oldest file in batch");
             assert_eq!(route.legacy[0].max_ts, Some(newer_ms), "max_ts must track newest file in batch");
         }
+    }
+
+    #[test]
+    fn explicit_watch_once_connector_hint_recognizes_antigravity_cli() {
+        let agy_full = Path::new(
+            "/tmp/sandbox/.gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555/.system_generated/logs/transcript_full.jsonl",
+        );
+        let agy_compact = Path::new(
+            "/tmp/sandbox/.gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555/.system_generated/logs/transcript.jsonl",
+        );
+        let gemini = Path::new("/tmp/sandbox/.gemini/tmp/deadbeef/chats/session-1.json");
+        assert_eq!(
+            explicit_watch_once_connector_hint(agy_full),
+            Some(ConnectorKind::Antigravity)
+        );
+        assert_eq!(
+            explicit_watch_once_connector_hint(agy_compact),
+            Some(ConnectorKind::Antigravity)
+        );
+        assert_eq!(
+            explicit_watch_once_connector_hint(gemini),
+            Some(ConnectorKind::Gemini)
+        );
     }
 }
