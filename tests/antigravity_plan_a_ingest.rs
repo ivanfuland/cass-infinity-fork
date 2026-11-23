@@ -720,3 +720,205 @@ fn antigravity_unpaired_mismatch_blocks_cross_step_fallback_and_reports_uncovere
     assert_eq!(watch_report["indexing_stats"]["event_align_failed"], json!(0));
     let _ = Path::new(&compact_path);
 }
+
+#[test]
+fn antigravity_configured_sources_toml_dual_file_index_and_watch_once() {
+    // CASS-R2-B1 regression: a `sources.toml`-configured root containing a real
+    // agy 1.5.14 dual-file session (both `transcript_full.jsonl` and
+    // `transcript.jsonl`) with all 4 default-allowlisted connectors enabled
+    // (`antigravity`, `claude_code`, `codex`, `pi_agent`) must:
+    //  1) succeed on `cass index --full` with 0 `source_ownership_unresolved`,
+    //     indexing 1 `antigravity` conversation and 0 `claude` conversations;
+    //  2) succeed on `cass index --watch-once <compact transcript.jsonl>` with
+    //     0 watch rejections and route cleanly to `antigravity`.
+    let fixture = AgyFixture::new();
+    let uuid = "4444dddd-2222-3333-4444-555566660000";
+
+    // Place the configured root OUTSIDE `$HOME/.gemini/antigravity-cli` so it
+    // exercises strictly the `sources.toml` shared-root ownership path.
+    let shared_root = fixture.root.path().join("mirror/.gemini/antigravity-cli");
+    let logs_dir = shared_root
+        .join("brain")
+        .join(uuid)
+        .join(".system_generated/logs");
+    std::fs::create_dir_all(&logs_dir).expect("mkdir mirror logs");
+
+    let full_records = [
+        json!({
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "created_at": "2026-11-22T12:00:00Z",
+            "content": "Configured root dual-file session"
+        }),
+        json!({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "created_at": "2026-11-22T12:00:01Z",
+            "model": "gemini-4-neon-high",
+            "content": "FULL_MIRROR_ANSWER_SENTINEL"
+        }),
+    ];
+    let compact_records = [
+        json!({
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "created_at": "2026-11-22T12:00:00Z",
+            "content": "Configured root dual-file session"
+        }),
+        json!({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "created_at": "2026-11-22T12:00:01Z",
+            "model": "gemini-4-neon-high",
+            "content": "COMPACT_WATCH_ONCE_SENTINEL"
+        }),
+    ];
+    let encode_jsonl = |recs: &[Value]| -> String {
+        let mut s = String::new();
+        for r in recs {
+            s.push_str(&serde_json::to_string(r).unwrap());
+            s.push('\n');
+        }
+        s
+    };
+    let full_path = logs_dir.join("transcript_full.jsonl");
+    let compact_path = logs_dir.join("transcript.jsonl");
+    std::fs::write(&full_path, encode_jsonl(&full_records)).expect("write full");
+    std::fs::write(&compact_path, encode_jsonl(&compact_records)).expect("write compact");
+
+    // Write sources.toml enabling all 4 default allowlisted connectors.
+    let cass_cfg_dir = fixture.config_home().join("cass");
+    std::fs::create_dir_all(&cass_cfg_dir).expect("mkdir config/cass");
+    let sources_toml = format!(
+        r#"disabled_agents = [
+  "aider", "amp", "chatgpt", "clawdbot", "cline", "copilot", "copilot_cli",
+  "crush", "cursor", "factory", "gemini", "hermes", "kimi", "openclaw",
+  "opencode", "openhands", "qwen", "vibe"
+]
+
+[[sources]]
+name = "local-agy"
+type = "local"
+origin_host = "local"
+paths = [{:?}]
+"#,
+        shared_root.to_string_lossy()
+    );
+    std::fs::write(cass_cfg_dir.join("sources.toml"), sources_toml).expect("write sources.toml");
+
+    // 1. Full batch index over configured dual-file root must succeed (exit 0).
+    let mut cmd = Command::new(cass_bin());
+    cmd.env("HOME", fixture.home())
+        .env("XDG_DATA_HOME", fixture.home().join(".local/share"))
+        .env("XDG_CONFIG_HOME", fixture.config_home())
+        .env("XDG_CACHE_HOME", fixture.home().join(".cache"))
+        .env("XDG_STATE_HOME", fixture.home().join(".state"))
+        .env("CASS_DATA_DIR", fixture.data_dir())
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("CASS_ANTIGRAVITY_DATA_ROOT")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("CASS_IGNORE_SOURCES_CONFIG")
+        .env_remove("CASS_API_CONFIG")
+        .env_remove("RUST_LOG")
+        .args(["index", "--full", "--data-dir"])
+        .arg(fixture.data_dir())
+        .arg("--json");
+    let batch_out = cmd.output().expect("spawn configured-root cass index");
+    let batch_stderr = String::from_utf8_lossy(&batch_out.stderr);
+    assert_eq!(
+        batch_out.status.code(),
+        Some(0),
+        "configured-root dual-file cass index must succeed: stderr={batch_stderr}"
+    );
+    assert!(
+        !batch_stderr.contains("source_ownership_unresolved"),
+        "must not emit source_ownership_unresolved: stderr={batch_stderr}"
+    );
+    let batch_report: Value = serde_json::from_slice(&batch_out.stdout).expect("batch json");
+    assert_eq!(batch_report["success"], json!(true), "report={batch_report}");
+    assert!(
+        batch_report["sources_config_error"].is_null(),
+        "sources.toml must load cleanly: {batch_report}"
+    );
+
+    let db = fixture.open_db();
+    let slug_counts: Vec<(String, i64)> = db
+        .query_all_map(
+            "SELECT a.slug, COUNT(*) FROM conversations c JOIN agents a ON a.id = c.agent_id GROUP BY a.slug ORDER BY a.slug",
+            &[],
+            |r| Ok((r.get_typed(0)?, r.get_typed(1)?)),
+        )
+        .expect("query agent counts");
+    assert_eq!(
+        slug_counts,
+        vec![("antigravity".to_string(), 1)],
+        "only antigravity must own the configured dual-file session, never claude"
+    );
+    let contents: Vec<String> = db
+        .query_all_map("SELECT content FROM messages", &[], |r| r.get_typed(0))
+        .expect("query contents");
+    assert!(
+        contents.iter().any(|c| c.contains("FULL_MIRROR_ANSWER_SENTINEL")),
+        "batch scan must read primary transcript_full.jsonl: {contents:?}"
+    );
+    drop(db);
+
+    // 2. Explicit `--watch-once` targeting compact `transcript.jsonl` under the same
+    //    configured root in a fresh data_dir must exit 0 and ingest cleanly under antigravity.
+    let watch_data = fixture.root.path().join("watch-data");
+    std::fs::create_dir_all(&watch_data).expect("mkdir watch-data");
+    let mut wcmd = Command::new(cass_bin());
+    wcmd.env("HOME", fixture.home())
+        .env("XDG_DATA_HOME", fixture.home().join(".local/share"))
+        .env("XDG_CONFIG_HOME", fixture.config_home())
+        .env("XDG_CACHE_HOME", fixture.home().join(".cache"))
+        .env("XDG_STATE_HOME", fixture.home().join(".state"))
+        .env("CASS_DATA_DIR", &watch_data)
+        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("CASS_ANTIGRAVITY_DATA_ROOT")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("CASS_IGNORE_SOURCES_CONFIG")
+        .env_remove("CASS_API_CONFIG")
+        .env_remove("RUST_LOG")
+        .args(["index", "--data-dir"])
+        .arg(&watch_data)
+        .arg("--watch-once")
+        .arg(&compact_path)
+        .arg("--json");
+    let watch_out = wcmd.output().expect("spawn configured-root watch-once");
+    let watch_stderr = String::from_utf8_lossy(&watch_out.stderr);
+    assert_eq!(
+        watch_out.status.code(),
+        Some(0),
+        "configured-root watch-once on transcript.jsonl must succeed: stderr={watch_stderr}"
+    );
+    assert!(
+        !watch_stderr.contains("source_ownership_unresolved"),
+        "watch-once must not emit source_ownership_unresolved: stderr={watch_stderr}"
+    );
+    let watch_report: Value = serde_json::from_slice(&watch_out.stdout).expect("watch json");
+    assert_eq!(watch_report["success"], json!(true), "watch={watch_report}");
+
+    let wdb = Conn::open_read_with(
+        &watch_data.join("agent_search.db"),
+        OpenOptions {
+            busy_timeout: Duration::from_secs(30),
+        },
+    )
+    .expect("open watch db");
+    let w_contents: Vec<String> = wdb
+        .query_all_map("SELECT content FROM messages", &[], |r| r.get_typed(0))
+        .expect("query watch contents");
+    assert!(
+        w_contents.iter().any(|c| c.contains("COMPACT_WATCH_ONCE_SENTINEL")),
+        "explicit --watch-once on transcript.jsonl must read that exact file: {w_contents:?}"
+    );
+}

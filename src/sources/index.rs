@@ -875,15 +875,14 @@ fn extract_agent_from_line(line: &str) -> Option<String> {
             .map(|s| s.trim_start_matches('.'))
             .filter(|s| !s.is_empty())
             .collect();
-        let first = *segments.first()?;
-        let first_clean = first.trim_end_matches('.');
-        if first_clean == "gemini"
-            && segments
-                .get(1)
-                .is_some_and(|next| next.trim_end_matches('.') == "antigravity-cli")
-        {
+        if segments.windows(2).any(|w| {
+            w[0].trim_end_matches('.') == "gemini"
+                && w[1].trim_end_matches('.') == "antigravity-cli"
+        }) {
             return Some("antigravity".to_string());
         }
+        let first = *segments.first()?;
+        let first_clean = first.trim_end_matches('.');
 
         // Map path components to agent names
         let agent_name = match first_clean {
@@ -1012,6 +1011,10 @@ mod tests {
         );
         assert_eq!(
             extract_agent_from_line("Scanning ~/.gemini/antigravity-cli..."),
+            Some("antigravity".into())
+        );
+        assert_eq!(
+            extract_agent_from_line("Scanning /tmp/sandbox/.gemini/antigravity-cli/brain..."),
             Some("antigravity".into())
         );
         assert_eq!(

@@ -676,7 +676,7 @@ fn classify_antigravity_mcp_dispatcher(call: &PairedTool) -> Option<(RecallTool,
     let tool = bare_name_tool(inner_tool_name).or_else(|| full_name_tool(inner_tool_name))?;
     let inner_args = args_obj
         .get("Arguments")
-        .cloned()
+        .map(exclusion::parse_tool_args_value)
         .unwrap_or_else(|| serde_json::json!({}));
     Some((tool, inner_args))
 }
@@ -6783,5 +6783,33 @@ mod tests {
             decide(&msg, 1, &event, &ctx, "antigravity", &paths_cfg()),
             Outcome::Preserve(None)
         );
+
+        // 5. CASS-R2-NB1: call_mcp_tool(cass_expand) with JSON-string Arguments still preserves RecallSrc.
+        let expand_wrapped = recall_output::encode(
+            RecallTool::Expand,
+            &json!([{"line": 7, "is_target": true, "content": "expanded line"}]),
+        )
+        .unwrap();
+        let expand_framed = format!(
+            "Created At: 2026-11-22T10:00:00Z\nCompleted At: 2026-11-22T10:00:01Z\n{expand_wrapped}"
+        );
+        let (msg, event, ctx) = fixture(
+            "call_mcp_tool",
+            json!({
+                "ServerName": "cass-mcp",
+                "ToolName": "cass_expand",
+                "Arguments": "{\"source_id\":\"local\",\"source_path\":\"/srv/sessions/exp.jsonl\",\"line\":7}"
+            }),
+            &expand_framed,
+        );
+        let Outcome::Exclude(judged) =
+            decide(&msg, 1, &event, &ctx, "antigravity", &paths_cfg())
+        else {
+            panic!("call_mcp_tool(cass-mcp, cass_expand) with string Arguments must exclude");
+        };
+        let src = judged.src.expect("RecallSrc must be extracted from string Arguments");
+        assert_eq!(src.sessions, vec!["/srv/sessions/exp.jsonl"]);
+        assert_eq!(src.hits.len(), 1);
+        assert_eq!(src.hits[0].line_number, Some(7));
     }
 }

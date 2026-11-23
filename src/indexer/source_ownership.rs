@@ -147,9 +147,35 @@ pub(crate) fn resolve_source_ownership(
     }
 
     let mut decisions = BTreeMap::new();
-    for (path, (relative, declared)) in groups {
-        let decision = decide(root, &relative, &declared, native_root_owner);
-        decisions.insert(path, decision);
+    for (path, (relative, declared)) in &groups {
+        // Real agy 1.5.14 sessions place both `transcript_full.jsonl` and
+        // `transcript.jsonl` side by side under `.system_generated/logs/`.
+        // `AntigravityConnector::discover_source_files` intentionally emits
+        // only the primary `transcript_full.jsonl` in directory mode (avoiding
+        // duplicate ingestion on incremental watermark scans), while
+        // `ClaudeCodeConnector` walks the shared root and declares both files.
+        // When `antigravity` is active and has declared the sibling
+        // `transcript_full.jsonl` in the same logs directory, `transcript.jsonl`
+        // (with sole path evidence `"antigravity"`) is owned by `"antigravity"`
+        // rather than `Unresolved`. If `antigravity` is disabled (did not
+        // declare the sibling), this remains `false` and fails closed.
+        let antigravity_sibling_claimed =
+            path.file_name().and_then(std::ffi::OsStr::to_str) == Some("transcript.jsonl")
+                && path.parent().is_some_and(|parent| {
+                    groups
+                        .get(&parent.join("transcript_full.jsonl"))
+                        .is_some_and(|(_, sib_declared)| {
+                            sib_declared.contains(ANTIGRAVITY_FOR_PATH_EVIDENCE)
+                        })
+                });
+        let decision = decide(
+            root,
+            relative,
+            declared,
+            native_root_owner,
+            antigravity_sibling_claimed,
+        );
+        decisions.insert(path.clone(), decision);
     }
     Ok(decisions)
 }
@@ -268,6 +294,7 @@ fn decide(
     relative: &Path,
     declared: &BTreeSet<&str>,
     native_root_owner: Option<&str>,
+    antigravity_sibling_claimed: bool,
 ) -> SourceOwnershipDecision {
     if !declared.contains(CLAUDE) && !declared.contains(CODEX) {
         return SourceOwnershipDecision::LegacyUnchanged;
@@ -297,7 +324,10 @@ fn decide(
     match evidence.len() {
         0 => SourceOwnershipDecision::Unresolved,
         1 => match evidence.into_iter().next() {
-            Some(owner) if declared.contains(owner.as_str()) => {
+            Some(owner)
+                if declared.contains(owner.as_str())
+                    || (antigravity_sibling_claimed && owner == ANTIGRAVITY_FOR_PATH_EVIDENCE) =>
+            {
                 SourceOwnershipDecision::Owner(owner)
             }
             _ => SourceOwnershipDecision::Unresolved,
@@ -1387,27 +1417,120 @@ mod partition_tests {
     }
 
     #[test]
-    fn antigravity_path_evidence_matches_transcript_and_keeps_claude_dir_unambiguous() {
-        let root = Path::new("/synthetic");
-        let full_transcript = "/synthetic/.gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555/.system_generated/logs/transcript_full.jsonl";
-        let compact_transcript = "/synthetic/.gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555/.system_generated/logs/transcript.jsonl";
-        let claude_same_dir_name = "/synthetic/.claude/projects/antigravity-cli/session.jsonl";
-        let claims = vec![
-            claim("claude", full_transcript),
-            claim("antigravity", full_transcript),
-            claim("claude", compact_transcript),
-            claim("antigravity", compact_transcript),
-            claim("claude", claude_same_dir_name),
-        ];
+    fn antigravity_real_discovery_resolves_dual_file_shared_root_and_preserves_claude_subdir() {
+        use crate::connectors::{Connector, ScanRoot};
+        use crate::connectors::antigravity::AntigravityConnector;
+        use crate::connectors::claude_code::ClaudeCodeConnector;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+
+        // 1. Dual-file agy 1.5.14 session (both transcript_full.jsonl and transcript.jsonl).
+        let dual_logs = root.join(
+            ".gemini/antigravity-cli/brain/11111111-2222-3333-4444-555555555555/.system_generated/logs",
+        );
+        std::fs::create_dir_all(&dual_logs).expect("mkdir dual logs");
+        let full_transcript = dual_logs.join("transcript_full.jsonl");
+        let compact_transcript = dual_logs.join("transcript.jsonl");
+        let sample_agy = r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"hello"}"#;
+        std::fs::write(&full_transcript, format!("{sample_agy}\n")).expect("write full");
+        std::fs::write(&compact_transcript, format!("{sample_agy}\n")).expect("write compact");
+
+        // 2. Solo agy 1.0.7 session (transcript.jsonl only).
+        let solo_logs = root.join(
+            ".gemini/antigravity-cli/brain/22222222-3333-4444-5555-666666666666/.system_generated/logs",
+        );
+        std::fs::create_dir_all(&solo_logs).expect("mkdir solo logs");
+        let solo_transcript = solo_logs.join("transcript.jsonl");
+        std::fs::write(&solo_transcript, format!("{sample_agy}\n")).expect("write solo");
+
+        // 3. Claude session inside a directory literally named `antigravity-cli`.
+        let claude_dir = root.join(".claude/projects/antigravity-cli");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir claude dir");
+        let claude_same_dir_name = claude_dir.join("session.jsonl");
+        std::fs::write(
+            &claude_same_dir_name,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .expect("write claude");
+
+        let scan_ctx = crate::connectors::ScanContext::with_roots(
+            root.to_path_buf(),
+            vec![ScanRoot::local(root.to_path_buf())],
+            None,
+        );
+        let claude_discovered = ClaudeCodeConnector::new()
+            .discover_source_files(&scan_ctx)
+            .expect("claude discovery");
+        let agy_discovered = AntigravityConnector::new()
+            .discover_source_files(&scan_ctx)
+            .expect("antigravity discovery");
+
+        // Confirm real AntigravityConnector directory discovery emits only primary transcript_full.jsonl
+        // for dual-file sessions (no hand-crafted dual claims).
+        assert!(agy_discovered.iter().any(|d| d.source_path == full_transcript));
+        assert!(!agy_discovered.iter().any(|d| d.source_path == compact_transcript));
+        assert!(agy_discovered.iter().any(|d| d.source_path == solo_transcript));
+        assert!(claude_discovered.iter().any(|d| d.source_path == compact_transcript));
+
+        let mut claims: Vec<SourceOwnershipClaim> = claude_discovered
+            .iter()
+            .map(|d| SourceOwnershipClaim {
+                cass_connector: "claude".to_string(),
+                source_path: d.source_path.clone(),
+            })
+            .collect();
+        claims.extend(agy_discovered.iter().map(|d| SourceOwnershipClaim {
+            cass_connector: "antigravity".to_string(),
+            source_path: d.source_path.clone(),
+        }));
 
         let partition =
-            partition_source_ownership(root, None, &claims).expect("valid antigravity claims");
-        assert_eq!(decide(&partition, full_transcript), owner("antigravity"));
-        assert_eq!(decide(&partition, compact_transcript), owner("antigravity"));
+            partition_source_ownership(root, None, &claims).expect("valid real discovery claims");
         assert_eq!(
-            decide(&partition, claude_same_dir_name),
+            decide(&partition, full_transcript.to_str().unwrap()),
+            owner("antigravity")
+        );
+        assert_eq!(
+            decide(&partition, compact_transcript.to_str().unwrap()),
+            owner("antigravity"),
+            "dual-file sibling transcript.jsonl must resolve to antigravity so claude skips cleanly"
+        );
+        assert_eq!(
+            decide(&partition, solo_transcript.to_str().unwrap()),
+            owner("antigravity")
+        );
+        assert_eq!(
+            decide(&partition, claude_same_dir_name.to_str().unwrap()),
             owner("claude"),
             "bare antigravity-cli directory under .claude/projects must stay owned by claude"
+        );
+
+        // Declaration-order invariance holds even with sibling-claim resolution.
+        let reversed: Vec<SourceOwnershipClaim> = claims.iter().rev().cloned().collect();
+        assert_eq!(
+            partition_source_ownership(root, None, &reversed).expect("reversed"),
+            partition
+        );
+
+        // Fail-closed: when antigravity is disabled (no antigravity claims), both
+        // transcript_full.jsonl and transcript.jsonl stay Unresolved (never handed to claude).
+        let claude_only: Vec<SourceOwnershipClaim> = claude_discovered
+            .iter()
+            .map(|d| SourceOwnershipClaim {
+                cass_connector: "claude".to_string(),
+                source_path: d.source_path.clone(),
+            })
+            .collect();
+        let disabled_partition =
+            partition_source_ownership(root, None, &claude_only).expect("claude-only claims");
+        assert_eq!(
+            decide(&disabled_partition, full_transcript.to_str().unwrap()),
+            SourceOwnershipDecision::Unresolved
+        );
+        assert_eq!(
+            decide(&disabled_partition, compact_transcript.to_str().unwrap()),
+            SourceOwnershipDecision::Unresolved
         );
     }
 }
