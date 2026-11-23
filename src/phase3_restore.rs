@@ -9296,8 +9296,7 @@ pub(crate) fn restore_journal_read(path: &Path) -> anyhow::Result<Option<Restore
         }
     }
 
-    // 版本闸之后直接严格反序列化（`#[serde(deny_unknown_fields)]` 显式拒绝
-    // 残留旧版含 `source_contexts`/`source_binding` 等字段的未完结 journal）。
+    // 版本闸之后再严格反序列化（`#[serde(deny_unknown_fields)]` 兜底拒绝非法扩展键）。
     let journal: RestoreJournal = serde_json::from_slice(&bytes)?;
     Ok(Some(journal))
 }
@@ -10376,17 +10375,20 @@ fn restore_drive(
 // receipt 说「这些确实提交过」—— 两个独立真源对上才算数。
 // ===========================================================================
 
-/// restore journal 的 schema 版本（R-E-79 补充裁定；Task14 升 4）。
+/// restore journal 的 schema 版本（R-E-79 补充裁定；Task14 升 4；拆除方案 B 升 5）。
 ///
-/// **4** = journal4：新增 `source_contexts`、`source_contexts_digest`、
-/// `source_profile` 与每 planned 项的 `source_binding`。四个键都必须出现，
-/// 显式 `null` 与缺键不同。
+/// **5** = journal5：移除方案 B 退役的 `source_contexts`、`source_contexts_digest`、
+/// `source_profile` 与每 planned 项的 `source_binding`。递增版本号而非仅靠
+/// `#[serde(deny_unknown_fields)]`，确保残留的旧版 v4 journal 在版本闸报出
+/// `E-JOURNAL-SCHEMA-MISMATCH`，而不是落到 serde 的字段解析错误。
+///
+/// **4** = journal4（已退役）：曾要求携带上述四个源事实字段。
 ///
 /// **3** = 随 marker 一起加了 `holds_count` / `origin_unmapped_count` 两格。
 /// 这个常量存在的理由不是兼容性（rehearsal 之前没有生产 journal），
 /// 而是**错误的可读性**：没有它，一份旧 journal 会死在 serde 的字段解析上，
 /// 那是错误的层在说话——操作者会去查文件损坏，而真相是版本不对。
-pub(crate) const RESTORE_JOURNAL_SCHEMA_VERSION: i64 = 4;
+pub(crate) const RESTORE_JOURNAL_SCHEMA_VERSION: i64 = 5;
 
 pub(crate) const W1_COMMIT_MARKER_SCHEMA: &str = "marker.w1-commit";
 /// **3**（R-E-91）：字段全集没变，变的是 `mirror_identity.manifest_root` 的**派生定义**
@@ -14093,6 +14095,30 @@ mod e7_restore_journal_tests {
         assert!(
             text.contains("E-JOURNAL-SCHEMA-MISMATCH") && text.contains("<absent>"),
             "版本号缺失也必须走同一条具名错误并说明是「缺失」，实得：{text}"
+        );
+
+        // 旧版 v4 journal（携带方案 B 退役的 `source_contexts`/`source_binding`）必须死在
+        // 版本闸（`E-JOURNAL-SCHEMA-MISMATCH`），不得滑进 `#[serde(deny_unknown_fields)]`。
+        let mut v4_obj = serde_json::to_value(&journal)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        v4_obj.insert("schema_version".into(), serde_json::json!(4));
+        v4_obj.insert("source_contexts".into(), serde_json::Value::Null);
+        v4_obj.insert("source_contexts_digest".into(), serde_json::Value::Null);
+        v4_obj.insert("source_profile".into(), serde_json::Value::Null);
+        std::fs::write(&d.journal_path, serde_json::to_vec(&v4_obj).unwrap()).unwrap();
+        let v4_text = format!("{:#}", restore_journal_read(&d.journal_path).unwrap_err());
+        assert!(
+            v4_text.contains("E-JOURNAL-SCHEMA-MISMATCH")
+                && v4_text.contains("4")
+                && v4_text.contains(&RESTORE_JOURNAL_SCHEMA_VERSION.to_string()),
+            "旧版 v4 journal 必须在版本闸报 E-JOURNAL-SCHEMA-MISMATCH，实得：{v4_text}"
+        );
+        assert!(
+            !v4_text.contains("unknown field"),
+            "版本闸必须先于 deny_unknown_fields 拒绝旧版 v4 journal：{v4_text}"
         );
     }
 
